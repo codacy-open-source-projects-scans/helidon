@@ -1,0 +1,36 @@
+///////////////////////////////////////////////////////////////////////////////
+
+    Copyright (c) 2019, 2023 Oracle and/or its affiliates.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+///////////////////////////////////////////////////////////////////////////////
+
+= gRPC Client
+:description: Helidon gRPC Client
+:keywords: helidon, grpc, java, se
+:feature-name: gRPC Client
+:rootdir: {docdir}/../..
+
+include::{rootdir}/includes/se.adoc[]
+
+== Contents
+
+- <<Overview, Overview>>
+
+== Overview
+
+gRPC client is temporarily removed from Helidon, please follow issue
+https://github.com/helidon-io/helidon/issues/5418
+
+If you require gRPC client, either stay with a previous version of Helidon, or allow us to finish fixing the issue above.
