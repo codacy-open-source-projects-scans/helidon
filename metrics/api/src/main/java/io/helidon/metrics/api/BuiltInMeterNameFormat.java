@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,20 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package io.helidon.metrics.api;
 
 /**
- * Helidon JWT and JWK token implementation.
+ * Choices for the output format for built-in meter names.
  */
-module io.helidon.security.jwt {
+public enum BuiltInMeterNameFormat {
+    /**
+     * Snake-case.
+     */
+    SNAKE,
 
-    requires io.helidon.security.util;
+    /**
+     * Camel-case (which is compatible with the MicroProfile Metrics spec).
+     */
+    CAMEL;
 
-    requires transitive io.helidon.common.configurable;
-    requires transitive io.helidon.common;
-    requires transitive io.helidon.config;
-    requires transitive jakarta.json;
-
-    exports io.helidon.security.jwt;
-    exports io.helidon.security.jwt.jwk;
-
+    static final String DEFAULT = "CAMEL";
 }
