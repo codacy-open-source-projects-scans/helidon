@@ -560,6 +560,10 @@
             <artifactId>helidon-microprofile-rest-client</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.microprofile.rest-client-metrics</groupId>
+            <artifactId>helidon-microprofile-rest-client-metrics</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.microprofile.reactive-streams</groupId>
             <artifactId>helidon-microprofile-reactive-streams</artifactId>
         </dependency>
@@ -1127,6 +1131,18 @@
         <dependency>
             <groupId>io.helidon.service</groupId>
             <artifactId>helidon-service-codegen</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.service.inject</groupId>
+            <artifactId>helidon-service-inject-codegen</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.service.inject</groupId>
+            <artifactId>helidon-service-inject-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.service.inject</groupId>
+            <artifactId>helidon-service-inject</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.metadata</groupId>
