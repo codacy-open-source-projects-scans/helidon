@@ -1,0 +1,10 @@
+{
+    "bundles": [
+        {
+            "name": "jakarta.el.PrivateMessages"
+        },
+        {
+            "name": "com.sun.el.Messages"
+        }
+    ]
+}
