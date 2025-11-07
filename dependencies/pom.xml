@@ -37,7 +37,7 @@
         Changing these versions requires approval for a new third party dependency!
         -->
         <version.lib.activemq>5.16.0</version.lib.activemq>
-        <version.lib.antlr>4.13.1</version.lib.antlr>
+        <version.lib.antlr>4.13.2</version.lib.antlr>
         <version.lib.brave-opentracing>1.0.0</version.lib.brave-opentracing>
         <version.lib.bytebuddy>1.17.5</version.lib.bytebuddy>
         <version.lib.coherence>25.03.1</version.lib.coherence>
@@ -55,7 +55,7 @@
         <version.lib.expressly>5.0.0</version.lib.expressly>
         <version.lib.etcd4j>2.18.0</version.lib.etcd4j>
         <version.lib.failsafe>2.3.1</version.lib.failsafe>
-        <version.lib.google-api-client>2.7.2</version.lib.google-api-client>
+        <version.lib.google-api-client>2.8.1</version.lib.google-api-client>
         <!-- For dependency convergence. google-http-client version should match what is used by google-api-client -->
         <version.lib.google-http-client>1.45.2</version.lib.google-http-client>
         <version.lib.google-error-prone>2.3.3</version.lib.google-error-prone>
@@ -141,7 +141,7 @@
         <version.lib.narayana>7.0.0.Final</version.lib.narayana>
         <version.lib.neo4j>5.28.3</version.lib.neo4j>
         <version.lib.netty>4.1.126.Final</version.lib.netty>
-        <version.lib.oci>3.73.1</version.lib.oci>
+        <version.lib.oci>3.75.0</version.lib.oci>
         <version.lib.ojdbc.family>23</version.lib.ojdbc.family>
         <version.lib.ojdbc>${version.lib.ojdbc.family}.9.0.25.07</version.lib.ojdbc>
         <version.lib.ojdbc8>${version.lib.ojdbc}</version.lib.ojdbc8>
