@@ -23,7 +23,7 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-bom</artifactId>
-        <version>4.3.0-SNAPSHOT</version>
+        <version>4.4.0-SNAPSHOT</version>
         <relativePath>../bom/pom.xml</relativePath>
     </parent>
     <artifactId>helidon-dependencies</artifactId>
@@ -141,7 +141,7 @@
         <version.lib.narayana>7.0.0.Final</version.lib.narayana>
         <version.lib.neo4j>5.28.3</version.lib.neo4j>
         <version.lib.netty>4.1.126.Final</version.lib.netty>
-        <version.lib.oci>3.75.0</version.lib.oci>
+        <version.lib.oci>3.76.0</version.lib.oci>
         <version.lib.ojdbc.family>23</version.lib.ojdbc.family>
         <version.lib.ojdbc>${version.lib.ojdbc.family}.9.0.25.07</version.lib.ojdbc>
         <version.lib.ojdbc8>${version.lib.ojdbc}</version.lib.ojdbc8>
