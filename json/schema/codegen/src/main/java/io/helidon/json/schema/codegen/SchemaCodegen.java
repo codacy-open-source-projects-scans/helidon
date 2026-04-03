@@ -23,6 +23,7 @@ import java.util.Collection;
 
 import io.helidon.codegen.CodegenContext;
 import io.helidon.codegen.CodegenException;
+import io.helidon.codegen.CodegenUtil;
 import io.helidon.codegen.RoundContext;
 import io.helidon.codegen.classmodel.ClassModel;
 import io.helidon.codegen.classmodel.TypeArgument;
@@ -36,6 +37,7 @@ import io.helidon.common.types.TypeNames;
 import io.helidon.metadata.hson.Hson;
 
 class SchemaCodegen implements CodegenExtension {
+    private static final TypeName GENERATOR = TypeName.create(SchemaCodegen.class);
 
     private final CodegenContext ctx;
 
@@ -67,12 +69,20 @@ class SchemaCodegen implements CodegenExtension {
                 .build();
         ClassModel.Builder builder = ClassModel.builder()
                 .type(typeName)
+                .copyright(CodegenUtil.copyright(GENERATOR,
+                                                 annotatedTypeName,
+                                                 typeName))
+                .addAnnotation(CodegenUtil.generatedAnnotation(GENERATOR,
+                                                               annotatedTypeName,
+                                                               typeName,
+                                                               "1",
+                                                               ""))
                 .accessModifier(AccessModifier.PACKAGE_PRIVATE)
                 .addInterface(SchemaTypes.JSON_SCHEMA_PROVIDER)
                 .addAnnotation(Annotation.create(SchemaTypes.SERVICE_SINGLETON))
                 .addAnnotation(Annotation.builder()
                                        .typeName(SchemaTypes.SERVICE_NAMED_BY_TYPE)
-                                       .putValue("value", annotatedTypeName)
+                                       .property("value", annotatedTypeName)
                                        .build())
                 .sortStaticFields(false)
                 .addField(fieldBuilder -> fieldBuilder.isStatic(true)
