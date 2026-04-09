@@ -282,6 +282,14 @@
             <artifactId>helidon-codegen-helidon-copyright</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.codegen</groupId>
+            <artifactId>helidon-codegen-api-stability</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.codegen</groupId>
+            <artifactId>helidon-codegen-api-stability-enforcer</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.testing</groupId>
             <artifactId>helidon-testing</artifactId>
         </dependency>
@@ -585,6 +593,10 @@
         <dependency>
             <groupId>io.helidon.webserver</groupId>
             <artifactId>helidon-webserver-access-log</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.webserver</groupId>
+            <artifactId>helidon-webserver-hsts</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.webserver</groupId>
