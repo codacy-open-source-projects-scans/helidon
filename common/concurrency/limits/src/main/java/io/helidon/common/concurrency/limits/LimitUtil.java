@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
+ * Copyright (c) 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,15 @@
  * limitations under the License.
  */
 
-/**
- * Telemetry tracing testing support.
- */
-module io.helidon.telemetry.testing.tracing {
+package io.helidon.common.concurrency.limits;
 
-    requires java.logging;
+import java.util.function.Supplier;
 
-    requires io.helidon.common.testing.junit5;
-    requires io.helidon.json;
+final class LimitUtil {
+    private LimitUtil() {
+    }
 
-    requires io.opentelemetry.exporter.logging.otlp;
-    requires hamcrest.all;
-
+    static Supplier<Long> clock(ClockConfig config) {
+        return config.clock().orElseGet(() -> System::nanoTime);
+    }
 }

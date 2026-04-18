@@ -16,6 +16,7 @@
 
 package io.helidon.webserver.websocket;
 
+import java.io.UncheckedIOException;
 import java.lang.System.Logger.Level;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -32,6 +33,7 @@ import io.helidon.http.Headers;
 import io.helidon.http.HttpPrologue;
 import io.helidon.webserver.CloseConnectionException;
 import io.helidon.webserver.ConnectionContext;
+import io.helidon.webserver.ServerConnectionException;
 import io.helidon.webserver.spi.ServerConnection;
 import io.helidon.websocket.ClientWsFrame;
 import io.helidon.websocket.ServerWsFrame;
@@ -130,10 +132,12 @@ public class WsConnection implements ServerConnection, WsSession {
         myThread = Thread.currentThread();
 
         try {
-            limit.invoke(() -> listener.onOpen(this));
+            limit.run(() -> listener.onOpen(this));
         } catch (LimitException e) {
             close(WsCloseCodes.TRY_AGAIN_LATER, "Too Many Concurrent Requests");
             return;
+        } catch (CloseConnectionException e) {
+            throw e;
         } catch (Exception e) {
             close(WsCloseCodes.UNEXPECTED_CONDITION, e.getMessage());
             return;
@@ -145,7 +149,7 @@ public class WsConnection implements ServerConnection, WsSession {
             readingNetwork = false;
             lastRequestTimestamp = DateTime.timestamp();
             try {
-                boolean result = limit.invoke(() -> processFrame(frame));
+                boolean result = limit.call(() -> processFrame(frame)).result();
                 if (!result) {
                     lastRequestTimestamp = DateTime.timestamp();
                     return;
@@ -336,8 +340,16 @@ public class WsConnection implements ServerConnection, WsSession {
             }
         }
         sendBuffer.write(frame.payloadData());
-        ctx.dataWriter().writeNow(sendBuffer);
+        writeFrame(sendBuffer);
         return this;
+    }
+
+    private void writeFrame(BufferData frameData) {
+        try {
+            ctx.dataWriter().writeNow(frameData);
+        } catch (UncheckedIOException e) {
+            throw new ServerConnectionException("Failed to write websocket frame", e);
+        }
     }
 
     private enum ContinuationType {
