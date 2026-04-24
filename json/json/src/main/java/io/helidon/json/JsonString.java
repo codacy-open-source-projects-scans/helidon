@@ -16,11 +16,12 @@
 
 package io.helidon.json;
 
+import io.helidon.common.Api;
+
 /**
  * Represents a JSON string value.
- * <p>
- * This module is incubating. These APIs may change in any version of Helidon, including backward incompatible changes.
  */
+@Api.Preview
 public final class JsonString extends JsonValue {
 
     private final byte[] buffer;
@@ -69,7 +70,7 @@ public final class JsonString extends JsonValue {
      * @param length the number of bytes that belong to the string value
      * @return a new JsonString
      */
-    static JsonString create(byte[] buffer, int start, int length) {
+    public static JsonString create(byte[] buffer, int start, int length) {
         return new JsonString(buffer, start, length);
     }
 

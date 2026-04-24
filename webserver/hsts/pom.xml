@@ -30,6 +30,10 @@
 
     <dependencies>
         <dependency>
+            <groupId>io.helidon.common</groupId>
+            <artifactId>helidon-common</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.webserver</groupId>
             <artifactId>helidon-webserver</artifactId>
         </dependency>
@@ -38,7 +42,7 @@
             <artifactId>helidon-config</artifactId>
         </dependency>
         <dependency>
-            <groupId>io.helidon.config</groupId>
+            <groupId>io.helidon.config.metadata</groupId>
             <artifactId>helidon-config-metadata</artifactId>
             <optional>true</optional>
         </dependency>

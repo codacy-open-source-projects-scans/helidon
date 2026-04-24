@@ -47,11 +47,6 @@
                 <artifactId>helidon</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
-           <dependency>
-                <groupId>io.helidon.metrics</groupId>
-                <artifactId>helidon-metrics-prometheus</artifactId>
-                <version>${helidon.version}</version>
-            </dependency>
             <!-- graphQL -->
             <dependency>
                 <groupId>io.helidon.graphql</groupId>
@@ -112,7 +107,7 @@
                 <version>${helidon.version}</version>
             </dependency>
             <dependency>
-                <groupId>io.helidon.config</groupId>
+                <groupId>io.helidon.config.metadata</groupId>
                 <artifactId>helidon-config-metadata</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
@@ -717,6 +712,11 @@
             </dependency>
             <dependency>
                 <groupId>io.helidon.http.media</groupId>
+                <artifactId>helidon-http-media-json-smile</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.http.media</groupId>
                 <artifactId>helidon-http-media-jsonb</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
@@ -1067,6 +1067,11 @@
             <dependency>
                 <groupId>io.helidon.json</groupId>
                 <artifactId>helidon-json</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.json</groupId>
+                <artifactId>helidon-json-smile</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
             <dependency>
