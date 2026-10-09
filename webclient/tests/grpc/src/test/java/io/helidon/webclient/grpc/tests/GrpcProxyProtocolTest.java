@@ -16,25 +16,6 @@
 
 package io.helidon.webclient.grpc.tests;
 
-import static org.hamcrest.CoreMatchers.is;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import com.google.protobuf.ByteString;
-import com.google.protobuf.Empty;
-import io.grpc.stub.StreamObserver;
-import io.helidon.config.Config;
-import io.helidon.webclient.api.ClientUri;
-import io.helidon.webclient.api.ConnectionListener;
-import io.helidon.webclient.grpc.ClientUriSuppliers;
-import io.helidon.webclient.grpc.GrpcClient;
-import io.helidon.webserver.ProxyProtocolData;
-import io.helidon.webserver.ProxyProtocolV2Data;
-import io.helidon.webserver.WebServer;
-import io.helidon.webserver.grpc.GrpcRouting;
-import io.helidon.webserver.grpc.ServerContextKeys;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
-
 import java.io.IOException;
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
@@ -43,15 +24,54 @@ import java.net.UnixDomainSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
+
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
+
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
+import io.grpc.CallOptions;
+import io.grpc.stub.ClientCalls;
+import io.grpc.stub.StreamObserver;
+
+import io.helidon.common.configurable.AllowList;
+import io.helidon.common.configurable.Resource;
+import io.helidon.common.tls.Tls;
+import io.helidon.config.Config;
+import io.helidon.webclient.api.ClientUri;
+import io.helidon.webclient.api.ConnectionListener;
+import io.helidon.webclient.api.SniMode;
+import io.helidon.webclient.grpc.ClientUriSuppliers;
+import io.helidon.webclient.grpc.GrpcClient;
+import io.helidon.webserver.ProxyProtocolData;
+import io.helidon.webserver.ProxyProtocolV2Data;
+import io.helidon.webserver.TcpTransportConfig;
+import io.helidon.webserver.UdsTransportConfig;
+import io.helidon.webserver.WebServer;
+import io.helidon.webserver.grpc.GrpcRouting;
+import io.helidon.webserver.grpc.ServerContextKeys;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 public class GrpcProxyProtocolTest {
+    private static final String LOGICAL_HOST = "service.example";
+    private static final String LOGICAL_AUTHORITY = LOGICAL_HOST + ":8443";
+    private static final String BASE_AUTHORITY = "base.example:9443";
+
     @TempDir
     public Path tempDir;
 
     @Test
     public void testProxyProtocolV1OverTcp() {
         var server = WebServer.builder()
-            .enableProxyProtocol(true)
+            .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
             .tls(t -> t.enabled(false))
             .bindAddress(new InetSocketAddress(Inet4Address.getLoopbackAddress(), 0))
             .addRouting(GrpcRouting.builder().unary(Proxy.getDescriptor(),
@@ -83,7 +103,7 @@ public class GrpcProxyProtocolTest {
     @Test
     public void testProxyProtocolV2OverTcp() throws IOException {
         var server = WebServer.builder()
-            .enableProxyProtocol(true)
+            .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
             .tls(t -> t.enabled(false))
             .bindAddress(new InetSocketAddress(Inet4Address.getLoopbackAddress(), 0))
             .addRouting(GrpcRouting.builder().unary(Proxy.getDescriptor(),
@@ -142,9 +162,10 @@ public class GrpcProxyProtocolTest {
         var bindAddress = UnixDomainSocketAddress.of(tempDir.resolve("uds.socket"));
 
         var server = WebServer.builder()
-            .enableProxyProtocol(true)
+            .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
             .tls(t -> t.enabled(false))
-            .bindAddress(bindAddress)
+            .addBinding(disabledTcpBinding())
+            .addBinding(udsBinding(bindAddress))
             .addRouting(GrpcRouting.builder().unary(Proxy.getDescriptor(),
                 "ProxyProtocolService",
                 "GetData",
@@ -182,9 +203,10 @@ public class GrpcProxyProtocolTest {
         var bindAddress = UnixDomainSocketAddress.of(tempDir.resolve("uds.socket"));
 
         var server = WebServer.builder()
-            .enableProxyProtocol(true)
+            .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
             .tls(t -> t.enabled(false))
-            .bindAddress(bindAddress)
+            .addBinding(disabledTcpBinding())
+            .addBinding(udsBinding(bindAddress))
             .addRouting(GrpcRouting.builder().unary(Proxy.getDescriptor(),
                 "ProxyProtocolService",
                 "GetData",
@@ -241,6 +263,97 @@ public class GrpcProxyProtocolTest {
         server.stop();
     }
 
+    @Test
+    public void testTlsOverUdsUsesLogicalAuthority() throws IOException {
+        Files.createDirectories(tempDir);
+        var bindAddress = UnixDomainSocketAddress.of(tempDir.resolve("tls-uds.socket"));
+
+        var server = WebServer.builder()
+            .tls(serverTls())
+            .addBinding(disabledTcpBinding())
+            .addBinding(udsBinding(bindAddress))
+            .addRouting(GrpcRouting.builder()
+                .unary(Strings.getDescriptor(), "StringService", "Upper", GrpcProxyProtocolTest::upper))
+            .build();
+        server.start();
+
+        GrpcClient grpcClient = GrpcClient.create(b -> b
+            .config(Config.create().get("grpc-client"))
+            .tls(clientTls())
+            .baseUri(URI.create("https://" + BASE_AUTHORITY))
+            .clientUriSupplier(ClientUriSuppliers.SingleSupplier.create(ClientUri.create()
+                .scheme("https")
+                .host(LOGICAL_HOST)
+                .port(8443)
+                .path("/")))
+            .baseAddress(bindAddress));
+        var service = StringServiceGrpc.newBlockingStub(grpcClient.channel());
+        var response = service.upper(Strings.StringMessage.newBuilder()
+                                             .setText("hello")
+                                             .build());
+
+        assertThat(response.getText(), is("HELLO"));
+
+        server.stop();
+    }
+
+    @Test
+    public void testTlsOverTcpUsesConfiguredSni() {
+        var server = WebServer.builder()
+            .tls(serverTls())
+            .bindAddress(new InetSocketAddress(Inet4Address.getLoopbackAddress(), 0))
+            .addRouting(GrpcRouting.builder()
+                .unary(Strings.getDescriptor(), "StringService", "Upper", GrpcProxyProtocolTest::upper))
+            .build();
+        server.start();
+
+        try {
+            GrpcClient grpcClient = GrpcClient.create(b -> b
+                .config(Config.create().get("grpc-client"))
+                .tls(clientTls())
+                .sni(sni -> sni.mode(SniMode.EXPLICIT)
+                        .host(LOGICAL_HOST))
+                .baseUri(URI.create("https://127.0.0.1:" + server.port())));
+            var service = StringServiceGrpc.newBlockingStub(grpcClient.channel());
+            var response = service.upper(Strings.StringMessage.newBuilder()
+                                                 .setText("hello")
+                                                 .build());
+
+            assertThat(response.getText(), is("HELLO"));
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    public void testTlsOverTcpHostHeaderSniUsesGrpcAuthority() {
+        var server = WebServer.builder()
+            .tls(serverTls())
+            .bindAddress(new InetSocketAddress(Inet4Address.getLoopbackAddress(), 0))
+            .addRouting(GrpcRouting.builder()
+                .unary(Strings.getDescriptor(), "StringService", "Upper", GrpcProxyProtocolTest::upper))
+            .build();
+        server.start();
+
+        try {
+            GrpcClient grpcClient = GrpcClient.create(b -> b
+                .config(Config.create().get("grpc-client"))
+                .tls(clientTls())
+                .sni(sni -> sni.mode(SniMode.HOST_HEADER))
+                .baseUri(URI.create("https://127.0.0.1:" + server.port())));
+            var response = ClientCalls.blockingUnaryCall(grpcClient.channel(),
+                                                         StringServiceGrpc.getUpperMethod(),
+                                                         CallOptions.DEFAULT.withAuthority(LOGICAL_AUTHORITY),
+                                                         Strings.StringMessage.newBuilder()
+                                                                 .setText("hello")
+                                                                 .build());
+
+            assertThat(response.getText(), is("HELLO"));
+        } finally {
+            server.stop();
+        }
+    }
+
     private ConnectionListener v1Listener(String proxyHeader) {
         return ConnectionListener.createWriteOnConnect(proxyHeader.getBytes(StandardCharsets.UTF_8));
     }
@@ -251,6 +364,18 @@ public class GrpcProxyProtocolTest {
             proxyHeaderBytes[i] = (byte) proxyHeader[i];
         }
         return ConnectionListener.createWriteOnConnect(proxyHeaderBytes);
+    }
+
+    private static TcpTransportConfig disabledTcpBinding() {
+        return TcpTransportConfig.builder()
+                .enabled(false)
+                .build();
+    }
+
+    private static UdsTransportConfig udsBinding(UnixDomainSocketAddress socketAddress) {
+        return UdsTransportConfig.builder()
+                .socket(socketAddress)
+                .build();
     }
 
     static void getProxyData(Empty req, StreamObserver<Proxy.ProxyProtocolDataMessage> streamObserver) {
@@ -280,5 +405,40 @@ public class GrpcProxyProtocolTest {
         }
         streamObserver.onNext(response.build());
         streamObserver.onCompleted();
+    }
+
+    private static void upper(Strings.StringMessage req, StreamObserver<Strings.StringMessage> streamObserver) {
+        streamObserver.onNext(Strings.StringMessage.newBuilder()
+                                      .setText(req.getText().toUpperCase(Locale.ROOT))
+                                      .build());
+        streamObserver.onCompleted();
+    }
+
+    private static Tls serverTls() {
+        SSLParameters parameters = new SSLParameters();
+        parameters.setSNIMatchers(List.of(SNIHostName.createSNIMatcher(Pattern.quote(LOGICAL_HOST))));
+
+        return Tls.builder()
+                .sslParameters(parameters)
+                .privateKey(key -> key
+                        .keystore(store -> store
+                                .passphrase("changeit")
+                                .keystore(Resource.create("uds-server.p12"))))
+                .privateKeyCertChain(key -> key
+                        .keystore(store -> store
+                                .trustStore(true)
+                                .passphrase("changeit")
+                                .keystore(Resource.create("uds-server.p12"))))
+                .build();
+    }
+
+    private static Tls clientTls() {
+        return Tls.builder()
+                .trust(trust -> trust
+                        .keystore(store -> store
+                                .passphrase("changeit")
+                                .trustStore(true)
+                                .keystore(Resource.create("uds-client.p12"))))
+                .build();
     }
 }

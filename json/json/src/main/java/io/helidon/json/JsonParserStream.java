@@ -78,7 +78,7 @@ final class JsonParserStream extends JsonParserBase {
             throw new UncheckedIOException("Error occurred while reading JSON to the buffer", e);
         }
         if (bufferLength == 0) {
-            throw new JsonException("Empty JSON input provided");
+            throw new JsonDecodingException("Empty JSON input provided");
         }
     }
 
@@ -118,7 +118,7 @@ final class JsonParserStream extends JsonParserBase {
                 // 1. Compact: shift unneeded prefix out so the required bytes can fit.
                 int preserveFrom;
                 if (replayMarked && mark >= 0 && mark <= currentIndex) {
-                    preserveFrom = mark;
+                    preserveFrom = bufferingJsonValue ? Math.min(mark, jsonValueStart) : mark;
                 } else if (bufferingJsonValue) {
                     preserveFrom = jsonValueStart;
                 } else {
@@ -133,6 +133,9 @@ final class JsonParserStream extends JsonParserBase {
                 }
                 bufferLength = kept;
                 currentIndex -= shift;
+                if (bufferingJsonValue) {
+                    jsonValueStart -= shift;
+                }
                 if (mark >= 0) {
                     mark = Math.max(0, mark - shift);
                 }
@@ -151,14 +154,16 @@ final class JsonParserStream extends JsonParserBase {
                 }
 
                 // 3. Read from the stream until we have enough bytes or EOF.
-                int lastRead = inputStream.read(buffer, kept, buffer.length - kept);
-                if (lastRead == -1) {
-                    finished = true;
-                    throw createException("Unexpected end of the binary JSON found");
+                while (currentIndex + amount >= bufferLength) {
+                    int lastRead = inputStream.read(buffer, bufferLength, buffer.length - bufferLength);
+                    if (lastRead == -1) {
+                        finished = true;
+                        throw createException("Unexpected end of the JSON stream found");
+                    }
+                    bufferLength += lastRead;
                 }
-                bufferLength = kept + lastRead;
             } catch (IOException e) {
-                throw new JsonException("Failed to read more Smile data from stream", e);
+                throw new JsonException("Failed to read more JSON data from stream", e);
             }
         }
     }
@@ -283,12 +288,12 @@ final class JsonParserStream extends JsonParserBase {
 
     @Override
     public JsonException createException(String message) {
-        return new JsonException(exceptionMessage(message));
+        return new JsonDecodingException(exceptionMessage(message));
     }
 
     @Override
     public JsonException createException(String message, Exception e) {
-        return new JsonException(exceptionMessage(message), e);
+        return new JsonDecodingException(exceptionMessage(message), e);
     }
 
     private String exceptionMessage(String message) {
@@ -830,7 +835,7 @@ final class JsonParserStream extends JsonParserBase {
     public JsonNumber readJsonNumber() {
         bufferingJsonValue = true;
         jsonValueStart = currentIndex;
-        skipNumber();
+        boolean hasExponent = skipJsonNumber();
         int length = currentIndex - jsonValueStart;
         if (currentIndex < bufferLength) {
             length++;
@@ -838,7 +843,7 @@ final class JsonParserStream extends JsonParserBase {
         byte[] numberBytes = new byte[length];
         System.arraycopy(buffer, jsonValueStart, numberBytes, 0, length);
         bufferingJsonValue = false;
-        return JsonNumber.create(numberBytes, 0, length);
+        return JsonNumber.create(numberBytes, 0, length, this, hasExponent);
     }
 
     void skipNumber() {
@@ -901,7 +906,11 @@ final class JsonParserStream extends JsonParserBase {
             if (finished) {
                 throw createException("Unexpected end of string. Incomplete JSON or incorrect use of the skip method");
             }
+            int previousIndex = currentIndex;
             readMoreData();
+            if (currentIndex < previousIndex) {
+                currentIndex++;
+            }
         }
     }
 
@@ -1243,7 +1252,11 @@ final class JsonParserStream extends JsonParserBase {
         int length = currentIndex - jsonValueStart;
         byte[] bytes = new byte[length];
         System.arraycopy(buffer, jsonValueStart, bytes, 0, length);
-        return Base64.getDecoder().decode(bytes);
+        try {
+            return Base64.getDecoder().decode(bytes);
+        } catch (IllegalArgumentException e) {
+            throw createException("Invalid Base64 value", e);
+        }
     }
 
     @Override
@@ -1344,6 +1357,31 @@ final class JsonParserStream extends JsonParserBase {
             currentIndex = bufferLength - 1;
             readMoreData();
             index = currentIndex + 1;
+        }
+    }
+
+    private boolean skipJsonNumber() {
+        boolean hasExponent = false;
+        int index;
+        while (true) {
+            for (index = currentIndex; index < bufferLength; index++) {
+                byte b = buffer[index];
+                if (!VALID_NUMBER_PARTS[b]) {
+                    currentIndex = index - 1;
+                    return hasExponent;
+                }
+                // Only exponent markers among valid number parts sort above '9'.
+                if (b > '9') {
+                    hasExponent = true;
+                }
+            }
+            if (!finished) {
+                currentIndex = index;
+                readMoreData();
+            } else {
+                currentIndex = index - 1;
+                return hasExponent;
+            }
         }
     }
 
@@ -2349,24 +2387,12 @@ final class JsonParserStream extends JsonParserBase {
     }
 
     private void skipObject() {
-        byte b = nextToken();
-        if (b == '}') {
-            return;
-        }
-        if (b == '"') {
-            skipString();
-            b = nextToken();
-        } else {
-            throw createException("Key name start expected", b);
-        }
-        if (b != ':') {
-            throw createException("Colon expected after the key", b);
-        }
-        nextToken();
-        skip();
-        b = nextToken();
-        while (b == ',') {
-            b = nextToken();
+        enterStructure();
+        try {
+            byte b = nextToken();
+            if (b == '}') {
+                return;
+            }
             if (b == '"') {
                 skipString();
                 b = nextToken();
@@ -2379,31 +2405,51 @@ final class JsonParserStream extends JsonParserBase {
             nextToken();
             skip();
             b = nextToken();
-        }
+            while (b == ',') {
+                b = nextToken();
+                if (b == '"') {
+                    skipString();
+                    b = nextToken();
+                } else {
+                    throw createException("Key name start expected", b);
+                }
+                if (b != ':') {
+                    throw createException("Colon expected after the key", b);
+                }
+                nextToken();
+                skip();
+                b = nextToken();
+            }
 
-        if (b == '}') {
-            return;
+            if (b != '}') {
+                throw createException("Comma or the end of the object expected", b);
+            }
+        } finally {
+            exitStructure();
         }
-        throw createException("Comma or the end of the object expected", b);
     }
 
     private void skipArray() {
-        byte b = nextToken();
-        if (b == ']') {
-            return;
-        }
-        skip(); // Skip the first array value
-        b = nextToken();
-        while (b == ',') {
-            nextToken();
-            skip();
+        enterStructure();
+        try {
+            byte b = nextToken();
+            if (b == ']') {
+                return;
+            }
+            skip(); // Skip the first array value
             b = nextToken();
-        }
+            while (b == ',') {
+                nextToken();
+                skip();
+                b = nextToken();
+            }
 
-        if (b == ']') {
-            return;
+            if (b != ']') {
+                throw createException("Comma or the end of the array expected", b);
+            }
+        } finally {
+            exitStructure();
         }
-        throw createException("Comma or the end of the array expected", b);
     }
 
     private boolean expectedNext(char c) {

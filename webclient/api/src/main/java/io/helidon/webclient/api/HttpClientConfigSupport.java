@@ -20,7 +20,9 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
 import java.net.UnixDomainSocketAddress;
+import java.util.LinkedHashSet;
 import java.util.ServiceLoader;
+import java.util.Set;
 
 import io.helidon.builder.api.Prototype;
 import io.helidon.common.HelidonServiceLoader;
@@ -29,6 +31,7 @@ import io.helidon.common.socket.SocketOptions;
 import io.helidon.common.tls.Tls;
 import io.helidon.config.Config;
 import io.helidon.http.HeaderName;
+import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.MediaContext;
@@ -36,6 +39,7 @@ import io.helidon.webclient.spi.DnsResolver;
 import io.helidon.webclient.spi.DnsResolverProvider;
 
 class HttpClientConfigSupport {
+    private static final String UNIX_DOMAIN_SOCKET_PREFIX = "unix:";
     private static final LazyValue<Tls> EMPTY_TLS = LazyValue.create(() -> Tls.builder().build());
     private static final LazyValue<DnsResolver> DISCOVERED_DNS_RESOLVER = LazyValue.create(() -> {
         return HelidonServiceLoader.builder(ServiceLoader.load(DnsResolverProvider.class))
@@ -149,6 +153,17 @@ class HttpClientConfigSupport {
         }
 
         /**
+         * Add a header name to strip on cross-origin redirects.
+         *
+         * @param builder builder to update
+         * @param headerName header name to add
+         */
+        @Prototype.BuilderMethod
+        static void addRedirectSensitiveHeader(HttpClientConfig.BuilderBase<?, ?> builder, String headerName) {
+            builder.addRedirectSensitiveHeader(HeaderNames.create(headerName));
+        }
+
+        /**
          * Config method to get {@link io.helidon.webclient.api.ClientUri}.
          *
          * @param config configuration instance
@@ -159,12 +174,25 @@ class HttpClientConfigSupport {
             return config.as(URI.class).map(ClientUri::create).orElseThrow();
         }
 
+        /**
+         * Config method to get redirect-sensitive header names.
+         *
+         * @param config configuration instance
+         * @return header name configured on the config node
+         */
+        @Prototype.ConfigFactoryMethod("redirectSensitiveHeaders")
+        static HeaderName createRedirectSensitiveHeader(Config config) {
+            return config.asString()
+                    .map(HeaderNames::create)
+                    .orElseThrow(() -> new IllegalStateException("Config node did not contain a header name"));
+        }
+
         @Prototype.ConfigFactoryMethod("baseAddress")
         static SocketAddress createBaseAddress(Config config) {
             String address = config.asString().get();
             // unix:/path/to/socket
-            if (address.startsWith("unix:")) {
-                String path = address.substring(7);
+            if (address.startsWith(UNIX_DOMAIN_SOCKET_PREFIX)) {
+                String path = address.substring(UNIX_DOMAIN_SOCKET_PREFIX.length());
                 return UnixDomainSocketAddress.of(path);
             }
             // must be localhost:8080 or similar (localhost, :8080 are also OK)
@@ -210,6 +238,12 @@ class HttpClientConfigSupport {
             target.defaultHeadersMap()
                     .forEach(target::addHeader);
 
+            if (!target.redirectSensitiveHeaders().contains(HeaderNames.AUTHORIZATION)
+                    || !target.redirectSensitiveHeaders().contains(HeaderNames.COOKIE)
+                    || !target.redirectSensitiveHeaders().contains(HeaderNames.PROXY_AUTHORIZATION)) {
+                target.redirectSensitiveHeaders(withDefaultRedirectSensitiveHeaders(target.redirectSensitiveHeaders()));
+            }
+
             if (!target.mediaSupports().isEmpty()) {
                 target.mediaContext(MediaContext.builder()
                                             .update(it -> target.mediaSupports().forEach(it::addMediaSupport))
@@ -228,6 +262,15 @@ class HttpClientConfigSupport {
             if (target.proxy().isEmpty()) {
                 target.proxy(Proxy.create());
             }
+        }
+
+        private static Set<HeaderName> withDefaultRedirectSensitiveHeaders(Set<HeaderName> headerNames) {
+            Set<HeaderName> effectiveHeaderNames = new LinkedHashSet<>(headerNames.size() + 3);
+            effectiveHeaderNames.add(HeaderNames.AUTHORIZATION);
+            effectiveHeaderNames.add(HeaderNames.COOKIE);
+            effectiveHeaderNames.add(HeaderNames.PROXY_AUTHORIZATION);
+            effectiveHeaderNames.addAll(headerNames);
+            return Set.copyOf(effectiveHeaderNames);
         }
     }
 }

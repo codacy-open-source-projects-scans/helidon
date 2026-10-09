@@ -30,11 +30,13 @@ import java.util.Optional;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
+import io.helidon.common.Api;
 import io.helidon.common.concurrency.limits.Limit;
 import io.helidon.common.concurrency.limits.spi.LimitProvider;
 import io.helidon.common.context.Context;
 import io.helidon.common.socket.SocketOptions;
 import io.helidon.common.tls.Tls;
+import io.helidon.config.ConfigException;
 import io.helidon.http.RequestedUriDiscoveryContext;
 import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.MediaContext;
@@ -43,6 +45,9 @@ import io.helidon.webserver.http.HttpRouting;
 import io.helidon.webserver.spi.ProtocolConfig;
 import io.helidon.webserver.spi.ProtocolConfigProvider;
 import io.helidon.webserver.spi.ServerConnectionSelector;
+import io.helidon.webserver.spi.ServerConnectionSelectorProvider;
+import io.helidon.webserver.spi.TransportBindingFactory;
+import io.helidon.webserver.spi.TransportBindingFactoryProvider;
 
 /**
  * Configuration of a server listener (server socket).
@@ -50,6 +55,7 @@ import io.helidon.webserver.spi.ServerConnectionSelector;
 @Prototype.Configured
 @Prototype.Blueprint(decorator = WebServerConfigSupport.ListenerConfigDecorator.class)
 @Prototype.CustomMethods(WebServerConfigSupport.ListenerCustomMethods.class)
+@Prototype.IncludeDefaultMethods({"bindings", "proxyProtocol"})
 interface ListenerConfigBlueprint {
     /**
      * Configuration of protocols. This may be either protocol selectors, or protocol upgraders from HTTP/1.1.
@@ -72,6 +78,29 @@ interface ListenerConfigBlueprint {
     @Option.Singular
     @Option.Provider(ProtocolConfigProvider.class)
     List<ProtocolConfig> protocols();
+
+    /**
+     * Transport bindings that serve this listener are configured as one object keyed by binding type; list form and
+     * nested {@code name} or {@code type} are invalid, and built-in TCP remains enabled unless
+     * {@code bindings.tcp.enabled=false}.
+     * <p>
+     * Configuration uses one object keyed by binding type. The object key is the binding's sole identity; list form and
+     * nested {@code type} or {@code name} properties are not supported. Each binding type may occur at most once.
+     * <p>
+     * TCP is an overlay default: when no TCP binding is configured, the listener adds the built-in TCP binding even when
+     * another binding is configured. Set {@code bindings.tcp.enabled=false} to explicitly disable TCP. An explicit TCP
+     * entry replaces the synthesized default.
+     *
+     * @return configured transport bindings
+     */
+    @Option.Configured
+    @Option.Singular
+    @Option.Provider(value = TransportBindingFactoryProvider.class,
+                     identity = Option.Provider.Identity.TYPE_ONLY)
+    @Api.Internal
+    default List<TransportBindingFactory> bindings() {
+        return List.of();
+    }
 
     /**
      * Http routing. This will always be added to the resulting {@link io.helidon.webserver.Router}, if defined,
@@ -119,8 +148,12 @@ interface ListenerConfigBlueprint {
     InetAddress address();
 
     /**
-     * The address to bind to. This is to permit both Internet Address ({@code <host>:<port>}) and Unix Domain socket
-     * ({@code unix:/path/to/socket}). If this is set it will override {@link #host()}, {@link #address()} and {@link #port()}.
+     * The TCP address to bind to ({@code <host>:<port>}); Unix domain addresses are rejected and must instead use
+     * {@code bindings.uds.socket}. If this is set it will override {@link #host()}, {@link #address()} and {@link #port()}.
+     * <p>
+     * To bind a Unix domain socket, configure an explicit {@code uds} transport binding instead.
+     * The legacy {@code unix:/path} form is rejected; use {@code bindings.uds.socket=/path} and explicitly disable TCP
+     * when the listener should be UDS-only.
      *
      * @return the socket address to bind on.
      */
@@ -210,6 +243,28 @@ interface ListenerConfigBlueprint {
     Optional<Tls> tls();
 
     /**
+     * Listener TLS virtual hosts selected by SNI; requires listener TLS and NIO socket-channel transport
+     * ({@code use-nio=true}).
+     * <p>
+     * Virtual hosts select TLS material only. The listener routing is used for all requests.
+     * Server startup fails if virtual hosts are configured without listener TLS or with {@code use-nio} disabled.
+     *
+     * @return configured listener virtual hosts
+     */
+    @Option.Configured
+    @Option.Singular
+    List<VirtualHostConfig> virtualHosts();
+
+    /**
+     * Listener-scoped server TLS SNI policy.
+     *
+     * @return SNI policy
+     */
+    @Option.Configured
+    @Option.DefaultMethod("create")
+    SniConfig sni();
+
+    /**
      * Configure the listener specific {@link io.helidon.http.encoding.ContentEncodingContext}.
      * This method discards all previously registered ContentEncodingContext.
      * If no content encoding context is registered, content encoding context of the webserver would be used.
@@ -239,15 +294,35 @@ interface ListenerConfigBlueprint {
     SocketOptions connectionOptions();
 
     /**
-     * Limits the number of connections that can be opened at a single point in time.
+     * Limits listener-wide connection admission shared by all connection-oriented bindings.
+     *
+     * @return pre-accept connection admission capacity for this listener
+     * @deprecated use {@link #maxConnections()}
+     */
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    @Option.Deprecated("maxConnections")
+    @Option.Configured
+    @Option.DefaultInt(-1)
+    @Option.Decorator(WebServerConfigSupport.MaxTcpConnectionsDecorator.class)
+    int maxTcpConnections();
+
+    /**
+     * Limits listener-wide connection admission shared by all connection-oriented bindings.
+     * A permit is acquired before accepting or admitting connection work and released after the connection finishes,
+     * or immediately if admission, setup, or submission fails.
      * Defaults to {@code -1}, meaning "unlimited" - what the system allows.
      * {@code 0} has the same meaning as {@code -1} - unlimited number of connections.
+     * A finite value must be at least the number of active connection-oriented bindings that reserve a permit while
+     * waiting to accept; listener planning fails otherwise.
+     * If the finite limit is {@code L} and {@code N} active bindings hold an idle permit, concentrated traffic has
+     * worst-case immediately usable capacity {@code L - N + 1}. The shared limit provides neither per-binding quotas nor
+     * strict fairness; an event-driven binding can be temporarily starved while idle pre-accept reservations are held.
      *
-     * @return number of TCP connections that can be opened to this listener, regardless of protocol
+     * @return pre-accept connection admission capacity for this listener, regardless of transport binding or protocol
      */
     @Option.Configured
     @Option.DefaultInt(-1)
-    int maxTcpConnections();
+    int maxConnections();
 
     /**
      * Limits the number of requests that can be executed at the same time (the number of active virtual threads of requests).
@@ -336,6 +411,17 @@ interface ListenerConfigBlueprint {
     List<ServerConnectionSelector> connectionSelectors();
 
     /**
+     * Providers of connection selectors discovered for this listener.
+     *
+     * @return connection selector providers
+     */
+    @SuppressWarnings("rawtypes")
+    @Api.Internal
+    @Option.Provider(ServerConnectionSelectorProvider.class)
+    @Option.Singular
+    List<ServerConnectionSelectorProvider> connectionSelectorProviders();
+
+    /**
      * Direct handlers specific for this listener.
      * A direct handler takes care of problems that happen before (or outside of) routing, such as bad request.
      *
@@ -355,18 +441,43 @@ interface ListenerConfigBlueprint {
     Optional<Context> listenerContext();
 
     /**
-     * Enable proxy protocol support for this socket. This protocol is supported by
+     * Deprecated PROXY protocol enablement flag for this socket. This protocol is supported by
      * some load balancers/reverse proxies as a means to convey client information that
      * would otherwise be lost. If enabled, the proxy protocol header must be present
      * on every new connection established with your server. For more information,
      * see <a href="https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt">
      * the specification</a>. Default is {@code false}.
+     * <p>
+     * This deprecated option cannot enable PROXY protocol support by itself. Configure
+     * {@link #proxyProtocol()} with {@link ProxyProtocolConfig#trustedProxies()} instead.
      *
      * @return proxy support status
+     * @deprecated use {@link #proxyProtocol()} instead
      */
+    @Deprecated(forRemoval = true, since = "4.5.2")
     @Option.Configured
     @Option.Default("false")
     boolean enableProxyProtocol();
+
+    /**
+     * PROXY protocol configuration.
+     * <p>
+     * If configured and {@link ProxyProtocolConfig#enabled()} is {@code true}, PROXY protocol support is enabled for this
+     * listener. The {@link ProxyProtocolConfig#trustedProxies()} allow list must be configured explicitly when support is
+     * enabled.
+     *
+     * @return PROXY protocol configuration
+     */
+    @Option.Configured("proxy-protocol")
+    @SuppressWarnings("removal")
+    default Optional<ProxyProtocolConfig> proxyProtocol() {
+        if (enableProxyProtocol()) {
+            throw new ConfigException("The deprecated \"enable-proxy-protocol\" option cannot enable PROXY protocol"
+                                              + " support by itself. Configure \"proxy-protocol.trusted-proxies\""
+                                              + " for the listener.");
+        }
+        return Optional.empty();
+    }
 
     /**
      * Requested URI discovery context.
@@ -442,7 +553,8 @@ interface ListenerConfigBlueprint {
     boolean ignoreInvalidNamedRouting();
 
     /**
-     * If set to {@code true}, use NIO socket channel, instead of a socket. Listener will always be a channel.
+     * Whether to use an NIO socket channel instead of a socket; Unix domain socket bindings always use NIO and ignore
+     * this setting, while listener TLS virtual hosts require it to be {@code true}.
      *
      * @return whether to use NIO socket channel, defaults to {@code true}
      */

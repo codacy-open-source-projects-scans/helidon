@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import io.helidon.common.buffers.Ascii;
+import io.helidon.common.buffers.BufferData;
 
 /*
  * Do not add random headers here. These headers are optimized for performance, and each header added to this enum
@@ -28,7 +29,6 @@ import io.helidon.common.buffers.Ascii;
  */
 enum HeaderNameEnum implements HeaderName {
     ACCEPT(Strings.ACCEPT_NAME),
-    ACCEPT_CHARSET(Strings.ACCEPT_CHARSET_NAME),
     ACCEPT_ENCODING(Strings.ACCEPT_ENCODING_NAME),
     ACCEPT_LANGUAGE(Strings.ACCEPT_LANGUAGE_NAME),
     ACCEPT_DATETIME(Strings.ACCEPT_DATETIME_NAME),
@@ -82,18 +82,14 @@ enum HeaderNameEnum implements HeaderName {
     LINK(Strings.LINK_NAME),
     LOCATION(Strings.LOCATION_NAME),
     PRAGMA(Strings.PRAGMA_NAME),
-    PUBLIC_KEY_PINS(Strings.PUBLIC_KEY_PINS_NAME),
     RETRY_AFTER(Strings.RETRY_AFTER_NAME),
     SERVER(Strings.SERVER_NAME),
     SET_COOKIE(Strings.SET_COOKIE_NAME),
-    SET_COOKIE2(Strings.SET_COOKIE2_NAME),
     STRICT_TRANSPORT_SECURITY(Strings.STRICT_TRANSPORT_SECURITY_NAME),
     TRAILER(Strings.TRAILER_NAME),
     TRANSFER_ENCODING(Strings.TRANSFER_ENCODING_NAME),
-    TSV(Strings.TSV_NAME),
     UPGRADE(Strings.UPGRADE_NAME),
     VARY(Strings.VARY_NAME),
-    WARNING(Strings.WARNING_NAME),
     WWW_AUTHENTICATE(Strings.WWW_AUTHENTICATE_NAME),
     X_CONTENT_TYPE_OPTIONS(Strings.X_CONTENT_TYPE_OPTIONS_NAME),
     X_FORWARDED_FOR(Strings.X_FORWARDED_FOR_NAME),
@@ -158,7 +154,11 @@ enum HeaderNameEnum implements HeaderName {
 
     @Override
     public byte[] nameBytes() {
-        return nameBytes;
+        return nameBytes.clone();
+    }
+
+    void writeName(BufferData buffer) {
+        BufferData.writeFromShared(buffer, nameBytes);
     }
 
     static class Strings {
@@ -197,17 +197,19 @@ enum HeaderNameEnum implements HeaderName {
         static final String USER_AGENT_NAME = "User-Agent";
         static final String VIA_NAME = "Via";
         static final String ACCEPT_PATCH_NAME = "Accept-Patch";
+        static final String ACCEPT_QUERY_NAME = "Accept-Query";
         static final String ACCEPT_RANGES_NAME = "Accept-Ranges";
         static final String AGE_NAME = "Age";
         static final String ALLOW_NAME = "Allow";
         static final String ALT_SVC_NAME = "Alt-Svc";
+        static final String ALT_USED_NAME = "Alt-Used";
         static final String CACHE_CONTROL_NAME = "Cache-Control";
         static final String CONNECTION_NAME = "Connection";
         static final String CONTENT_DISPOSITION_NAME = "Content-Disposition";
         static final String CONTENT_ENCODING_NAME = "Content-Encoding";
         static final String CONTENT_LANGUAGE_NAME = "Content-Language";
         static final String CONTENT_LENGTH_NAME = "Content-Length";
-        static final String CONTENT_LOCATION_NAME = "aa";
+        static final String CONTENT_LOCATION_NAME = "Content-Location";
         static final String CONTENT_RANGE_NAME = "Content-Range";
         static final String CONTENT_TYPE_NAME = "Content-Type";
         static final String DATE_NAME = "Date";

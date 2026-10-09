@@ -95,7 +95,9 @@ interface CorsPathConfigBlueprint {
     Set<String> allowHeaders();
 
     /**
-     * Set of allowed methods, defaults to all.
+     * Set of allowed case-sensitive HTTP method names, defaults to all.
+     * <p>
+     * Configured names must match the exact case of both preflight and actual request methods.
      *
      * @return allowed methods
      */
@@ -119,6 +121,7 @@ interface CorsPathConfigBlueprint {
      * Whether to allow credentials.
      * <p>
      * If enabled, this will be used in {@value io.helidon.http.HeaderNames#ACCESS_CONTROL_ALLOW_CREDENTIALS_NAME} header.
+     * Credentials cannot be used with wildcard origins in an enabled CORS configuration.
      *
      * @return whether to allow credentials, defaults to {@code false}
      */

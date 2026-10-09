@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,29 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import io.helidon.common.Size;
+import io.helidon.common.buffers.BufferData;
 import io.helidon.http.Header;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
+import io.helidon.http.Method;
 import io.helidon.http.Status;
+import io.helidon.http.WritableHeaders;
+import io.helidon.http.http2.FlowControl;
+import io.helidon.http.http2.Http2ErrorCode;
+import io.helidon.http.http2.Http2Flag;
+import io.helidon.http.http2.Http2FrameData;
+import io.helidon.http.http2.Http2FrameHeader;
+import io.helidon.http.http2.Http2FrameTypes;
+import io.helidon.http.http2.Http2Headers;
+import io.helidon.http.http2.Http2RstStream;
 import io.helidon.webclient.api.ClientResponseTyped;
 import io.helidon.webclient.http2.Http2Client;
 import io.helidon.webclient.http2.Http2ClientProtocolConfig;
@@ -47,8 +60,14 @@ import io.helidon.webserver.http2.Http2Upgrader;
 import io.helidon.webserver.testing.junit5.ServerTest;
 import io.helidon.webserver.testing.junit5.SetUpRoute;
 import io.helidon.webserver.testing.junit5.SetUpServer;
+import io.helidon.webserver.testing.junit5.Socket;
+import io.helidon.webserver.testing.junit5.http2.Http2TestClient;
+import io.helidon.webserver.testing.junit5.http2.Http2TestConnection;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.hasHeader;
 import static io.helidon.http.Method.GET;
@@ -59,16 +78,28 @@ import static org.hamcrest.Matchers.containsInAnyOrder;
 @ServerTest
 public class HeadersServerTest {
 
+    private static final String SMALL_MAX_HEADERS_SOCKET = "small-max-headers";
+    private static final String LARGE_ENTITY_BUFFER_SOCKET = "large-entity-buffer";
+    private static final int SMALL_MAX_HEADERS_SIZE = 100;
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
     private static final String DATA = "Helidon!!!".repeat(10);
     private static final Header TEST_TRAILER_HEADER = HeaderValues.create("test-trailer", "trailer-value");
     private static final Header STREAM_RESULT_OK = HeaderValues.create("stream-result", "OK");
+    private static final Header INVALID_RESPONSE_HEADER = HeaderValues.create("valid-header-name", "Header\u001fValue");
     private final Http2Client client;
+    private final Http2Client responseValidationDisabledClient;
 
     HeadersServerTest(WebServer server) {
         client = Http2Client.builder()
                 .baseUri("http://localhost:" + server.port())
                 .protocolConfig(Http2ClientProtocolConfig.builder().priorKnowledge(true).build())
+                .build();
+        responseValidationDisabledClient = Http2Client.builder()
+                .baseUri("http://localhost:" + server.port("response-validation-disabled"))
+                .protocolConfig(Http2ClientProtocolConfig.builder()
+                                        .priorKnowledge(true)
+                                        .validateResponseHeaders(false)
+                                        .build())
                 .build();
     }
 
@@ -76,7 +107,25 @@ public class HeadersServerTest {
     static void setUpServer(WebServerConfig.Builder serverBuilder) {
         Http2Config http2Config = Http2Config.builder()
                 .sendErrorDetails(true)
+                .maxHeadersSize(128_000)
                 .maxHeaderListSize(128_000)
+                .build();
+        Http2Config responseValidationDisabledConfig = Http2Config.builder()
+                .sendErrorDetails(true)
+                .maxHeadersSize(128_000)
+                .maxHeaderListSize(128_000)
+                .validateResponseHeaders(false)
+                .build();
+        Http2Config smallMaxHeadersConfig = Http2Config.builder()
+                .sendErrorDetails(true)
+                .maxHeadersSize(SMALL_MAX_HEADERS_SIZE)
+                .maxHeaderListSize(128_000)
+                .build();
+        Http2Config largeEntityBufferConfig = Http2Config.builder()
+                .sendErrorDetails(true)
+                .maxHeadersSize(16_384)
+                .maxHeaderListSize(128_000)
+                .maxBufferedEntitySize(Size.create(Long.MAX_VALUE))
                 .build();
 
         serverBuilder.port(-1)
@@ -90,10 +139,42 @@ public class HeadersServerTest {
                                                .config(Http1Config.create())
                         .addUpgrader(Http2Upgrader.create(http2Config))
                         .build());
+        serverBuilder.putSocket("response-validation-disabled", socket -> socket
+                .port(-1)
+                .protocolsDiscoverServices(false)
+                .addConnectionSelector(Http2ConnectionSelector.builder()
+                                               .http2Config(responseValidationDisabledConfig)
+                                               .build()));
+        serverBuilder.putSocket(SMALL_MAX_HEADERS_SOCKET, socket -> socket
+                .port(-1)
+                .protocolsDiscoverServices(false)
+                .addConnectionSelector(Http2ConnectionSelector.builder()
+                                               .http2Config(smallMaxHeadersConfig)
+                                               .build()));
+        serverBuilder.putSocket(LARGE_ENTITY_BUFFER_SOCKET, socket -> socket
+                .port(-1)
+                .protocolsDiscoverServices(false)
+                .addConnectionSelector(Http2ConnectionSelector.builder()
+                                               .http2Config(largeEntityBufferConfig)
+                                               .build()));
     }
 
     @SetUpRoute
     static void router(HttpRouting.Builder router) {
+        routes(router);
+    }
+
+    @SetUpRoute("response-validation-disabled")
+    static void responseValidationDisabledRouter(HttpRouting.Builder router) {
+        routes(router);
+    }
+
+    @SetUpRoute(SMALL_MAX_HEADERS_SOCKET)
+    static void smallMaxHeadersRouter(HttpRouting.Builder router) {
+        routes(router);
+    }
+
+    private static void routes(HttpRouting.Builder router) {
         router.error(IllegalStateException.class, (req, res, t) -> res.status(500).send(t.getMessage()));
         router.route(Http2Route.route(GET, "/ping", (req, res) -> res.send("pong")));
         router.route(Http2Route.route(GET, "/cont-out",
@@ -145,6 +226,12 @@ public class HeadersServerTest {
         router.route(Http2Route.route(GET, "/trailers-no-trailers",
                                       (req, res) -> {
                                           res.trailers().add(TEST_TRAILER_HEADER);
+                                          res.send(DATA);
+                                      }
+        ));
+        router.route(Http2Route.route(GET, "/invalid-response-header",
+                                      (req, res) -> {
+                                          res.header(INVALID_RESPONSE_HEADER);
                                           res.send(DATA);
                                       }
         ));
@@ -219,7 +306,7 @@ public class HeadersServerTest {
                                                             HttpResponse.BodyHandlers.ofString());
 
                 int status = response.statusCode();
-                // since Java 24, we get a 400 back and not an exception
+                // The client can report the rejected headers as a 400 response.
                 assertThat("IOException or status 400 was expected, but got status " + response.statusCode()
                                    + ", headers: " + response.headers()
                                    + ", and response: " + response.body(),
@@ -228,6 +315,86 @@ public class HeadersServerTest {
             } catch (IOException e) {
                 // this is expected
             }
+        }
+    }
+
+    @Test
+    void oversizedIgnoredRequestHeaderCountsAgainstLimit(@Socket(SMALL_MAX_HEADERS_SOCKET) Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            connection.completeHandshake(TIMEOUT);
+
+            WritableHeaders<?> writableHeaders = WritableHeaders.create();
+            writableHeaders.add(HeaderValues.create(HeaderNames.X_HELIDON_CN, "a".repeat(128)));
+            Http2Headers headers = Http2Headers.create(writableHeaders);
+            headers.method(GET);
+            headers.path("/cont-in");
+            headers.scheme(connection.clientUri().scheme());
+            headers.authority(connection.clientUri().authority());
+            connection.writer()
+                    .writeHeaders(headers,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertGoAway(Http2ErrorCode.ENHANCE_YOUR_CALM,
+                                    "Request Header Fields Too Large",
+                                    TIMEOUT);
+        }
+    }
+
+    @Test
+    void splitHeaderBlockLimitIsIndependentOfBufferedEntityLimit(
+            @Socket(LARGE_ENTITY_BUFFER_SOCKET) Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            connection.completeHandshake(TIMEOUT);
+            connection.writer().write(new Http2FrameData(
+                    Http2FrameHeader.create(16_384,
+                                            Http2FrameTypes.HEADERS,
+                                            Http2Flag.HeaderFlags.create(0),
+                                            1),
+                    BufferData.create(new byte[16_384])));
+            for (int i = 0; i < 3; i++) {
+                connection.writer().write(new Http2FrameData(
+                        Http2FrameHeader.create(16_384,
+                                                Http2FrameTypes.CONTINUATION,
+                                                Http2Flag.ContinuationFlags.create(0),
+                                                1),
+                        BufferData.create(new byte[16_384])));
+            }
+            connection.writer().write(new Http2FrameData(
+                    Http2FrameHeader.create(1,
+                                            Http2FrameTypes.CONTINUATION,
+                                            Http2Flag.ContinuationFlags.create(Http2Flag.END_OF_HEADERS),
+                                            1),
+                    BufferData.create(new byte[1])));
+
+            connection.assertGoAway(Http2ErrorCode.ENHANCE_YOUR_CALM,
+                                    "Request Header Fields Too Large",
+                                    TIMEOUT);
+        }
+    }
+
+    @Test
+    void decodedHeaderLimitStopsHpackDecode(@Socket(SMALL_MAX_HEADERS_SOCKET) Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            connection.completeHandshake(TIMEOUT);
+            byte[] headerBlock = {
+                    (byte) 0x82, (byte) 0x86, (byte) 0x84,
+                    (byte) 0x90, (byte) 0x90, (byte) 0x90,
+                    0
+            };
+            Http2Flag.HeaderFlags flags = Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM);
+            connection.writer()
+                    .write(new Http2FrameData(
+                            Http2FrameHeader.create(headerBlock.length,
+                                                    Http2FrameTypes.HEADERS,
+                                                    flags,
+                                                    1),
+                            BufferData.create(headerBlock)));
+
+            connection.assertGoAway(Http2ErrorCode.ENHANCE_YOUR_CALM,
+                                    "Request Header Fields Too Large",
+                                    TIMEOUT);
         }
     }
 
@@ -299,6 +466,356 @@ public class HeadersServerTest {
         assertThat(res.status(), is(Status.INTERNAL_SERVER_ERROR_500));
         assertThat(res.entity(), is(
                 "Trailers are supported only when response headers have trailer names definition 'Trailer: <trailer-name>'"));
+    }
+
+    @Test
+    void invalidResponseHeaderResetsStreamWhenValidationIsEnabled(Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers headers = Http2Headers.create(WritableHeaders.create());
+            headers.method(GET);
+            headers.path("/invalid-response-header");
+            headers.scheme(connection.clientUri().scheme());
+            headers.authority(connection.clientUri().authority());
+            connection.writer()
+                    .writeHeaders(headers,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+        }
+    }
+
+    @Test
+    void missingRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers invalidHeaders = Http2Headers.create(WritableHeaders.create());
+            invalidHeaders.method(GET);
+            invalidHeaders.scheme(connection.clientUri().scheme());
+            invalidHeaders.authority(connection.clientUri().authority());
+            connection.writer()
+                    .writeHeaders(invalidHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @Test
+    void emptyRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "");
+    }
+
+    @Test
+    void malformedContentLengthWithMissingRequestTargetClosesConnection(Http2TestClient testClient) {
+        assertMalformedContentLengthClosesConnection(testClient, false);
+    }
+
+    @Test
+    void malformedContentLengthWithEmptyRequestTargetClosesConnection(Http2TestClient testClient) {
+        assertMalformedContentLengthClosesConnection(testClient, true);
+    }
+
+    @Test
+    void relativeRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "boards/");
+    }
+
+    @Test
+    void queryOnlyRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "?q=1");
+    }
+
+    @Test
+    void malformedQueryRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "/ok?q=%GG");
+    }
+
+    @Test
+    void absoluteRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "http://example/a");
+    }
+
+    @Test
+    void asteriskRequestTargetRequiresOptions(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "*");
+    }
+
+    @Test
+    void asteriskRequestTargetDoesNotAllowQuery(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, Method.OPTIONS, "*?q=1");
+    }
+
+    @Test
+    void fragmentRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, GET, "/boards/#fragment");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"proxy.example:443", "[::1]:443", "[Vf.foo-bar]:443"})
+    void ordinaryConnectReturnsNotImplementedAndKeepsConnectionOpen(String authority, Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers connectHeaders = Http2Headers.create(WritableHeaders.create());
+            connectHeaders.method(Method.CONNECT);
+            connectHeaders.authority(authority);
+            connection.writer()
+                    .writeHeaders(connectHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            assertThat(connection.assertHeaders(1, TIMEOUT).status(), is(Status.NOT_IMPLEMENTED_501));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "'[Vf.foo-bar]:443', '[Vf.foo-bar]:443'",
+            "service+name:443, service+name:443",
+            "service%2Dname:443, service%2Dname:443",
+            "service%2Dname:443, service%2dname:443",
+            "service-name:443, service%2Dname:443",
+            "service%2Dname:443, service-name:443"
+    })
+    void ordinaryConnectWithMatchingHostReturnsNotImplementedAndKeepsConnectionOpen(String authority,
+                                                                                     String host,
+                                                                                     Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            WritableHeaders<?> headers = WritableHeaders.create();
+            Http2Headers connectHeaders = Http2Headers.create(headers);
+            headers.add(HeaderNames.HOST, host);
+            connectHeaders.method(Method.CONNECT);
+            connectHeaders.authority(authority);
+            connection.writer()
+                    .writeHeaders(connectHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            assertThat(connection.assertHeaders(1, TIMEOUT).status(), is(Status.NOT_IMPLEMENTED_501));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "service+name:443, service%2Bname:443",
+            "service%2Bname:443, service+name:443"
+    })
+    void ordinaryConnectRejectsReservedEncodingMismatchAndKeepsConnectionOpen(String authority,
+                                                                               String host,
+                                                                               Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            WritableHeaders<?> headers = WritableHeaders.create();
+            Http2Headers connectHeaders = Http2Headers.create(headers);
+            headers.add(HeaderNames.HOST, host);
+            connectHeaders.method(Method.CONNECT);
+            connectHeaders.authority(authority);
+            connection.writer()
+                    .writeHeaders(connectHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @Test
+    void ordinaryConnectRejectsUnicodeCaseFoldedHostAndKeepsConnectionOpen(Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            BufferData headerBlock = BufferData.growing(128);
+            writeLiteralWithIndexedName(headerBlock, 2, "CONNECT");
+            writeLiteralWithIndexedName(headerBlock, 1, "service%2Di.example:443");
+            writeLiteralWithNewName(headerBlock, "host", "service%2D\u0131.example:443");
+            Http2Flag.HeaderFlags flags =
+                    Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM);
+            connection.writer()
+                    .write(new Http2FrameData(Http2FrameHeader.create(headerBlock.available(),
+                                                                     Http2FrameTypes.HEADERS,
+                                                                     flags,
+                                                                     1),
+                                                  headerBlock));
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @Test
+    void connectWithPathResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(testClient, Method.CONNECT, "/");
+    }
+
+    @Test
+    void connectWithoutPortResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers connectHeaders = Http2Headers.create(WritableHeaders.create());
+            connectHeaders.method(Method.CONNECT);
+            connectHeaders.authority("proxy.example");
+            connection.writer()
+                    .writeHeaders(connectHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    @Test
+    void asteriskRequestTargetReachesRequestHandlingForOptions(Http2TestClient testClient) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers headers = Http2Headers.create(WritableHeaders.create());
+            headers.method(Method.OPTIONS);
+            headers.path("*");
+            headers.scheme(connection.clientUri().scheme());
+            headers.authority(connection.clientUri().authority());
+            connection.writer()
+                    .writeHeaders(headers,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            connection.assertHeaders(1, TIMEOUT);
+        }
+    }
+
+    @Test
+    void invalidResponseHeaderCanBeWrittenWhenValidationIsDisabled() {
+        ClientResponseTyped<String> res = responseValidationDisabledClient
+                .get("/invalid-response-header")
+                .request(String.class);
+
+        assertThat(res.status(), is(Status.OK_200));
+        assertThat(res.headers().get(INVALID_RESPONSE_HEADER.headerName()).get(),
+                   is(INVALID_RESPONSE_HEADER.get()));
+    }
+
+    private static void assertInvalidRequestTargetResetsStreamAndKeepsConnectionOpen(Http2TestClient testClient,
+                                                                                      Method method,
+                                                                                      String requestTarget) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            Http2Headers invalidHeaders = Http2Headers.create(WritableHeaders.create());
+            invalidHeaders.method(method);
+            invalidHeaders.path(requestTarget);
+            invalidHeaders.scheme(connection.clientUri().scheme());
+            invalidHeaders.authority(connection.clientUri().authority());
+            connection.writer()
+                    .writeHeaders(invalidHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertSettings(TIMEOUT);
+            connection.assertWindowsUpdate(0, TIMEOUT);
+            connection.assertSettings(TIMEOUT);
+
+            Http2RstStream rstStream = connection.assertRstStream(1, TIMEOUT);
+            assertThat(rstStream.errorCode(), is(Http2ErrorCode.PROTOCOL));
+            assertConnectionReusable(connection);
+        }
+    }
+
+    private static void assertMalformedContentLengthClosesConnection(Http2TestClient testClient,
+                                                                      boolean emptyRequestTarget) {
+        try (Http2TestConnection connection = testClient.createConnection()) {
+            WritableHeaders<?> headers = WritableHeaders.create();
+            headers.add(HeaderNames.CONTENT_LENGTH, "+5");
+            Http2Headers invalidHeaders = Http2Headers.create(headers);
+            invalidHeaders.method(GET);
+            if (emptyRequestTarget) {
+                invalidHeaders.path("");
+            }
+            invalidHeaders.scheme(connection.clientUri().scheme());
+            invalidHeaders.authority(connection.clientUri().authority());
+
+            connection.completeHandshake(TIMEOUT);
+            connection.writer()
+                    .writeHeaders(invalidHeaders,
+                                  1,
+                                  Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                  FlowControl.Outbound.NOOP);
+
+            connection.assertGoAway(Http2ErrorCode.PROTOCOL,
+                                    "Content-Length header must be a number.",
+                                    TIMEOUT);
+        }
+    }
+
+    private static void assertConnectionReusable(Http2TestConnection connection) {
+        Http2Headers validHeaders = Http2Headers.create(WritableHeaders.create());
+        validHeaders.method(GET);
+        validHeaders.path("/ping");
+        validHeaders.scheme(connection.clientUri().scheme());
+        validHeaders.authority(connection.clientUri().authority());
+        connection.writer()
+                .writeHeaders(validHeaders,
+                              3,
+                              Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                              FlowControl.Outbound.NOOP);
+
+        assertThat(connection.assertHeaders(3, TIMEOUT).status(), is(Status.OK_200));
+    }
+
+    private static void writeLiteralWithIndexedName(BufferData target, int index, String value) {
+        target.write(0x40 | index);
+        writeRawString(target, value);
+    }
+
+    private static void writeLiteralWithNewName(BufferData target, String name, String value) {
+        target.write(0x40);
+        writeRawString(target, name);
+        writeRawString(target, value);
+    }
+
+    private static void writeRawString(BufferData target, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        target.write(bytes.length);
+        target.write(bytes);
     }
 
     private HttpClient http2Client(URI base) throws IOException, InterruptedException {

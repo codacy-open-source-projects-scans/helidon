@@ -22,7 +22,7 @@
     <parent>
         <groupId>io.helidon.declarative</groupId>
         <artifactId>helidon-declarative-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -47,10 +47,15 @@
         <module>codegen</module>
         <module>http</module>
         <module>scheduling</module>
+        <module>messaging</module>
         <module>metrics</module>
+        <module>openapi</module>
         <module>tracing</module>
+        <module>graphql</module>
         <module>websocket</module>
         <module>cors</module>
+        <module>grpc</module>
+        <module>compatibility</module>
     </modules>
 
 </project>

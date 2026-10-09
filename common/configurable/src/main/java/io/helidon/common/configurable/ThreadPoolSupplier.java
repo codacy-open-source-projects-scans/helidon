@@ -25,6 +25,7 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import io.helidon.builder.api.RuntimeType;
+import io.helidon.common.Api;
 import io.helidon.common.LazyValue;
 import io.helidon.common.context.Contexts;
 import io.helidon.config.Config;
@@ -33,6 +34,7 @@ import io.helidon.config.Config;
  * Supplier of a custom thread pool.
  * The returned thread pool supports {@link io.helidon.common.context.Context} propagation.
  */
+@Api.Stable
 public final class ThreadPoolSupplier implements Supplier<ExecutorService>, RuntimeType.Api<ThreadPoolConfig> {
     // this type is used on config blueprint, as the default value for rejection policy
     static final ThreadPool.RejectionHandler DEFAULT_REJECTION_POLICY = new ThreadPool.RejectionHandler();
@@ -42,7 +44,7 @@ public final class ThreadPoolSupplier implements Supplier<ExecutorService>, Runt
 
     private final int corePoolSize;
     private final int maxPoolSize;
-    private final int keepAliveMinutes;
+    private final long keepAliveMinutes;
     private final int queueCapacity;
     private final boolean isDaemon;
     private final String threadNamePrefix;
@@ -59,7 +61,7 @@ public final class ThreadPoolSupplier implements Supplier<ExecutorService>, Runt
         this.config = config;
         this.corePoolSize = config.corePoolSize();
         this.maxPoolSize = config.maxPoolSize();
-        this.keepAliveMinutes = config.keepAlive().toMinutesPart();
+        this.keepAliveMinutes = config.keepAlive().toMinutes();
         this.queueCapacity = config.queueCapacity();
         this.isDaemon = config.daemon();
         this.prestart = config.shouldPrestart();

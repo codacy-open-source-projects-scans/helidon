@@ -23,18 +23,26 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import io.helidon.common.HelidonServiceLoader;
-import io.helidon.common.LruCache;
+import io.helidon.common.LazyValue;
 import io.helidon.common.parameters.Parameters;
 import io.helidon.config.Config;
 import io.helidon.config.metadata.Configured;
 import io.helidon.config.metadata.ConfiguredOption;
+import io.helidon.faulttolerance.CircuitBreaker;
+import io.helidon.faulttolerance.ResilientValue;
+import io.helidon.faulttolerance.ResilientValueConfig;
+import io.helidon.faulttolerance.Retry;
+import io.helidon.faulttolerance.Timeout;
+import io.helidon.http.HeaderNames;
 import io.helidon.http.Status;
 import io.helidon.json.JsonObject;
 import io.helidon.security.AuthenticationResponse;
@@ -79,27 +87,32 @@ import static io.helidon.security.providers.oidc.common.spi.TenantConfigFinder.D
  */
 public final class OidcProvider implements AuthenticationProvider, OutboundSecurityProvider {
     private static final System.Logger LOGGER = System.getLogger(OidcProvider.class.getName());
+    static final String DEFAULT_JWT_GROUPS_PATH = "groups";
 
     private final boolean optional;
     private final OidcConfig oidcConfig;
     private final List<TenantIdFinder> tenantIdFinders;
-    private final List<TenantConfigFinder> tenantConfigFinders;
     private final boolean propagate;
     private final OidcOutboundConfig outboundConfig;
     private final boolean useJwtGroups;
-    private final LruCache<String, TenantAuthenticationHandler> tenantAuthHandlers = LruCache.create();
+    private final String jwtGroupsPath;
+    private final String jwtGroupsSeparator;
+    private final TenantCache<TenantAuthenticationHandler> tenantAuthHandlers;
 
     private OidcProvider(Builder builder, OidcOutboundConfig oidcOutboundConfig) {
         this.optional = builder.optional;
         this.oidcConfig = builder.oidcConfig;
         this.propagate = builder.propagate && (oidcOutboundConfig.hasOutbound());
         this.useJwtGroups = builder.useJwtGroups;
+        this.jwtGroupsPath = builder.jwtGroupsPath;
+        this.jwtGroupsSeparator = builder.jwtGroupsSeparator;
         this.outboundConfig = oidcOutboundConfig;
 
-        tenantConfigFinders = List.copyOf(builder.tenantConfigFinders);
         tenantIdFinders = List.copyOf(builder.tenantIdFinders);
 
-        tenantConfigFinders.forEach(tenantConfigFinder -> tenantConfigFinder.onChange(tenantAuthHandlers::remove));
+        tenantAuthHandlers = new TenantCache<>(builder.tenantConfigFinders,
+                                               oidcConfig,
+                                               this::tenantAuthenticationHandler);
     }
 
     /**
@@ -148,23 +161,53 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
     }
 
     private AuthenticationResponse authenticateWithTenant(String tenantId, ProviderRequest providerRequest) {
-        Optional<TenantAuthenticationHandler> tenantHandler = tenantAuthHandlers.get(tenantId);
-        if (tenantHandler.isPresent()) {
-            return tenantHandler.get().authenticate(tenantId, providerRequest);
-        } else {
-            TenantConfig possibleConfig = tenantConfigFinders.stream()
-                    .map(tenantConfigFinder -> tenantConfigFinder.config(tenantId))
-                    .flatMap(Optional::stream)
-                    .findFirst()
-                    .orElse(oidcConfig.tenantConfig(tenantId));
-            Tenant tenant = Tenant.create(oidcConfig, possibleConfig);
-            TenantAuthenticationHandler handler = new TenantAuthenticationHandler(oidcConfig,
-                                                                                  tenant,
-                                                                                  useJwtGroups,
-                                                                                  optional);
-            return tenantAuthHandlers.computeValue(tenantId, () -> Optional.of(handler)).get()
-                    .authenticate(tenantId, providerRequest);
+        try {
+            return cachedTenantAuthenticationHandler(tenantId)
+                    .map(Supplier::get)
+                    .map(handler -> handler.authenticate(tenantId, providerRequest))
+                    .orElseGet(this::unknownTenantResponse);
+        } catch (ResilientValue.UnavailableException _) {
+            return unavailableTenantResponse();
         }
+    }
+
+    private Optional<Supplier<TenantAuthenticationHandler>> cachedTenantAuthenticationHandler(String tenantId) {
+        return tenantAuthHandlers.get(tenantId);
+    }
+
+    private Supplier<TenantAuthenticationHandler> tenantAuthenticationHandler(TenantConfig tenantConfig) {
+        oidcConfig.validateTenantForAuthentication(tenantConfig);
+        Supplier<TenantAuthenticationHandler> loader = () -> {
+            Tenant tenant = Tenant.create(oidcConfig, tenantConfig);
+            return new TenantAuthenticationHandler(oidcConfig,
+                                                   tenant,
+                                                   useJwtGroups,
+                                                   jwtGroupsPath,
+                                                   jwtGroupsSeparator,
+                                                   optional);
+        };
+        if (!tenantConfig.tenantLoadingLazy()) {
+            return LazyValue.create(loader);
+        }
+        return ResilientValue.create(new ResilientConfig<>("OIDC tenant authentication",
+                                                           loader,
+                                                           tenantConfig.jwkRetry(),
+                                                           tenantConfig.jwkCircuitBreaker(),
+                                                           tenantConfig.jwkTimeout()));
+    }
+
+    private AuthenticationResponse unknownTenantResponse() {
+        if (optional) {
+            return AuthenticationResponse.builder()
+                    .status(SecurityResponse.SecurityStatus.ABSTAIN)
+                    .description("Tenant configuration is not available")
+                    .build();
+        }
+        return AuthenticationResponse.builder()
+                .status(SecurityResponse.SecurityStatus.FAILURE)
+                .statusCode(Status.UNAUTHORIZED_401.code())
+                .description("Tenant configuration is not available")
+                .build();
     }
 
     private String findTenantIdFromRedirects(ProviderRequest providerRequest) {
@@ -220,6 +263,25 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
         };
     }
 
+    private AuthenticationResponse unavailableTenantResponse() {
+        if (optional) {
+            return AuthenticationResponse.builder()
+                    .status(SecurityResponse.SecurityStatus.ABSTAIN)
+                    .description("Tenant configuration is temporarily unavailable")
+                    .build();
+        }
+        var builder = AuthenticationResponse.builder()
+                .status(SecurityResponse.SecurityStatus.FAILURE)
+                .description("Tenant configuration is temporarily unavailable");
+        if (oidcConfig.useHeader()) {
+            return builder.statusCode(Status.UNAUTHORIZED_401.code())
+                    .responseHeader(HeaderNames.WWW_AUTHENTICATE.defaultCase(), "Bearer")
+                    .build();
+        }
+        return builder.statusCode(Status.SERVICE_UNAVAILABLE_503.code())
+                .build();
+    }
+
     private OutboundSecurityResponse propagateAccessToken(ProviderRequest providerRequest,
                                                                  SecurityEnvironment outboundEnv) {
         Optional<Subject> user = providerRequest.securityContext().user();
@@ -255,26 +317,28 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
 
             clientCredentialsConfig.scope().ifPresent(scope -> formBuilder.add("scope", scope));
 
-            HttpClientRequest postRequest = oidcConfig.appWebClient()
-                    .post()
-                    .uri(oidcConfig.tokenEndpointUri());
+            try {
+                HttpClientRequest postRequest = oidcConfig.appWebClient()
+                        .post()
+                        .uri(oidcConfig.tokenEndpointUri());
 
-            OidcUtil.updateRequest(OidcConfig.RequestType.ID_AND_SECRET_TO_TOKEN, oidcConfig, formBuilder, postRequest);
+                OidcUtil.updateRequest(OidcConfig.RequestType.ID_AND_SECRET_TO_TOKEN, oidcConfig, formBuilder, postRequest);
 
-            try (var response = postRequest.submit(formBuilder.build())) {
-                if (response.status().family() == Status.Family.SUCCESSFUL) {
-                    JsonObject jsonObject = response.as(JsonObject.class);
-                    String accessToken = jsonObject.stringValue("access_token")
-                            .orElseThrow(() -> new IllegalStateException("JSON field \"access_token\" must be defined"));
+                try (var response = postRequest.submit(formBuilder.build())) {
+                    if (response.status().family() == Status.Family.SUCCESSFUL) {
+                        JsonObject jsonObject = response.as(JsonObject.class);
+                        String accessToken = jsonObject.stringValue("access_token")
+                                .orElseThrow(() -> new IllegalStateException("JSON field \"access_token\" must be defined"));
 
-                    Map<String, List<String>> headers = new HashMap<>(outboundEnv.headers());
-                    target.tokenHandler.header(headers, accessToken);
-                    return OutboundSecurityResponse.withHeaders(headers);
-                } else {
-                    return OutboundSecurityResponse.builder()
-                            .status(SecurityResponse.SecurityStatus.FAILURE)
-                            .description("Could not obtain access token from the identity server")
-                            .build();
+                        Map<String, List<String>> headers = new HashMap<>(outboundEnv.headers());
+                        target.tokenHandler.header(headers, accessToken);
+                        return OutboundSecurityResponse.withHeaders(headers);
+                    } else {
+                        return OutboundSecurityResponse.builder()
+                                .status(SecurityResponse.SecurityStatus.FAILURE)
+                                .description("Could not obtain access token from the identity server")
+                                .build();
+                    }
                 }
             } catch (Exception e) {
                 return OutboundSecurityResponse.builder()
@@ -312,12 +376,23 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
         // for outbound calls, unless it is the same audience
         private Boolean propagate;
         private boolean useJwtGroups = true;
+        private String jwtGroupsPath = DEFAULT_JWT_GROUPS_PATH;
+        private String jwtGroupsSeparator;
         private OutboundConfig outboundConfig;
         private Config config = Config.empty();
         private TokenHandler defaultOutboundHandler = TokenHandler.builder()
                 .tokenHeader("Authorization")
                 .tokenPrefix("Bearer ")
                 .build();
+
+        /**
+         * Create a new builder instance.
+         *
+         * @deprecated Use {@link OidcProvider#builder()} instead.
+         */
+        @Deprecated(forRemoval = true, since = "27.0.0")
+        public Builder() {
+        }
 
         @Override
         public OidcProvider build() {
@@ -396,6 +471,8 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
                 }
             }
             config.get("use-jwt-groups").asBoolean().ifPresent(this::useJwtGroups);
+            config.get("jwt-groups-path").asString().ifPresent(this::jwtGroupsPath);
+            config.get("jwt-groups-separator").asString().ifPresent(this::jwtGroupsSeparator);
             config.get("discover-tenant-config-providers").asBoolean().ifPresent(this::discoverTenantConfigProviders);
             config.get("discover-tenant-id-providers").asBoolean().ifPresent(this::discoverTenantIdProviders);
             return this;
@@ -464,6 +541,43 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
         public Builder useJwtGroups(boolean useJwtGroups) {
             this.useJwtGroups = useJwtGroups;
             return this;
+        }
+
+        /**
+         * Path to the JWT payload claim containing the groups to add as role grants.
+         * The default path is {@code groups}. Nested object claims can be configured with slash-separated path segments,
+         * such as {@code realm/groups}.
+         *
+         * @param jwtGroupsPath JWT groups claim path
+         * @return updated builder instance
+         */
+        @ConfiguredOption("groups")
+        public Builder jwtGroupsPath(String jwtGroupsPath) {
+            this.jwtGroupsPath = requireText(jwtGroupsPath, "JWT groups path");
+            return this;
+        }
+
+        /**
+         * Separator used to split a string claim value into multiple groups.
+         * This is used only when {@link #jwtGroupsPath(String)} configures a custom path other than {@code groups}.
+         * The default {@code groups} claim keeps the standard OIDC JWT behavior.
+         * Setting this property without changing the JWT groups path has no effect.
+         *
+         * @param jwtGroupsSeparator separator for string-valued custom groups claim
+         * @return updated builder instance
+         */
+        @ConfiguredOption
+        public Builder jwtGroupsSeparator(String jwtGroupsSeparator) {
+            this.jwtGroupsSeparator = requireText(jwtGroupsSeparator, "JWT groups separator");
+            return this;
+        }
+
+        private static String requireText(String value, String description) {
+            Objects.requireNonNull(value, description + " must not be null");
+            if (value.isEmpty()) {
+                throw new IllegalArgumentException(description + " must not be empty");
+            }
+            return value;
         }
 
         /**
@@ -537,6 +651,13 @@ public final class OidcProvider implements AuthenticationProvider, OutboundSecur
             return this;
         }
 
+    }
+
+    private record ResilientConfig<T>(String description,
+                                      Supplier<T> loader,
+                                      Retry retry,
+                                      CircuitBreaker circuitBreaker,
+                                      Timeout timeout) implements ResilientValueConfig<T> {
     }
 
     private static final class OidcOutboundConfig {

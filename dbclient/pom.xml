@@ -22,13 +22,17 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
     </parent>
     <packaging>pom</packaging>
 
     <groupId>io.helidon.dbclient</groupId>
     <artifactId>helidon-dbclient-project</artifactId>
     <name>Helidon Database Client Project</name>
+
+    <properties>
+        <javadoc.fail-on-warnings>true</javadoc.fail-on-warnings>
+    </properties>
 
     <modules>
         <module>dbclient</module>

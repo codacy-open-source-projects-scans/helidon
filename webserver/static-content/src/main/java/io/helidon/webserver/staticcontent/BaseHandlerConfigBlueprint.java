@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -78,7 +78,8 @@ interface BaseHandlerConfigBlueprint {
      * Note that files cached through this method may use more than the max-bytes configured for the in-memory cache (i.e.
      * this option wins over the maximal size in bytes), so kindly be careful with what is pushed to the cache.
      * <p>
-     * <i>Files cached in memory will never be re-loaded, even if changed, until server restart!</i>
+     * <i>Files cached in memory are snapshots. They remain available and are never re-loaded, even if their source is changed
+     * or removed, until server restart!</i>
      *
      * @return set of file names (or directory names if not using classpath) to cache in memory on startup
      */
@@ -125,13 +126,35 @@ interface BaseHandlerConfigBlueprint {
     Function<String, String> pathMapper();
 
     /**
-     * Configure capacity of cache used for resources. This cache will make sure the media type and location is discovered
-     * faster.
+     * Configures the capacity of the cache used for resource metadata.
+     * Pre-compressed sidecar lookup state is attached to the corresponding normal resource record.
      * <p>
      * To cache content (bytes) in memory, use {@link io.helidon.webserver.staticcontent.BaseHandlerConfig#memoryCache()}
      *
-     * @return maximal number of cached records, only caches media type and Path, not the content
+     * @return maximal number of cached records; records do not contain the content bytes
      */
     @Option.Configured
     Optional<Integer> recordCacheCapacity();
+
+    /**
+     * Whether pre-compressed sidecar resources should be selected for this handler; feature-registered handlers inherit
+     * the feature value when absent, directly created handlers default to disabled, and file system handlers configured
+     * with a single file always require handler-level opt-in.
+     *
+     * @return whether pre-compressed sidecar resources should be used
+     */
+    @Option.Configured
+    Optional<Boolean> preCompressedEnabled();
+
+    /**
+     * Pre-compressed content coding to file suffix mappings; handler mappings replace inherited feature-level mappings
+     * rather than merging with them, an explicit empty map disables sidecar lookups for this handler, codings must be
+     * unique concrete valid HTTP tokens other than {@code identity} and {@code *}, and suffixes have leading dots ignored
+     * and must not contain path separators.
+     *
+     * @return content coding to file suffix mappings
+     */
+    @Option.Configured
+    @Option.Singular("preCompressedEncoding")
+    Optional<Map<String, String>> preCompressedEncodings();
 }

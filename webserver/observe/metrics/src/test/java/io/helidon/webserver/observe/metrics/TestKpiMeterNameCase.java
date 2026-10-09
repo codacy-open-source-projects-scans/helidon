@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,30 @@
  */
 package io.helidon.webserver.observe.metrics;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 import io.helidon.metrics.api.BuiltInMeterNameFormat;
+import io.helidon.metrics.api.Counter;
 import io.helidon.metrics.api.KeyPerformanceIndicatorMetricsConfig;
+import io.helidon.metrics.api.Meter;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
 import io.helidon.metrics.api.MetricsConfig;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.metrics.spi.MeterBuilderCustomizer;
+import io.helidon.service.registry.ServiceRegistryConfig;
+import io.helidon.service.registry.ServiceRegistryManager;
+import io.helidon.service.registry.Services;
+import io.helidon.webserver.KeyPerformanceIndicatorSupport;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.sameInstance;
 
 class TestKpiMeterNameCase {
 
@@ -41,7 +54,7 @@ class TestKpiMeterNameCase {
                         .extended(true)
                         .build())
                 .build();
-        MeterRegistry meterRegistry = Metrics.createMeterRegistry(metricsConfig);
+        MeterRegistry meterRegistry = Services.get(MetricsFactory.class).createMeterRegistry(metricsConfig);
 
         // As a side-effect, the following line registers the KPI metrics in the meter registry.
         KeyPerformanceIndicatorMetricsImpls.get(meterRegistry,
@@ -49,11 +62,11 @@ class TestKpiMeterNameCase {
                                                 KeyPerformanceIndicatorMetricsConfig.builder().extended(true).build(),
                                                 BuiltInMeterNameFormat.CAMEL);
 
-        assertThat("In-flight KPI",
-                   meterRegistry.meters().stream()
-                           .map(m -> m.id().name())
-                           .toList(),
-                   hasItem("requests.inFlight"));
+        var meterNames = meterRegistry.meters().stream()
+                .map(m -> m.id().name())
+                .toList();
+        assertThat("In-flight KPI", meterNames, hasItem("requests.inFlight"));
+        assertThat("Long-running KPI", meterNames, hasItem("requests.longRunning"));
     }
 
     @Test
@@ -64,7 +77,7 @@ class TestKpiMeterNameCase {
                         .build())
                 .builtInMeterNameFormat(BuiltInMeterNameFormat.SNAKE)
                 .build();
-        MeterRegistry meterRegistry = Metrics.createMeterRegistry(metricsConfig);
+        MeterRegistry meterRegistry = Services.get(MetricsFactory.class).createMeterRegistry(metricsConfig);
 
         // As a side-effect, the following line registers the KPI metrics in the meter registry.
         KeyPerformanceIndicatorMetricsImpls.get(meterRegistry,
@@ -72,10 +85,151 @@ class TestKpiMeterNameCase {
                                                 KeyPerformanceIndicatorMetricsConfig.builder().extended(true).build(),
                                                 BuiltInMeterNameFormat.SNAKE);
 
-        assertThat("In-flight KPI",
-                   meterRegistry.meters().stream()
-                           .map(m -> m.id().name())
-                           .toList(),
-                   hasItem("requests.in_flight"));
+        var meterNames = meterRegistry.meters().stream()
+                .map(m -> m.id().name())
+                .toList();
+        assertThat("In-flight KPI", meterNames, hasItem("requests.in_flight"));
+        assertThat("Long-running KPI", meterNames, hasItem("requests.long_running"));
+    }
+
+    @Test
+    void testKpiMetricsAreIsolatedByRegistry() {
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MetricsConfig metricsConfig = MetricsConfig.builder()
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry firstRegistry = metricsFactory.createMeterRegistry(metricsConfig);
+        MeterRegistry secondRegistry = metricsFactory.createMeterRegistry(metricsConfig);
+        KeyPerformanceIndicatorSupport.Metrics firstMetrics = null;
+        KeyPerformanceIndicatorSupport.Metrics secondMetrics = null;
+        try {
+            firstMetrics = KeyPerformanceIndicatorMetricsImpls.get(firstRegistry,
+                                                                   "requests.",
+                                                                   KeyPerformanceIndicatorMetricsConfig.create(),
+                                                                   BuiltInMeterNameFormat.CAMEL);
+            secondMetrics = KeyPerformanceIndicatorMetricsImpls.get(secondRegistry,
+                                                                    "requests.",
+                                                                    KeyPerformanceIndicatorMetricsConfig.create(),
+                                                                    BuiltInMeterNameFormat.CAMEL);
+
+            assertThat("Each registry has its own KPI metrics", secondMetrics, not(sameInstance(firstMetrics)));
+
+            firstMetrics.onRequestReceived();
+            secondMetrics.onRequestReceived();
+            assertThat("First registry count", counter(firstRegistry).count(), is(1L));
+            assertThat("Second registry count", counter(secondRegistry).count(), is(1L));
+
+            firstMetrics.close();
+            firstMetrics = null;
+            assertThat("Closing the first KPI metrics removes only its meters",
+                       firstRegistry.meters().stream().noneMatch(meter -> meter.id().name().equals("requests.count")),
+                       is(true));
+
+            secondMetrics.onRequestReceived();
+            assertThat("Second registry remains active", counter(secondRegistry).count(), is(2L));
+        } finally {
+            if (firstMetrics != null) {
+                firstMetrics.close();
+            }
+            if (secondMetrics != null) {
+                secondMetrics.close();
+            }
+            firstRegistry.close();
+            secondRegistry.close();
+        }
+    }
+
+    @Test
+    void testSharedKpiMetricsRemainUntilLastOwnerCloses() {
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MeterRegistry meterRegistry = metricsFactory.createMeterRegistry(MetricsConfig.create());
+        KeyPerformanceIndicatorSupport.Metrics firstMetrics = null;
+        KeyPerformanceIndicatorSupport.Metrics secondMetrics = null;
+        try {
+            firstMetrics = KeyPerformanceIndicatorMetricsImpls.get(meterRegistry,
+                                                                   "requests.",
+                                                                   KeyPerformanceIndicatorMetricsConfig.create(),
+                                                                   BuiltInMeterNameFormat.CAMEL);
+            secondMetrics = KeyPerformanceIndicatorMetricsImpls.get(meterRegistry,
+                                                                    "requests.",
+                                                                    KeyPerformanceIndicatorMetricsConfig.create(),
+                                                                    BuiltInMeterNameFormat.CAMEL);
+
+            assertThat("Observers share the same KPI metrics", secondMetrics, sameInstance(firstMetrics));
+
+            firstMetrics.onRequestReceived();
+            firstMetrics.close();
+            firstMetrics = null;
+
+            assertThat("First observer close preserves shared KPI meters", counter(meterRegistry).count(), is(1L));
+
+            secondMetrics.onRequestReceived();
+            assertThat("Second observer keeps recording KPI metrics", counter(meterRegistry).count(), is(2L));
+
+            secondMetrics.close();
+            secondMetrics = null;
+
+            assertThat("Last observer close removes KPI meters",
+                       meterRegistry.meters().stream().noneMatch(meter -> meter.id().name().equals("requests.count")),
+                       is(true));
+        } finally {
+            if (firstMetrics != null) {
+                firstMetrics.close();
+            }
+            if (secondMetrics != null) {
+                secondMetrics.close();
+            }
+            meterRegistry.close();
+        }
+    }
+
+    @Test
+    void customizerCanDistinguishKpiMetrics() {
+        AtomicReference<MetricsFactory> metricsFactoryRef = new AtomicReference<>();
+        MeterBuilderCustomizer customizer = new MeterBuilderCustomizer() {
+            @Override
+            public void customize(Meter.Builder<?, ?> builder) {
+                if (builder.origin()
+                        .filter(origin -> origin.equals(KeyPerformanceIndicatorMetricsImpls.class.getName()))
+                        .isPresent()) {
+                    builder.addTag(metricsFactoryRef.get().tagCreate("metric-origin", "kpi"));
+                }
+            }
+        };
+        ServiceRegistryManager manager = ServiceRegistryManager.create(ServiceRegistryConfig.builder()
+                                                                                .putContractInstance(MeterBuilderCustomizer.class,
+                                                                                                     customizer)
+                                                                                .build());
+        KeyPerformanceIndicatorSupport.Metrics kpiMetrics = null;
+        try {
+            MetricsFactory metricsFactory = manager.registry().get(MetricsFactory.class);
+            metricsFactoryRef.set(metricsFactory);
+            MeterRegistry meterRegistry = manager.registry().get(MeterRegistry.class);
+            Counter regularCounter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("regular"));
+            kpiMetrics = KeyPerformanceIndicatorMetricsImpls.get(meterRegistry,
+                                                                 "requests.",
+                                                                 KeyPerformanceIndicatorMetricsConfig.create(),
+                                                                 BuiltInMeterNameFormat.CAMEL);
+
+            assertThat("KPI meter exposes its origin to the customizer",
+                       counter(meterRegistry).id().tagsMap(),
+                       hasEntry("metric-origin", "kpi"));
+            assertThat("Ordinary meter does not use the KPI origin",
+                       regularCounter.id().tagsMap(),
+                       not(hasEntry("metric-origin", "kpi")));
+        } finally {
+            if (kpiMetrics != null) {
+                kpiMetrics.close();
+            }
+            manager.shutdown();
+        }
+    }
+
+    private static Counter counter(MeterRegistry meterRegistry) {
+        return meterRegistry.meters().stream()
+                .filter(meter -> meter.id().name().equals("requests.count"))
+                .map(Counter.class::cast)
+                .findFirst()
+                .orElseThrow();
     }
 }

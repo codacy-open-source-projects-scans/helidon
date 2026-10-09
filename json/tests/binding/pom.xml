@@ -22,7 +22,7 @@
     <parent>
         <groupId>io.helidon.json.tests</groupId>
         <artifactId>helidon-json-tests-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
     </parent>
 
     <name>Helidon JSON Tests Binding</name>
@@ -67,6 +67,11 @@
         <dependency>
             <groupId>io.helidon.codegen</groupId>
             <artifactId>helidon-codegen-apt</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.codegen</groupId>
+            <artifactId>helidon-codegen-api-stability</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

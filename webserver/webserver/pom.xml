@@ -21,7 +21,7 @@
     <parent>
         <groupId>io.helidon.webserver</groupId>
         <artifactId>helidon-webserver-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>helidon-webserver</artifactId>
@@ -37,6 +37,10 @@
             <artifactId>helidon-common</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.common</groupId>
+            <artifactId>helidon-common-uri</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon</groupId>
             <artifactId>helidon</artifactId>
         </dependency>
@@ -45,12 +49,20 @@
             <artifactId>helidon-http</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.http</groupId>
+            <artifactId>helidon-http-http1</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.common</groupId>
             <artifactId>helidon-common-socket</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.common</groupId>
             <artifactId>helidon-common-context</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.common</groupId>
+            <artifactId>helidon-common-configurable</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.common</groupId>

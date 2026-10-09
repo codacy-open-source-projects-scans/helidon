@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -117,11 +117,19 @@ class UriPathNoParam implements UriPath {
 
          we use decoded and normalized path to match routing, so we need to resolve all of that
          */
+        if (isSimplePath(rawPath)) {
+            return rawPath;
+        }
+
         int percent = rawPath.indexOf('%');
         int dot = rawPath.indexOf(".");
         int doubleSlash = rawPath.indexOf("//");
 
-        if (!validate && percent == -1 && doubleSlash == -1 && dot == -1) {
+        if (!validate
+                && percent == -1
+                && doubleSlash == -1
+                && dot == -1
+                && (rawPath.isEmpty() || rawPath.charAt(0) == '/' || rawPath.indexOf(':') == -1)) {
             return rawPath;
         }
 
@@ -133,6 +141,36 @@ class UriPathNoParam implements UriPath {
             rawPath = rawPath.substring(1);
         }
 
-        return URI.create(rawPath).normalize().getPath();
+        String path = URI.create(rawPath).normalize().getPath();
+        return path == null ? "" : path;
     }
+
+    private static boolean isSimplePath(String rawPath) {
+        int length = rawPath.length();
+        if (length == 0 || rawPath.charAt(0) != '/') {
+            return false;
+        }
+
+        boolean slash = true;
+        for (int i = 1; i < length; i++) {
+            char c = rawPath.charAt(i);
+            if (c == '/') {
+                if (slash) {
+                    return false;
+                }
+                slash = true;
+            } else if ((c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '-'
+                    || c == '_'
+                    || c == '~') {
+                slash = false;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
 }

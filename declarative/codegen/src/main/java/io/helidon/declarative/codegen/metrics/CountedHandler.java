@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,7 +79,6 @@ class CountedHandler {
 
         String name = MetricsExtension.name(annotation, type, element);
         List<MetricsExtension.Tag> tags = MetricsExtension.tags(ctx, type, element, annotation);
-        String scope = MetricsExtension.scope(annotation);
         String description = MetricsExtension.description(annotation, ANNOTATION_COUNTED, type, element);
         String unit = annotation.stringValue("unit").orElse("none");
 
@@ -89,18 +88,15 @@ class CountedHandler {
                         .type(METER_REGISTRY)
                         .name("meterRegistry")
                 )
+                .addContentLine("var metricsFactory = meterRegistry.metricsFactory();")
                 .addContent("this.counter = meterRegistry.getOrCreate(")
-                .addContent(COUNTER)
-                .addContent(".builder(")
+                .addContent("metricsFactory.counterBuilder(")
                 .addContentLiteral(name)
                 .addContentLine(")")
                 .increaseContentPadding()
                 .increaseContentPadding()
                 .addContent(".description(")
                 .addContentLiteral(description)
-                .addContentLine(")")
-                .addContent(".scope(")
-                .addContentLiteral(scope)
                 .addContentLine(")")
                 .addContent(".baseUnit(")
                 .addContentLiteral(unit)

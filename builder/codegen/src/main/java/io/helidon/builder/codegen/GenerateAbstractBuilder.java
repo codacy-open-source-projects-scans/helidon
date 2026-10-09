@@ -30,9 +30,12 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import io.helidon.builder.api.Option;
 import io.helidon.builder.codegen.spi.BuilderCodegenExtension;
+import io.helidon.codegen.RoundContext;
 import io.helidon.codegen.classmodel.ClassModel;
 import io.helidon.codegen.classmodel.Constructor;
+import io.helidon.codegen.classmodel.ContentBuilder;
 import io.helidon.codegen.classmodel.InnerClass;
 import io.helidon.codegen.classmodel.Javadoc;
 import io.helidon.codegen.classmodel.Method;
@@ -59,15 +62,25 @@ final class GenerateAbstractBuilder {
     private GenerateAbstractBuilder() {
     }
 
-    static void generate(List<BuilderCodegenExtension> extensions,
-                         ClassModel.Builder classModel,
-                         PrototypeInfo prototypeInfo,
-                         List<TypeArgument> typeArguments,
-                         List<TypeName> typeArgumentNames,
-                         List<OptionHandler> options,
-                         List<BuilderCodegen.NewDefault> newDefaults) {
+    static TypeName generate(RoundContext ctx,
+                             List<BuilderCodegenExtension> extensions,
+                             ClassModel.Builder classModel,
+                             PrototypeInfo prototypeInfo,
+                             TypeArguments genericArguments,
+                             List<OptionHandler> options,
+                             List<BuilderCodegen.NewDefault> newDefaults) {
         Optional<TypeName> superType = prototypeInfo.superPrototype();
         TypeName prototype = prototypeInfo.prototypeType();
+        String ifaceName = prototype.className();
+        TypeName implementationType = TypeName.builder()
+                .packageName(prototype.packageName())
+                .addEnclosingName(ifaceName)
+                .addEnclosingName("BuilderBase")
+                .className(ifaceName + "Impl")
+                .build();
+        boolean sealedPrototype = prototypeInfo.blueprint().hasAnnotation(Types.PROTOTYPE_SEALED);
+        List<TypeArgument> typeArguments = genericArguments.arguments();
+        List<TypeName> typeArgumentNames = genericArguments.names();
 
         classModel.addInnerClass(builder -> {
             typeArguments.forEach(builder::addGenericArgument);
@@ -115,8 +128,31 @@ final class GenerateAbstractBuilder {
             fromBuilderMethod(builder, prototypeInfo, options, typeArgumentNames);
 
             // method preBuildPrototype() - handles providers, decorator
-            preBuildPrototypeMethod(extensions, builder, prototypeInfo, options);
+            preBuildPrototypeMethod(ctx, extensions, builder, prototypeInfo, options);
             validatePrototypeMethod(extensions, builder, prototypeInfo, options);
+            if (sealedPrototype) {
+                builder.addMethod(method -> {
+                    method.name("buildPrototype")
+                            .description("Create a new prototype instance from a builder.")
+                            .accessModifier(AccessModifier.PROTECTED)
+                            .isFinal(true)
+                            .returnType(prototype, "new prototype instance")
+                            .addParameter(param -> param.name("builder")
+                                    .type(TypeName.builder()
+                                                  .from(TypeName.create(prototype.fqName() + ".BuilderBase"))
+                                                  .addTypeArguments(typeArgumentNames)
+                                                  .addTypeArgument(TypeArgument.create("?"))
+                                                  .addTypeArgument(TypeArgument.create("?"))
+                                                  .build())
+                                    .description("builder used to create the prototype"))
+                            .addContent("return new ")
+                            .addContent(implementationType);
+                    if (!typeArguments.isEmpty()) {
+                        method.addContent("<>");
+                    }
+                    method.addContentLine("(builder);");
+                });
+            }
 
             //custom method adding
             addCustomBuilderMethods(builder, prototypeInfo);
@@ -131,13 +167,24 @@ final class GenerateAbstractBuilder {
                      options,
                      true);
 
-            // before the builder class is finished, we also generate a protected implementation
-            generatePrototypeImpl(extensions, builder, prototypeInfo, options, typeArguments, typeArgumentNames);
+            if (hasAllowedValues(options)) {
+                isAllowedValueMethod(builder);
+            }
+
+            // before the builder class is finished, we also generate an implementation
+            generatePrototypeImpl(extensions,
+                                  builder,
+                                  prototypeInfo,
+                                  implementationType,
+                                  sealedPrototype,
+                                  options,
+                                  genericArguments);
 
             extensions.forEach(it -> it.updateBuilderBase(prototypeInfo,
                                                           Utils.options(options),
                                                           builder));
         });
+        return implementationType;
     }
 
     static void buildRuntimeObjectMethod(InnerClass.Builder classBuilder,
@@ -149,6 +196,10 @@ final class GenerateAbstractBuilder {
 
         Method.Builder builder = Method.builder()
                 .name("build")
+                .description(isBuilder
+                                     ? "Create an instance from this builder. Calling this method may update this builder"
+                                             + " from providers and decorators, so repeated calls may have side effects."
+                                     : "Create a new runtime instance from this prototype.")
                 .addAnnotation(Annotations.OVERRIDE)
                 .returnType(runtimeType)
                 .addContent("return ");
@@ -400,9 +451,6 @@ final class GenerateAbstractBuilder {
                 classBuilder.addField(builder -> builder.type(Types.CONFIG).name("config"));
             }
         }
-        if (isBuilder && prototypeInfo.registrySupport()) {
-            classBuilder.addField(builder -> builder.type(Types.SERVICE_REGISTRY).name("serviceRegistry"));
-        }
         for (OptionHandler optionHandler : options) {
             if (!isBuilder && optionHandler.option().builderOptionOnly()) {
                 continue;
@@ -456,7 +504,8 @@ final class GenerateAbstractBuilder {
         return type.equals(CONFIG);
     }
 
-    private static void preBuildPrototypeMethod(List<BuilderCodegenExtension> extensions,
+    private static void preBuildPrototypeMethod(RoundContext ctx,
+                                                List<BuilderCodegenExtension> extensions,
                                                 InnerClass.Builder classBuilder,
                                                 PrototypeInfo prototypeInfo,
                                                 List<OptionHandler> options) {
@@ -480,15 +529,21 @@ final class GenerateAbstractBuilder {
 
             if (configured && hasConfiguredRegistryServiceOrProvider(options)) {
                 // need to have a non-null config instance
-                preBuildBuilder.addContent("var config = config().orElseGet(")
+                String configAccessor = FactoryPrototypeInfo.inheritedConfigAccessor(ctx, prototypeInfo.blueprint())
+                        .orElseGet(() -> prototypeInfo.recordStyle() ? "config" : "getConfig");
+                preBuildBuilder.addContent("var config = ")
+                        .addContent(configAccessor)
+                        .addContent("().orElseGet(")
                         .addContent(CONFIG)
                         .addContentLine("::empty);");
             }
 
             if (prototypeInfo.registrySupport() || hasRegistryService) {
+                String registryAccessor = FactoryPrototypeInfo.inheritedServiceRegistryAccessor(ctx, prototypeInfo.blueprint())
+                        .orElseGet(() -> prototypeInfo.recordStyle() ? "serviceRegistry" : "getServiceRegistry");
                 preBuildBuilder.addContent("var registry = ")
-                        .addContent(Optional.class)
-                        .addContentLine(".ofNullable(this.serviceRegistry);");
+                        .addContent(registryAccessor)
+                        .addContentLine("();");
             }
 
             for (OptionHandler optionHandler : options) {
@@ -497,20 +552,42 @@ final class GenerateAbstractBuilder {
 
                 if (option.provider().isPresent()) {
                     OptionProvider optionProvider = option.provider().get();
+                    TypeName providerContainerType = providerContainerType(option.declaredType());
 
-                    // using a code block, so we can reuse the same variable names for multiple providers
-                    TypeName providerType = optionProvider.providerType();
+                    if (!optionProvider.enabledBy().isEmpty()) {
+                        preBuildBuilder.addContentLine("if (" + optionProvider.enabledBy() + "()) {");
+                    }
+
+                    if (optionConfigured && (providerContainerType.isList() || providerContainerType.isSet())) {
+                        OptionConfigured configuredOption = option.configured().orElseThrow();
+                        preBuildBuilder.addContent(CONFIG_BUILDER_SUPPORT)
+                                .addContent(".validateProviderConfig(config, \"")
+                                .addContent(configuredOption.configKey())
+                                .addContent("\", ")
+                                .addContent(Option.Provider.Identity.class)
+                                .addContent(".")
+                                .addContent(optionProvider.providerIdentity().name())
+                                .addContent(", ")
+                                .addContent(Option.Provider.ConfigForm.class)
+                                .addContent(".")
+                                .addContent(optionProvider.configForm().name())
+                                .addContentLine(");");
+                    }
 
                     if (prototypeInfo.registrySupport()) {
                         serviceRegistryPropertyDiscovery(preBuildBuilder,
                                                          optionHandler,
                                                          optionConfigured,
-                                                         providerType);
+                                                         optionProvider);
                     } else {
                         serviceLoaderPropertyDiscovery(preBuildBuilder,
                                                        optionHandler,
                                                        optionConfigured,
-                                                       providerType);
+                                                       optionProvider);
+                    }
+
+                    if (!optionProvider.enabledBy().isEmpty()) {
+                        preBuildBuilder.addContentLine("}");
                     }
 
                 } else if (option.registryService()) {
@@ -555,19 +632,135 @@ final class GenerateAbstractBuilder {
                 .anyMatch(it -> it.provider().isPresent());
     }
 
+    private static boolean optionalProviderContainer(TypeName typeName) {
+        return typeName.isOptional()
+                && !typeName.typeArguments().isEmpty()
+                && (typeName.typeArguments().getFirst().isList() || typeName.typeArguments().getFirst().isSet());
+    }
+
+    private static boolean optionalProviderSet(TypeName typeName) {
+        return typeName.isOptional()
+                && !typeName.typeArguments().isEmpty()
+                && typeName.typeArguments().getFirst().isSet();
+    }
+
+    private static TypeName providerContainerType(TypeName typeName) {
+        if (typeName.isOptional()) {
+            return typeName.typeArguments().getFirst();
+        }
+        return typeName;
+    }
+
+    private static TypeName providerValueType(OptionHandler optionHandler) {
+        TypeName providerContainerType = providerContainerType(optionHandler.option().declaredType());
+        if (providerContainerType.isList() || providerContainerType.isSet()) {
+            return providerContainerType.typeArguments().getFirst();
+        }
+        return optionHandler.typeHandler().type();
+    }
+
+    private static void optionalProviderExisting(ContentBuilder<?> content, OptionInfo option, boolean optionalSet) {
+        content.addContent(option.name())
+                .addContent(" == null ? ")
+                .addContent(List.class)
+                .addContent(".of() : ");
+        if (optionalSet) {
+            content.addContent(List.class)
+                    .addContent(".copyOf(")
+                    .addContent(option.name())
+                    .addContent(")");
+        } else {
+            content.addContent(option.name());
+        }
+    }
+
+    private static void optionalProviderEmpty(ContentBuilder<?> content, TypeName providerValueType) {
+        content.addContent(List.class)
+                .addContent(".<")
+                .addContent(providerValueType.genericTypeName())
+                .addContent(">of()");
+    }
+
+    private static void addOptionalProviderDiscovered(Method.Builder preBuildBuilder, OptionInfo option, boolean optionalSet) {
+        preBuildBuilder.addContent("this.add")
+                .addContent(capitalize(option.name()))
+                .addContent("(");
+        if (optionalSet) {
+            preBuildBuilder.addContent("new ")
+                    .addContent(LinkedHashSet.class)
+                    .addContent("<>(discovered)");
+        } else {
+            preBuildBuilder.addContent("discovered");
+        }
+        preBuildBuilder.addContentLine(");");
+    }
+
+    private static void configuredProviderSettings(ContentBuilder<?> content,
+                                                   OptionInfo option,
+                                                   OptionProvider optionProvider) {
+        content.addContent(CONFIG_BUILDER_SUPPORT)
+                .addContent(".ProviderSettings.create(")
+                .addContent(Option.Provider.Identity.class)
+                .addContent(".")
+                .addContent(optionProvider.providerIdentity().name())
+                .addContent(", ")
+                .addContent(Option.Provider.ConfigForm.class)
+                .addContent(".")
+                .addContent(optionProvider.configForm().name())
+                .addContent(", ")
+                .addContent(option.name())
+                .addContent("DiscoverServices), ");
+    }
+
     private static void serviceLoaderPropertyDiscovery(Method.Builder preBuildBuilder,
                                                        OptionHandler optionHandler,
                                                        boolean propertyConfigured,
-                                                       TypeName providerType) {
+                                                       OptionProvider optionProvider) {
 
         TypeHandler typeHandler = optionHandler.typeHandler();
         OptionInfo option = optionHandler.option();
         TypeName typeName = option.declaredType();
+        TypeName providerValueType = providerValueType(optionHandler);
+        TypeName providerType = optionProvider.providerType();
 
         if (propertyConfigured) {
             OptionConfigured configured = option.configured().get();
 
-            if (typeName.isList() || typeName.isSet()) {
+            if (optionalProviderContainer(typeName)) {
+                boolean optionalSet = optionalProviderSet(typeName);
+                preBuildBuilder.addContentLine("{")
+                        .addContent("var optionConfig = config.get(\"")
+                        .addContent(configured.configKey())
+                        .addContentLine("\");")
+                        .addContent("var discovered = optionConfig.exists() && optionConfig.asNodeList().orElseGet(")
+                        .addContent(List.class)
+                        .addContentLine("::of).isEmpty()")
+                        .increaseContentPadding()
+                        .increaseContentPadding()
+                        .addContent("? ")
+                        .update(it -> optionalProviderEmpty(it, providerValueType))
+                        .addContentLine("")
+                        .addContent(": ")
+                        .addContent(CONFIG_BUILDER_SUPPORT)
+                        .addContent(".discoverServices(config, \"")
+                        .addContent(configured.configKey())
+                        .addContent("\", ")
+                        .addContent(providerType.genericTypeName())
+                        .addContent(".class, ")
+                        .addContent(providerValueType.genericTypeName())
+                        .addContent(".class, ")
+                        .update(it -> configuredProviderSettings(it, option, optionProvider))
+                        .update(it -> optionalProviderExisting(it, option, optionalSet))
+                        .addContentLine(");")
+                        .decreaseContentPadding()
+                        .decreaseContentPadding()
+                        .addContent("if (optionConfig.exists() || ")
+                        .addContent(option.name())
+                        .addContentLine(" != null || !discovered.isEmpty()) {");
+                addOptionalProviderDiscovered(preBuildBuilder, option, optionalSet);
+                preBuildBuilder.addContentLine("}")
+                        .addContentLine("}");
+            } else if (typeName.isList() || typeName.isSet()) {
                 preBuildBuilder.addContent("this.add")
                         .addContent(capitalize(option.name()))
                         .addContent("(")
@@ -577,10 +770,9 @@ final class GenerateAbstractBuilder {
                         .addContent("\", ")
                         .addContent(providerType.genericTypeName())
                         .addContent(".class, ")
-                        .addContent(typeHandler.type().genericTypeName())
+                        .addContent(providerValueType.genericTypeName())
                         .addContent(".class, ")
-                        .addContent(option.name())
-                        .addContent("DiscoverServices, ")
+                        .update(it -> configuredProviderSettings(it, option, optionProvider))
                         .addContent(option.name())
                         .addContentLine("));");
             } else {
@@ -593,8 +785,7 @@ final class GenerateAbstractBuilder {
                         .addContent(".class, ")
                         .addContent(typeHandler.type().genericTypeName())
                         .addContent(".class, ")
-                        .addContent(option.name())
-                        .addContent("DiscoverServices, ")
+                        .update(it -> configuredProviderSettings(it, option, optionProvider))
                         .addContent(Optional.class)
                         .addContent(".ofNullable(")
                         .addContent(option.name())
@@ -603,7 +794,25 @@ final class GenerateAbstractBuilder {
                         .addContentLine(");");
             }
         } else {
-            if (typeName.isList() || typeName.isSet()) {
+            if (optionalProviderContainer(typeName)) {
+                boolean optionalSet = optionalProviderSet(typeName);
+                preBuildBuilder.addContentLine("{")
+                        .addContent("var discovered = ")
+                        .addContent(BUILDER_SUPPORT)
+                        .addContent(".discoverServices(")
+                        .addContent(providerType.genericTypeName())
+                        .addContent(".class, ")
+                        .addContent(option.name())
+                        .addContent("DiscoverServices, ")
+                        .update(it -> optionalProviderExisting(it, option, optionalSet))
+                        .addContentLine(");")
+                        .addContent("if (")
+                        .addContent(option.name())
+                        .addContentLine(" != null || !discovered.isEmpty()) {");
+                addOptionalProviderDiscovered(preBuildBuilder, option, optionalSet);
+                preBuildBuilder.addContentLine("}")
+                        .addContentLine("}");
+            } else if (typeName.isList() || typeName.isSet()) {
                 preBuildBuilder.addContent("this.add")
                         .addContent(capitalize(option.name()))
                         .addContent("(")
@@ -759,15 +968,25 @@ final class GenerateAbstractBuilder {
     private static void serviceRegistryPropertyDiscovery(Method.Builder preBuildBuilder,
                                                          OptionHandler optionHandler,
                                                          boolean propertyConfigured,
-                                                         TypeName providerType) {
+                                                         OptionProvider optionProvider) {
         TypeHandler typeHandler = optionHandler.typeHandler();
         OptionInfo option = optionHandler.option();
         TypeName typeName = option.declaredType();
+        TypeName providerValueType = providerValueType(optionHandler);
+        TypeName providerType = optionProvider.providerType();
 
         if (propertyConfigured) {
             OptionConfigured configured = option.configured().get();
 
-            if (typeName.isList() || typeName.isSet()) {
+            if (optionalProviderContainer(typeName)) {
+                serviceRegistryConfiguredOptionalProviderContainer(preBuildBuilder,
+                                                                   option,
+                                                                   configured,
+                                                                   providerType,
+                                                                   providerValueType,
+                                                                   optionProvider,
+                                                                   optionalProviderSet(typeName));
+            } else if (typeName.isList() || typeName.isSet()) {
                 preBuildBuilder.addContent("this.add")
                         .addContent(capitalize(option.name()))
                         .addContent("(")
@@ -782,10 +1001,9 @@ final class GenerateAbstractBuilder {
                         .addContentLine("registry,")
                         .addContent(providerType.genericTypeName())
                         .addContentLine(".class,")
-                        .addContent(typeHandler.type().genericTypeName())
+                        .addContent(providerValueType.genericTypeName())
                         .addContentLine(".class,")
-                        .addContent(option.name())
-                        .addContentLine("DiscoverServices,")
+                        .update(it -> configuredProviderSettings(it, option, optionProvider))
                         .addContent(option.name())
                         .addContentLine("));")
                         .decreaseContentPadding()
@@ -806,8 +1024,7 @@ final class GenerateAbstractBuilder {
                         .addContentLine(".class,")
                         .addContent(typeHandler.type().genericTypeName())
                         .addContentLine(".class,")
-                        .addContent(option.name())
-                        .addContentLine("DiscoverServices,")
+                        .update(it -> configuredProviderSettings(it, option, optionProvider))
                         .addContent(Optional.class)
                         .addContent(".ofNullable(")
                         .addContent(option.name())
@@ -820,7 +1037,33 @@ final class GenerateAbstractBuilder {
                         .decreaseContentPadding();
             }
         } else {
-            if (typeName.isList()) {
+            if (optionalProviderContainer(typeName)) {
+                boolean optionalSet = optionalProviderSet(typeName);
+                preBuildBuilder.addContentLine("{")
+                        .addContent("var discovered = ")
+                        .addContent(REGISTRY_BUILDER_SUPPORT);
+                if (optionalSet) {
+                    preBuildBuilder.addContent(".<")
+                            .addContent(providerValueType.genericTypeName())
+                            .addContent(">serviceSet(registry, ")
+                            .addContentCreate(providerValueType)
+                            .addContent(", ");
+                } else {
+                    preBuildBuilder.addContent(".<")
+                            .addContent(providerValueType.genericTypeName())
+                            .addContent(">serviceList(registry, ")
+                            .addContentCreate(providerValueType)
+                            .addContent(", ");
+                }
+                preBuildBuilder.addContent(option.name())
+                        .addContentLine("DiscoverServices);")
+                        .addContent("if (")
+                        .addContent(option.name())
+                        .addContentLine(" != null || !discovered.isEmpty()) {");
+                addOptionalProviderDiscovered(preBuildBuilder, option, false);
+                preBuildBuilder.addContentLine("}")
+                        .addContentLine("}");
+            } else if (typeName.isList()) {
                 preBuildBuilder
                         .addContent("this.add")
                         .addContent(capitalize(option.name()))
@@ -860,7 +1103,57 @@ final class GenerateAbstractBuilder {
         }
     }
 
-    private static void validatePrototypeMethod(List<BuilderCodegenExtension> extensions, InnerClass.Builder classBuilder,
+    private static void serviceRegistryConfiguredOptionalProviderContainer(Method.Builder preBuildBuilder,
+                                                                          OptionInfo option,
+                                                                          OptionConfigured configured,
+                                                                          TypeName providerType,
+                                                                          TypeName providerValueType,
+                                                                          OptionProvider optionProvider,
+                                                                          boolean optionalSet) {
+        preBuildBuilder.addContentLine("{")
+                .addContent("var optionConfig = config.get(\"")
+                .addContent(configured.configKey())
+                .addContentLine("\");")
+                .addContent("var discovered = optionConfig.exists() && optionConfig.asNodeList().orElseGet(")
+                .addContent(List.class)
+                .addContentLine("::of).isEmpty()")
+                .increaseContentPadding()
+                .increaseContentPadding()
+                .addContent("? ")
+                .update(it -> optionalProviderEmpty(it, providerValueType))
+                .addContentLine("")
+                .addContent(": ")
+                .addContent(CONFIG_BUILDER_SUPPORT)
+                .addContentLine(".discoverServices(config,")
+                .increaseContentPadding()
+                .increaseContentPadding()
+                .increaseContentPadding()
+                .addContent("\"")
+                .addContent(configured.configKey())
+                .addContentLine("\",")
+                .addContentLine("registry,")
+                .addContent(providerType.genericTypeName())
+                .addContentLine(".class,")
+                .addContent(providerValueType.genericTypeName())
+                .addContentLine(".class,")
+                .update(it -> configuredProviderSettings(it, option, optionProvider))
+                .update(it -> optionalProviderExisting(it, option, optionalSet))
+                .addContentLine(");")
+                .decreaseContentPadding()
+                .decreaseContentPadding()
+                .decreaseContentPadding()
+                .decreaseContentPadding()
+                .decreaseContentPadding()
+                .addContent("if (optionConfig.exists() || ")
+                .addContent(option.name())
+                .addContentLine(" != null || !discovered.isEmpty()) {");
+        addOptionalProviderDiscovered(preBuildBuilder, option, optionalSet);
+        preBuildBuilder.addContentLine("}")
+                .addContentLine("}");
+    }
+
+    private static void validatePrototypeMethod(List<BuilderCodegenExtension> extensions,
+                                                InnerClass.Builder classBuilder,
                                                 PrototypeInfo prototypeInfo,
                                                 List<OptionHandler> options) {
 
@@ -909,9 +1202,8 @@ final class GenerateAbstractBuilder {
                 if (declaredType.isList() || declaredType.isSet()) {
                     String single = "single" + capitalize(propertyName);
                     validateBuilder.addContentLine("for (var " + single + " : " + propertyName + ") {");
-                    validateBuilder.addContentLine("if (!" + allowedValuesConstant + ".contains(String.valueOf(" + single + "))"
-                                                           + ") {")
-                            .addContent("collector.fatal(getClass(), \"Property \\\"")
+                    validateBuilder.addContentLine("if (!isAllowedValue(" + allowedValuesConstant + ", " + single + ")) {");
+                    validateBuilder.addContent("collector.fatal(getClass(), \"Property \\\"")
                             .addContent(propertyName)
                             .addContent("\\\" contains value that is not within allowed values. Configured: \\\"\" + "
                                                 + single + " + \"\\\"")
@@ -923,9 +1215,8 @@ final class GenerateAbstractBuilder {
                     if (!declaredType.primitive()) {
                         validateBuilder.addContent(propertyName + " != null && ");
                     }
-                    validateBuilder.addContentLine("!" + allowedValuesConstant + ".contains(String.valueOf(" + propertyName
-                                                           + "))) {")
-                            .addContent("collector.fatal(getClass(), \"Property \\\"")
+                    validateBuilder.addContentLine("!isAllowedValue(" + allowedValuesConstant + ", " + propertyName + ")) {");
+                    validateBuilder.addContent("collector.fatal(getClass(), \"Property \\\"")
                             .addContent(propertyName)
                             .addContent("\\\" value is not within allowed values. Configured: \\\"\" + " + propertyName + " + "
                                                 + "\"\\\"")
@@ -937,27 +1228,54 @@ final class GenerateAbstractBuilder {
         validateBuilder.addContentLine("collector.collect().checkValid();");
     }
 
+    private static void isAllowedValueMethod(InnerClass.Builder classBuilder) {
+        classBuilder.addMethod(method -> method
+                .name("isAllowedValue")
+                .accessModifier(AccessModifier.PRIVATE)
+                .returnType(TypeName.create(boolean.class))
+                .addParameter(param -> param.name("allowedValues")
+                        .type(TypeName.builder(SET)
+                                      .addTypeArgument(TypeNames.STRING)
+                                      .build()))
+                .addParameter(param -> param.name("value")
+                        .type(Object.class))
+                .addContentLine("if (allowedValues.contains(String.valueOf(value))) {")
+                .addContentLine("return true;")
+                .addContentLine("}")
+                .addContentLine("if (!(value instanceof Enum<?> enumValue)) {")
+                .addContentLine("return false;")
+                .addContentLine("}")
+                .addContent("return allowedValues.contains(enumValue.name().toLowerCase(")
+                .addContent(Locale.class)
+                .addContentLine(".ROOT));"));
+    }
+
     private static void generatePrototypeImpl(List<BuilderCodegenExtension> extensions,
                                               InnerClass.Builder classBuilder,
                                               PrototypeInfo prototypeInfo,
+                                              TypeName implementationType,
+                                              boolean sealedPrototype,
                                               List<OptionHandler> options,
-                                              List<TypeArgument> typeArguments,
-                                              List<TypeName> typeArgumentNames) {
+                                              TypeArguments genericArguments) {
         Optional<TypeName> superPrototype = prototypeInfo.superPrototype();
 
         TypeName prototype = prototypeInfo.prototypeType();
+        List<TypeArgument> typeArguments = genericArguments.arguments();
+        List<TypeName> typeArgumentNames = genericArguments.names();
         String ifaceName = prototype.className();
         // inner class of the builder
-        String implName = ifaceName + "Impl";
+        String implName = implementationType.className();
 
         // inner class of builder base
         classBuilder.addInnerClass(builder -> {
             typeArguments.forEach(builder::addGenericArgument);
             builder.name(implName)
-                    .accessModifier(AccessModifier.PROTECTED)
+                    .accessModifier(sealedPrototype ? AccessModifier.PRIVATE : AccessModifier.PROTECTED)
                     .isStatic(true)
-                    .description("Generated implementation of the prototype, "
-                                         + "can be extended by descendant prototype implementations.");
+                    .description(sealedPrototype
+                                         ? "Generated final implementation of the sealed prototype."
+                                         : "Generated implementation of the prototype, "
+                                                 + "can be extended by descendant prototype implementations.");
             superPrototype.ifPresent(it -> {
                 builder.superType(TypeName.create(it.className() + "Impl"));
             });
@@ -978,7 +1296,7 @@ final class GenerateAbstractBuilder {
              */
             builder.addConstructor(constructor -> {
                 constructor.description("Create an instance providing a builder.")
-                        .accessModifier(AccessModifier.PROTECTED)
+                        .accessModifier(sealedPrototype ? AccessModifier.PRIVATE : AccessModifier.PROTECTED)
                         .addParameter(param -> param.name("builder")
                                 .type(TypeName.builder()
                                               .from(TypeName.create(ifaceName + ".BuilderBase"))
@@ -1023,6 +1341,7 @@ final class GenerateAbstractBuilder {
             hashCodeAndEquals(builder, options, ifaceName, superPrototype.isPresent());
 
             extensions.forEach(it -> it.updateImplementation(prototypeInfo, Utils.options(options), builder));
+            builder.isFinal(sealedPrototype);
         });
     }
 
@@ -1187,25 +1506,36 @@ final class GenerateAbstractBuilder {
                 .name("toString")
                 .returnType(TypeName.create(String.class))
                 .addAnnotation(Annotations.OVERRIDE)
-                .addContent("return \"" + typeName);
+                .addContent("return ");
 
         List<OptionHandler> toStringFields = options.stream()
                 .filter(it -> it.option().includeInToString() && (isBuilder || !it.option().builderOptionOnly()))
                 .toList();
 
         if (toStringFields.isEmpty()) {
-            method.addContentLine("{};\"");
+            method.addContentLiteral(typeName + "{};")
+                    .addContentLine();
         } else {
-            method.addContentLine("{\"")
+            method.addContentLiteral(typeName + "{")
+                    .addContentLine()
                     .increaseContentPadding()
-                    .increaseContentPadding()
-                    .addContentLine(toStringFields.stream()
-                                            .map(it -> GenerateAbstractBuilder.toStringBody(it, isBuilder))
-                                            .collect(Collectors.joining(" + \",\"\n")));
+                    .increaseContentPadding();
+            Iterator<OptionHandler> fieldIterator = toStringFields.iterator();
+            while (fieldIterator.hasNext()) {
+                toStringBody(method, fieldIterator.next(), isBuilder);
+                if (fieldIterator.hasNext()) {
+                    method.addContent(" + ")
+                            .addContentLiteral(",");
+                }
+                method.addContentLine();
+            }
             if (hasSuper) {
-                method.addContentLine("+ \"};\"");
+                method.addContent("+ ")
+                        .addContentLiteral("};")
+                        .addContentLine();
             } else {
-                method.addContent("+ \"}\"");
+                method.addContent("+ ")
+                        .addContentLiteral("}");
             }
         }
         if (hasSuper) {
@@ -1215,7 +1545,7 @@ final class GenerateAbstractBuilder {
         classBuilder.addMethod(method);
     }
 
-    private static String toStringBody(OptionHandler it, boolean isBuilder) {
+    private static void toStringBody(Method.Builder method, OptionHandler it, boolean isBuilder) {
         var option = it.option();
         var typeName = it.typeHandler().type();
 
@@ -1223,19 +1553,32 @@ final class GenerateAbstractBuilder {
                 .equals(Types.CHAR_ARRAY);
 
         String name = option.name();
+        method.addContent("+ ")
+                .addContentLiteral(name + "=")
+                .addContent(" + ");
         if (secret) {
             if (typeName.primitive() && !typeName.array()) {
-                return "+ \"" + name + "=****\"";
+                method.addContentLiteral("****");
+            } else if (!isBuilder && option.declaredType().isOptional()) {
+                // builder stores fields without optional wrapper
+                method.addContent("(" + name + ".isPresent() ? ")
+                        .addContentLiteral("****")
+                        .addContent(" : ")
+                        .addContentLiteral("null")
+                        .addContent(")");
+            } else {
+                method.addContent("(" + name + " == null ? ")
+                        .addContentLiteral("null")
+                        .addContent(" : ")
+                        .addContentLiteral("****")
+                        .addContent(")");
             }
-            // builder stores fields without optional wrapper
-            if (!isBuilder && option.declaredType().isOptional()) {
-                return "+ \"" + name + "=\" + (" + name + ".isPresent() ? \"****\" : "
-                        + "\"null\")";
-            }
-            return "+ \"" + name + "=\" + (" + name + " == null ? \"null\" : "
-                    + "\"****\")";
+        } else if (option.declaredType().array()) {
+            method.addContent(Arrays.class)
+                    .addContent(".toString(" + name + ")");
+        } else {
+            method.addContent(name);
         }
-        return "+ \"" + name + "=\" + " + name;
     }
 
     private static void implMethods(InnerClass.Builder classBuilder,
@@ -1268,7 +1611,23 @@ final class GenerateAbstractBuilder {
             constructor.addContent("this." + option.name() + " = ");
             TypeName declaredType = option.declaredType();
 
-            if (declaredType.isOptional()) {
+            if (declaredType.isOptional() && optionHandler.typeHandler().type().isList()) {
+                constructor.addContent("builder." + getterName + "().map(")
+                        .addContent(List.class)
+                        .addContentLine("::copyOf);");
+            } else if (declaredType.isOptional() && optionHandler.typeHandler().type().isSet()) {
+                constructor.addContent("builder." + getterName + "().map(it -> ")
+                        .addContent(Collections.class)
+                        .addContent(".unmodifiableSet(new ")
+                        .addContent(LinkedHashSet.class)
+                        .addContentLine("<>(it)));");
+            } else if (declaredType.isOptional() && optionHandler.typeHandler().type().isMap()) {
+                constructor.addContent("builder." + getterName + "().map(it -> ")
+                        .addContent(Collections.class)
+                        .addContent(".unmodifiableMap(new ")
+                        .addContent(LinkedHashMap.class)
+                        .addContentLine("<>(it)));");
+            } else if (declaredType.isOptional()) {
                 constructor.addContent("builder." + getterName + "().map(")
                         .addContent(Function.class)
                         .addContentLine(".identity());");
@@ -1313,5 +1672,8 @@ final class GenerateAbstractBuilder {
         }
 
         return result.toString();
+    }
+
+    record TypeArguments(List<TypeArgument> arguments, List<TypeName> names) {
     }
 }

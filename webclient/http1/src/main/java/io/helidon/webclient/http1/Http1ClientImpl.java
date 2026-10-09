@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,21 @@
 
 package io.helidon.webclient.http1;
 
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
+import io.helidon.http.HttpLogConfig;
+import io.helidon.http.LogFormatter;
 import io.helidon.http.Method;
+import io.helidon.http.http1.Http1ConnectionListener;
+import io.helidon.http.http1.Http1LoggingConnectionListener;
+import io.helidon.webclient.api.ClientConnection;
 import io.helidon.webclient.api.ClientRequest;
 import io.helidon.webclient.api.ClientUri;
 import io.helidon.webclient.api.FullClientRequest;
+import io.helidon.webclient.api.HttpTransportConnectionCache;
+import io.helidon.webclient.api.HttpTransportObserverSupport;
 import io.helidon.webclient.api.WebClient;
 import io.helidon.webclient.spi.HttpClientSpi;
 
@@ -29,18 +40,45 @@ class Http1ClientImpl implements Http1Client, HttpClientSpi {
     private final Http1ClientProtocolConfig protocolConfig;
     private final Http1ConnectionCache connectionCache;
     private final Http1ConnectionCache clientCache;
+    private final HttpTransportConnectionCache<Http1ConnectionCache> observedCache;
+    private final Http1ConnectionListener recvListener;
+    private final Http1ConnectionListener sendListener;
+    private final LogFormatter logFormatter;
 
     Http1ClientImpl(WebClient webClient, Http1ClientConfig clientConfig) {
         this.webClient = webClient;
         this.clientConfig = clientConfig;
         this.protocolConfig = clientConfig.protocolConfig();
-        if (clientConfig.shareConnectionCache()) {
+        this.observedCache = HttpTransportConnectionCache.create(Http1ConnectionCache.class,
+                                                                 clientConfig,
+                                                                 Http1ConnectionCache::create)
+                .orElse(null);
+        if (observedCache != null) {
+            this.connectionCache = null;
+            this.clientCache = null;
+        } else if (clientConfig.shareConnectionCache()) {
             this.connectionCache = Http1ConnectionCache.shared();
             this.clientCache = null;
         } else {
             this.connectionCache = Http1ConnectionCache.create();
             this.clientCache = connectionCache;
         }
+
+        HttpLogConfig logConfig = protocolConfig.log();
+        if (logConfig.receiveLog()) {
+            this.recvListener = Http1LoggingConnectionListener.create(logConfig,
+                                                                      "cl-recv");
+        } else {
+            this.recvListener = Http1ConnectionListener.create(List.of());
+        }
+        if (logConfig.sendLog()) {
+            this.sendListener = Http1LoggingConnectionListener.create(logConfig,
+                                                                      "cl-send");
+        } else {
+            this.sendListener = Http1ConnectionListener.create(List.of());
+        }
+
+        this.logFormatter = LogFormatter.create(logConfig);
     }
 
     @Override
@@ -71,18 +109,20 @@ class Http1ClientImpl implements Http1Client, HttpClientSpi {
         // this is HTTP/1.1 - it should support any and all HTTP requests
         // this method is called from the "generic" HTTP client, that can support any version (that is on classpath).
         // usually HTTP/1.1 is either the only available, or a fallback if other versions cannot be used
-        Http1ClientRequest request = new Http1ClientRequestImpl(this,
-                                                                clientRequest,
-                                                                clientRequest.method(),
-                                                                clientUri,
-                                                                clientRequest.sendExpectContinue().orElse(null),
-                                                                clientRequest.properties());
+        var selectedProxyRoute = clientRequest.selectedProxyRoute();
+        Http1ClientRequestImpl request = new Http1ClientRequestImpl(this,
+                                                                    clientRequest,
+                                                                    clientRequest.method(),
+                                                                    clientUri,
+                                                                    clientRequest.sendExpectContinue().orElse(null),
+                                                                    clientRequest.properties());
 
         clientRequest.connection().ifPresent(request::connection);
         clientRequest.pathParams().forEach(request::pathParam);
         clientRequest.address().ifPresent(request::address);
-
-        return request.readTimeout(clientRequest.readTimeout())
+        clientRequest.sni().ifPresent(request::sni);
+        request.readTimeout(clientRequest.readTimeout())
+                .readContinueTimeout(clientRequest.readContinueTimeout())
                 .followRedirects(clientRequest.followRedirects())
                 .maxRedirects(clientRequest.maxRedirects())
                 .keepAlive(clientRequest.keepAlive())
@@ -90,13 +130,35 @@ class Http1ClientImpl implements Http1Client, HttpClientSpi {
                 .tls(clientRequest.tls())
                 .headers(clientRequest.headers())
                 .fragment(clientUri.fragment());
+        selectedProxyRoute.ifPresent(request::selectedProxyRoute);
+        return request;
     }
 
     @Override
     public void closeResource() {
-        if (clientCache != null) {
+        if (observedCache != null) {
+            observedCache.closeResource();
+        } else if (clientCache != null) {
             this.clientCache.closeResource();
         }
+    }
+
+    @Override
+    public CompletionStage<Void> closeResourceAsync() {
+        closeResource();
+        return observedCache == null ? CompletableFuture.completedStage(null) : observedCache.completion();
+    }
+
+    Http1ConnectionListener recvListener() {
+        return recvListener;
+    }
+
+    Http1ConnectionListener sendListener() {
+        return sendListener;
+    }
+
+    LogFormatter logFormatter() {
+        return logFormatter;
     }
 
     WebClient webClient() {
@@ -112,6 +174,11 @@ class Http1ClientImpl implements Http1Client, HttpClientSpi {
     }
 
     Http1ConnectionCache connectionCache() {
-        return connectionCache;
+        return observedCache == null ? connectionCache : observedCache.cache();
+    }
+
+    <T extends ClientConnection> T observe(T connection) {
+        return observedCache == null ? connection
+                : HttpTransportObserverSupport.observe(connection, observedCache.observer());
     }
 }

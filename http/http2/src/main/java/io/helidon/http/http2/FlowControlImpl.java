@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 package io.helidon.http.http2;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 
@@ -114,13 +116,18 @@ abstract class FlowControlImpl implements FlowControl {
 
         @Override
         public void incrementWindowSize(int increment) {
-            long strRemaining = streamWindowSize.incrementWindowSize(increment);
-            if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
-                LOGGER_INBOUND.log(DEBUG, String.format("%s IFC STR %d: +%d(%d)", type, streamId(), increment, strRemaining));
-            }
+            incrementStreamWindowSize(increment);
             long conRemaining = connectionWindowSize.incrementWindowSize(increment);
             if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
                 LOGGER_INBOUND.log(DEBUG, String.format("%s IFC STR 0: +%d(%d)", type, increment, conRemaining));
+            }
+        }
+
+        @Override
+        public void incrementStreamWindowSize(int increment) {
+            long strRemaining = streamWindowSize.incrementWindowSize(increment);
+            if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
+                LOGGER_INBOUND.log(DEBUG, String.format("%s IFC STR %d: +%d(%d)", type, streamId(), increment, strRemaining));
             }
         }
 
@@ -128,9 +135,23 @@ abstract class FlowControlImpl implements FlowControl {
 
     static class Outbound extends FlowControlImpl implements FlowControl.Outbound {
 
+        private static final VarHandle CONNECTION_WINDOW_WAITER;
+
+        static {
+            try {
+                CONNECTION_WINDOW_WAITER = MethodHandles.lookup()
+                        .findVarHandle(FlowControlImpl.Outbound.class,
+                                       "connectionWindowWaiter",
+                                       WindowSizeImpl.Outbound.ConnectionWindowWaiter.class);
+            } catch (ReflectiveOperationException e) {
+                throw new Error("Unable to obtain connection window waiter VarHandle", e);
+            }
+        }
+
         private final ConnectionFlowControl.Type type;
         private final ConnectionFlowControl connectionFlowControl;
-        private final WindowSize.Outbound streamWindowSize;
+        private final WindowSizeImpl.Outbound streamWindowSize;
+        private volatile WindowSizeImpl.Outbound.ConnectionWindowWaiter connectionWindowWaiter;
 
         Outbound(ConnectionFlowControl.Type type,
                  int streamId,
@@ -138,7 +159,7 @@ abstract class FlowControlImpl implements FlowControl {
             super(streamId);
             this.type = type;
             this.connectionFlowControl = connectionFlowControl;
-            this.streamWindowSize = WindowSize.createOutbound(type, streamId, connectionFlowControl);
+            this.streamWindowSize = new WindowSizeImpl.Outbound(type, streamId, connectionFlowControl);
         }
 
         @Override
@@ -171,7 +192,6 @@ abstract class FlowControlImpl implements FlowControl {
             if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
                 LOGGER_OUTBOUND.log(DEBUG, String.format("%s OFC STR %d: +%d(%d)", type, streamId(), increment, remaining));
             }
-            connectionFlowControl.outbound().triggerUpdate();
             return remaining;
         }
 
@@ -182,13 +202,42 @@ abstract class FlowControlImpl implements FlowControl {
 
         @Override
         public void blockTillUpdate() {
-            connectionFlowControl.outbound().blockTillUpdate();
+            connectionFlowControl.blockTillUpdate(connectionWindowWaiter());
             streamWindowSize.blockTillUpdate();
+        }
+
+        @Override
+        public void connectionClosed() {
+            connectionFlowControl.connectionClosed();
+            streamWindowSize.connectionClosed();
+        }
+
+        @Override
+        public void streamClosed() {
+            streamWindowSize.streamClosed();
+            WindowSizeImpl.Outbound.ConnectionWindowWaiter waiter = connectionWindowWaiter;
+            if (waiter != null) {
+                connectionFlowControl.streamClosed(waiter);
+            }
         }
 
         @Override
         public int maxFrameSize() {
             return connectionFlowControl.maxFrameSize();
+        }
+
+        private WindowSizeImpl.Outbound.ConnectionWindowWaiter connectionWindowWaiter() {
+            WindowSizeImpl.Outbound.ConnectionWindowWaiter waiter = connectionWindowWaiter;
+            if (waiter == null) {
+                WindowSizeImpl.Outbound.ConnectionWindowWaiter newWaiter =
+                        connectionFlowControl.createConnectionWindowWaiter(streamWindowSize::isStreamClosed);
+                if (CONNECTION_WINDOW_WAITER.compareAndSet(this, null, newWaiter)) {
+                    waiter = newWaiter;
+                } else {
+                    waiter = connectionWindowWaiter;
+                }
+            }
+            return waiter;
         }
     }
 

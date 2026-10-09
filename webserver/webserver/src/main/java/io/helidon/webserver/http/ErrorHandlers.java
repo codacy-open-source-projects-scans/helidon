@@ -26,8 +26,12 @@ import io.helidon.http.BadRequestException;
 import io.helidon.http.DirectHandler;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.HttpException;
+import io.helidon.http.HttpPrologue;
 import io.helidon.http.InternalServerException;
+import io.helidon.http.LogFormatter;
 import io.helidon.http.RequestException;
+import io.helidon.http.Status;
+import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.webserver.CloseConnectionException;
 import io.helidon.webserver.ConnectionContext;
 import io.helidon.webserver.ServerConnectionException;
@@ -143,11 +147,13 @@ public final class ErrorHandlers {
                                         ServerRequest request,
                                         RoutingResponse response,
                                         RequestException e) {
-        // we are only interested in resetting the streams, headers are at the discretion of the error handler
-        if (!response.resetStream()) {
+        if (!response.resetEntity()) {
+            HttpPrologue prologue = request.prologue();
             ctx.log(LOGGER, System.Logger.Level.WARNING,
                     "Request failed: %s, cannot send error response, as response already sent",
-                    e, request.prologue());
+                    e, prologue.method()
+                            + " " + LogFormatter.escape(prologue.uriPath().rawPath())
+                            + " " + prologue.protocol() + "/" + prologue.protocolVersion());
             throw new CloseConnectionException(
                     "Cannot send response of an error handler, status and headers already written");
         }
@@ -166,9 +172,13 @@ public final class ErrorHandlers {
                 }
             }
         }
+        prepareContentEncoding(ctx, request, response);
         ctx.listenerContext()
                 .directHandlers()
-                .handle(e, response, keepAlive);
+                .handle(e,
+                        DirectTransportRequest.create(request.prologue(), request.headers()),
+                        response,
+                        keepAlive);
 
         response.commit();
     }
@@ -188,7 +198,9 @@ public final class ErrorHandlers {
         if (e instanceof HttpException httpException) {
             handleRequestException(ctx, request, response, RequestException.builder()
                     .cause(e)
-                    .type(DirectHandler.EventType.OTHER)
+                    .type(httpException.status().code() == Status.BAD_REQUEST_400.code()
+                                  ? DirectHandler.EventType.BAD_REQUEST
+                                  : DirectHandler.EventType.OTHER)
                     .message(e.getMessage())
                     .status(httpException.status())
                     .setKeepAlive(httpException.keepAlive())
@@ -200,7 +212,10 @@ public final class ErrorHandlers {
             handleRequestException(ctx, request, response, RequestException.builder()
                     .cause(e)
                     .type(DirectHandler.EventType.INTERNAL_ERROR)
-                    .message(e.getMessage())
+                    .message(ctx.listenerContext()
+                                     .config()
+                                     .errorHandling()
+                                     .includeEntity() ? e.getMessage() : "Internal Server Error")
                     .request(DirectTransportRequest.create(request.prologue(), request.headers()))
                     .build());
         }
@@ -211,8 +226,7 @@ public final class ErrorHandlers {
                              RoutingResponse response,
                              Throwable e,
                              ErrorHandler<Throwable> it) {
-        // we are only interested in resetting the streams, headers are at the discretion of the error handler
-        if (!response.resetStream()) {
+        if (!response.resetEntity()) {
             ctx.log(LOGGER,
                     System.Logger.Level.WARNING,
                     "Unable to reset response for error handler, at least part of entity already written. "
@@ -221,6 +235,7 @@ public final class ErrorHandlers {
             throw new CloseConnectionException(
                     "Cannot send response of a simple handler, status and headers already written", e);
         }
+        prepareContentEncoding(ctx, request, response);
         try {
             it.handle(request, response, e);
             response.commit();
@@ -238,6 +253,17 @@ public final class ErrorHandlers {
         } catch (Exception ex) {
             ctx.log(LOGGER, System.Logger.Level.TRACE, "Failed to handle exception.", ex);
             unhandledError(ctx, request, response, e);
+        }
+    }
+
+    private void prepareContentEncoding(ConnectionContext ctx,
+                                        ServerRequest request,
+                                        RoutingResponse response) {
+        ContentEncodingContext contentEncodingContext = ctx.listenerContext().contentEncodingContext();
+        try {
+            contentEncodingContext.encoder(request.headers());
+        } catch (HttpException _) {
+            response.automaticContentEncoding(false);
         }
     }
 }

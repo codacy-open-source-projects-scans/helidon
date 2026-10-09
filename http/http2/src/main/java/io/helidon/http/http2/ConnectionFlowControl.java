@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package io.helidon.http.http2;
 
 import java.time.Duration;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 import io.helidon.common.Builder;
 
@@ -34,7 +35,7 @@ public class ConnectionFlowControl {
     private final BiConsumer<Integer, Http2WindowUpdate> windowUpdateWriter;
     private final Duration timeout;
     private final WindowSize.Inbound inboundConnectionWindowSize;
-    private final WindowSize.Outbound outboundConnectionWindowSize;
+    private final WindowSizeImpl.Outbound outboundConnectionWindowSize;
 
     private volatile int maxFrameSize = WindowSize.DEFAULT_MAX_FRAME_SIZE;
     private volatile int initialWindowSize = WindowSize.DEFAULT_WIN_SIZE;
@@ -53,8 +54,7 @@ public class ConnectionFlowControl {
                                          initialWindowSize,
                                          maxFrameSize,
                                          windowUpdateWriter);
-        outboundConnectionWindowSize =
-                WindowSize.createOutbound(type, 0, this);
+        outboundConnectionWindowSize = new WindowSizeImpl.Outbound(type, 0, this);
     }
 
     /**
@@ -119,6 +119,17 @@ public class ConnectionFlowControl {
     }
 
     /**
+     * Increment inbound connection flow control window, called when received DATA frame size is restored
+     * without a stream-specific window update.
+     *
+     * @param increment received DATA frame size in bytes
+     * @return inbound window size after increment
+     */
+    public long incrementInboundConnectionWindowSize(int increment) {
+        return inboundConnectionWindowSize.incrementWindowSize(increment);
+    }
+
+    /**
      * Reset MAX_FRAME_SIZE for all streams, existing and future ones.
      *
      * @param maxFrameSize to split data frames according to when larger
@@ -150,6 +161,22 @@ public class ConnectionFlowControl {
      */
     public WindowSize.Outbound outbound() {
         return outboundConnectionWindowSize;
+    }
+
+    void connectionClosed() {
+        outboundConnectionWindowSize.connectionClosed();
+    }
+
+    WindowSizeImpl.Outbound.ConnectionWindowWaiter createConnectionWindowWaiter(BooleanSupplier streamClosed) {
+        return outboundConnectionWindowSize.createConnectionWindowWaiter(streamClosed);
+    }
+
+    void streamClosed(WindowSizeImpl.Outbound.ConnectionWindowWaiter waiter) {
+        outboundConnectionWindowSize.triggerUpdate(waiter);
+    }
+
+    void blockTillUpdate(WindowSizeImpl.Outbound.ConnectionWindowWaiter waiter) {
+        outboundConnectionWindowSize.blockTillUpdate(waiter);
     }
 
     /**

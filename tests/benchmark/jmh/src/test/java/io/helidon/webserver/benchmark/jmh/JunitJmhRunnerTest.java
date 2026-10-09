@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,42 +20,62 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.hamcrest.MatcherAssert;
 import org.hamcrest.Matchers;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.openjdk.jmh.results.RunResult;
 import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
+import org.openjdk.jmh.runner.options.ChainedOptionsBuilder;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
+@ResourceLock(value = Resources.SYSTEM_PROPERTIES, mode = ResourceAccessMode.READ)
 public class JunitJmhRunnerTest {
 
     private static final String ERROR_MARGIN_PERCENT_DEFAULT = "15";
-    private static final int ERROR_MARGIN =
-            Integer.parseInt(System.getProperty("webserver.jmh.errorMargin", ERROR_MARGIN_PERCENT_DEFAULT));
+    private static final String ALL_BENCHMARKS = ".*JmhTest";
+    private static final String HTTP2_REUSE_BENCHMARK =
+            ".*HttpJmhTest.http2MaxConcurrentStreamReuseLargeResponse";
+    private static final String HTTP2_FLOW_CONTROL_BENCHMARK = ".*Http2FlowControlJmhTest.*";
+    private static final int DEFAULT_THREADS = 8;
+    private static final int HTTP2_REUSE_THREADS = 1;
 
     static Stream<Histogram.Benchmark> httpBenchmarks() throws RunnerException, IOException {
-        Options opt = new OptionsBuilder()
-                .include(".*JmhTest")
-                .forks(1)
-                .threads(8)
-                .resultFormat(ResultFormatType.JSON)
-                .result("./target/benchmark-result.json")
-                .warmupIterations(10)
-                .warmupTime(TimeValue.seconds(1))
-                .measurementIterations(8)
-                .measurementTime(TimeValue.seconds(2))
+        Options defaultOptions = optionsBuilder("./target/benchmark-result.json")
+                .include(ALL_BENCHMARKS)
+                .exclude(HTTP2_REUSE_BENCHMARK)
+                .exclude(HTTP2_FLOW_CONTROL_BENCHMARK)
+                .exclude(".*Http2ConnectionWriterJmhTest.*")
+                .threads(DEFAULT_THREADS)
                 .build();
 
-        Collection<RunResult> runResults = new Runner(opt).run();
+        Options http2ReuseOptions = optionsBuilder("./target/benchmark-result-http2-reuse.json")
+                .include(HTTP2_REUSE_BENCHMARK)
+                .threads(HTTP2_REUSE_THREADS)
+                .build();
+
+        Options http2FlowControlOptions = optionsBuilder("./target/benchmark-result-http2-flow-control.json")
+                .include(HTTP2_FLOW_CONTROL_BENCHMARK)
+                .build();
+
+        Collection<RunResult> runResults = new ArrayList<>();
+        runResults.addAll(new Runner(defaultOptions).run());
+        runResults.addAll(new Runner(http2ReuseOptions).run());
+        runResults.addAll(new Runner(http2FlowControlOptions).run());
 
         boolean resetBaseline = Boolean.parseBoolean(System.getProperty("webserver.jmh.resetBaseline", "false"));
 
@@ -63,8 +83,9 @@ public class JunitJmhRunnerTest {
         Map<String, BaseLine> baseLineMap;
         if (resetBaseline || !baseLineFile.exists()) {
             Files.deleteIfExists(baseLineFile.toPath());
-            baseLineMap = BaseLine.load(Path.of("./target/benchmark-result.json"));
-            Files.copy(Path.of("./target/benchmark-result.json"), baseLineFile.toPath());
+            baseLineMap = runResults.stream()
+                    .map(BaseLine::create)
+                    .collect(Collectors.toMap(BaseLine::getBenchmark, Function.identity()));
         } else {
             baseLineMap = BaseLine.load(baseLineFile.toPath());
         }
@@ -76,22 +97,37 @@ public class JunitJmhRunnerTest {
         return histogram.benchmarks.stream();
     }
 
+    private static ChainedOptionsBuilder optionsBuilder(String resultFile) {
+        return new OptionsBuilder()
+                .forks(1)
+                .shouldFailOnError(true)
+                .resultFormat(ResultFormatType.JSON)
+                .result(resultFile)
+                .warmupIterations(10)
+                .warmupTime(TimeValue.seconds(1))
+                .measurementIterations(8)
+                .measurementTime(TimeValue.seconds(2));
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("httpBenchmarks")
     void renderResult(Histogram.Benchmark benchmark) {
         String render = benchmark.render();
 
-        double errMargin = (benchmark.currentScore() / 100) * ERROR_MARGIN;
-        String errMarginDesc = String.format("%s%%(%.2f)", ERROR_MARGIN, errMargin);
+        int errorMargin = Integer.parseInt(System.getProperty("webserver.jmh.errorMargin", ERROR_MARGIN_PERCENT_DEFAULT));
+        double errMargin = (benchmark.currentScore() / 100) * errorMargin;
+        String errMarginDesc = String.format("%s%%(%.2f)", errorMargin, errMargin);
+        boolean higherIsBetter = benchmark.higherIsBetter();
         MatcherAssert.assertThat(
                 "\n" + render + "\n" +
                         benchmark.name() + " regression detected. Error margin " + errMarginDesc,
-                benchmark.currentScore() + errMargin,
-                Matchers.greaterThanOrEqualTo(benchmark.baseLineScore()));
+                higherIsBetter ? benchmark.currentScore() + errMargin : benchmark.currentScore() - errMargin,
+                higherIsBetter ? Matchers.greaterThanOrEqualTo(benchmark.baseLineScore())
+                        : Matchers.lessThanOrEqualTo(benchmark.baseLineScore()));
 
         System.out.println(render);
 
-        if (benchmark.currentScore() < benchmark.baseLineScore()) {
+        if (benchmark.regression()) {
             System.out.println("⚠ Still within the error margin " + errMarginDesc);
         }
     }

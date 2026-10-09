@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import java.util.Optional;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
+import io.helidon.metrics.api.MeterRegistry;
 import io.helidon.webclient.api.HttpClientConfig;
 import io.helidon.webclient.grpc.spi.GrpcClientService;
 import io.helidon.webclient.grpc.spi.GrpcClientServiceProvider;
@@ -30,6 +31,7 @@ import io.helidon.webclient.grpc.spi.GrpcClientServiceProvider;
  */
 @Prototype.Blueprint
 @Prototype.Configured
+@Prototype.IncludeDefaultMethods("meterRegistry")
 interface GrpcClientConfigBlueprint extends HttpClientConfig, Prototype.Factory<GrpcClient> {
 
     /**
@@ -59,14 +61,21 @@ interface GrpcClientConfigBlueprint extends HttpClientConfig, Prototype.Factory<
     boolean enableMetrics();
 
     /**
-     * gRPC client services. A gRPC service needs to be explicitly added to
-     * be enabled given that {@code discoveredServices} is {@code false}.
+     * Meter registry to use for gRPC client metrics.
+     *
+     * @return meter registry to use
+     */
+    default Optional<MeterRegistry> meterRegistry() {
+        return Optional.empty();
+    }
+
+    /**
+     * gRPC client services. Services are discovered automatically by default.
      *
      * @return services to use with this gRPC client
      */
     @Option.Singular
     @Option.Configured
-    @Option.Provider(value = GrpcClientServiceProvider.class, discoverServices = false)
+    @Option.Provider(GrpcClientServiceProvider.class)
     List<GrpcClientService> grpcServices();
 }
-

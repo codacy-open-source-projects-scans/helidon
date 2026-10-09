@@ -17,12 +17,19 @@
 package io.helidon.json;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -50,6 +57,157 @@ class JsonValueParserTest {
         assertThat(parser.readJsonValue(), is(original));
         assertThat(parser.readDouble(), is(123.45));
         assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserReadsBigInteger() {
+        JsonParser parser = JsonParser.create(JsonNumber.create(new BigDecimal("1E+3")));
+
+        assertThat(parser.readBigInteger(), is(BigInteger.valueOf(1_000)));
+    }
+
+    @Test
+    public void testJsonValueParserRejectsExcessiveBigIntegerExpansion() {
+        JsonParser parser = JsonParser.create(JsonNumber.create(new BigDecimal("1E+4097")));
+
+        assertThrows(JsonException.class, parser::readBigInteger);
+    }
+
+    @Test
+    public void testJsonValueParserHasAggregateBigIntegerExpansionBudget() {
+        JsonNumber number = JsonNumber.create(new BigDecimal("1E+4096"));
+        BigInteger expected = BigInteger.TEN.pow(4_096);
+        JsonParser parser = JsonParser.create(number);
+
+        for (int i = 0; i < 16; i++) {
+            assertThat(parser.readBigInteger(), is(expected));
+        }
+        JsonException exception = assertThrows(JsonException.class, parser::readBigInteger);
+        assertThat(exception.getMessage(), containsString("65536"));
+
+        assertThat(JsonParser.create(number).readBigInteger(), is(expected));
+    }
+
+    @Test
+    public void testJsonValueParserRetainsSourceDocumentBigIntegerExpansionBudget() {
+        BigInteger expected = BigInteger.TEN.pow(4_096);
+        JsonNumber number = JsonParser.create("1e4096").readJsonNumber();
+
+        for (int i = 0; i < 8; i++) {
+            assertThat(number.bigIntegerValue(), is(expected));
+        }
+        JsonParser parser = JsonParser.create(number);
+        for (int i = 0; i < 8; i++) {
+            assertThat(parser.readBigInteger(), is(expected));
+        }
+        assertThrows(JsonException.class, parser::readBigInteger);
+        assertThrows(JsonException.class, () -> JsonParser.create(number).readBigInteger());
+
+        assertThat(JsonParser.create("1e4096").readJsonNumber().bigIntegerValue(), is(expected));
+    }
+
+    @Test
+    public void testJsonValueParserChargesMixedOriginNumbersToParserBudget() {
+        BigInteger expected = BigInteger.TEN.pow(4_096);
+        List<JsonNumber> values = new ArrayList<>();
+        for (int i = 0; i < 17; i++) {
+            values.add(JsonParser.create("1e4096").readJsonNumber());
+        }
+        JsonParser parser = JsonParser.create(JsonArray.create(values));
+
+        for (int i = 0; i < 16; i++) {
+            assertThat(parser.nextToken(), is((byte) '1'));
+            assertThat(parser.readBigInteger(), is(expected));
+            assertThat(parser.nextToken(), is((byte) ','));
+        }
+        assertThat(parser.nextToken(), is((byte) '1'));
+        JsonException exception = assertThrows(JsonException.class, parser::readBigInteger);
+        assertThat(exception.getMessage(), containsString("65536"));
+    }
+
+    @Test
+    public void testJsonValueParserReturnedNumberRetainsSourceDocumentBudget() {
+        BigInteger expected = BigInteger.TEN.pow(4_096);
+        JsonNumber number = JsonParser.create("1e4096").readJsonNumber();
+        JsonParser parser = JsonParser.create(number);
+        JsonNumber returnedNumber = parser.readJsonNumber();
+
+        assertThat(returnedNumber, sameInstance(number));
+
+        for (int i = 0; i < 8; i++) {
+            assertThat(number.bigIntegerValue(), is(expected));
+            assertThat(returnedNumber.bigIntegerValue(), is(expected));
+        }
+        assertThrows(JsonException.class, number::bigIntegerValue);
+        assertThrows(JsonException.class, returnedNumber::bigIntegerValue);
+    }
+
+    @Test
+    public void testJsonValueParserRetainsExpandingValueIdentity() {
+        JsonNumber number = JsonParser.create("1e4096").readJsonNumber();
+        JsonArray array = JsonArray.create(List.of(number));
+        JsonObject object = JsonObject.create(Map.of("number", number));
+
+        assertThat(JsonParser.create(number).readJsonValue(), sameInstance(number));
+        assertThat(JsonParser.create(array).readJsonArray(), sameInstance(array));
+        assertThat(JsonParser.create(object).readJsonObject(), sameInstance(object));
+    }
+
+    @Test
+    void testJsonValueParserReadsIntegralTypes() {
+        JsonParser parser = JsonParser.create(JsonNumber.create(123));
+        JsonParser longParser = JsonParser.create(JsonNumber.create(9_876_543_210L));
+
+        assertThat(parser.readByte(), is((byte) 123));
+        assertThat(parser.readShort(), is((short) 123));
+        assertThat(longParser.readLong(), is(9_876_543_210L));
+    }
+
+    @Test
+    void testJsonValueParserRejectsIntegralOverflow() {
+        assertThrows(JsonException.class, () -> JsonParser.create(JsonNumber.create(128)).readByte());
+        assertThrows(JsonException.class, () -> JsonParser.create(JsonNumber.create(32_768)).readShort());
+        assertThrows(JsonException.class, () -> JsonParser.create(JsonNumber.create(2_147_483_648L)).readInt());
+        assertThrows(JsonException.class,
+                     () -> JsonParser.create(JsonNumber.create(new BigDecimal("9223372036854775808"))).readLong());
+    }
+
+    @Test
+    void testJsonValueParserTruncatesIntegralBoundaryFractions() {
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("127.9"))).readByte(), is(Byte.MAX_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("-128.9"))).readByte(), is(Byte.MIN_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("32767.9"))).readShort(), is(Short.MAX_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("-32768.9"))).readShort(), is(Short.MIN_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("2147483647.9"))).readInt(), is(Integer.MAX_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("-2147483648.9"))).readInt(), is(Integer.MIN_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("9223372036854775807.9"))).readLong(),
+                   is(Long.MAX_VALUE));
+        assertThat(JsonParser.create(JsonNumber.create(new BigDecimal("-9223372036854775808.9"))).readLong(),
+                   is(Long.MIN_VALUE));
+    }
+
+    @Test
+    void testJsonValueParserRejectsExtremePositiveExponentWithoutBigIntegerConversion() {
+        JsonNumber number = JsonNumber.create(new BigIntegerGuardDecimal("1e100000000"));
+
+        assertThat(assertThrows(JsonException.class, () -> JsonParser.create(number).readByte()).getMessage(),
+                   is("The number is too big for a byte value"));
+        assertThat(assertThrows(JsonException.class, () -> JsonParser.create(number).readShort()).getMessage(),
+                   is("The number is too big for a short value"));
+        assertThat(assertThrows(JsonException.class, () -> JsonParser.create(number).readInt()).getMessage(),
+                   is("The number is too big for an int value"));
+        assertThat(assertThrows(JsonException.class, () -> JsonParser.create(number).readLong()).getMessage(),
+                   is("The number is too big for a long value"));
+    }
+
+    @Test
+    void testJsonValueParserTruncatesExtremeNegativeExponentWithoutBigIntegerConversion() {
+        JsonNumber number = JsonNumber.create(new BigIntegerGuardDecimal("1e-100000000"));
+
+        assertThat(JsonParser.create(number).readByte(), is((byte) 0));
+        assertThat(JsonParser.create(number).readShort(), is((short) 0));
+        assertThat(JsonParser.create(number).readInt(), is(0));
+        assertThat(JsonParser.create(number).readLong(), is(0L));
     }
 
     @Test
@@ -84,6 +242,13 @@ class JsonValueParserTest {
     }
 
     @Test
+    public void testJsonValueParserRejectsInvalidBase64() {
+        JsonParser parser = JsonParser.create(JsonString.create("not-base64***"));
+
+        assertThrows(JsonDecodingException.class, parser::readBinary);
+    }
+
+    @Test
     public void testJsonValueParserWithBoolean() {
         JsonValue original = JsonBoolean.TRUE;
         JsonParser parser = JsonParser.create(original);
@@ -112,6 +277,7 @@ class JsonValueParserTest {
         JsonParser parser = JsonParser.create(original);
 
         JsonObject result = parser.readJsonObject();
+        assertThat(result, sameInstance(original));
         assertThat(result.stringValue("key1").orElseThrow(), is("value1"));
         assertThat(result.intValue("key2").orElseThrow(), is(42));
     }
@@ -126,7 +292,8 @@ class JsonValueParserTest {
         JsonParser parser = JsonParser.create(original);
 
         JsonArray result = parser.readJsonArray();
-        assertThat(result.values().size(), is(3));
+        assertThat(result, sameInstance(original));
+        assertThat(result.size(), is(3));
         assertThat(result.get(0, JsonNull.instance()).asString().value(), is("item1"));
         assertThat(result.get(1, JsonNull.instance()).asNumber().intValue(), is(123));
         assertThat(result.get(2, JsonNull.instance()).asBoolean().value(), is(true));
@@ -227,6 +394,12 @@ class JsonValueParserTest {
     }
 
     @Test
+    public void testJsonValueParserSkipsNestedEmptyContainers() {
+        assertNestedEmptyContainerSkipped(JsonObject.empty(), (byte) '{', (byte) '}');
+        assertNestedEmptyContainerSkipped(JsonArray.empty(), (byte) '[', (byte) ']');
+    }
+
+    @Test
     public void testJsonValueParserSkipAfterRead() {
         JsonValue original = JsonString.create("test");
         JsonParser parser = JsonParser.create(original);
@@ -278,6 +451,90 @@ class JsonValueParserTest {
     }
 
     @Test
+    public void testJsonValueParserNextTokenAdvancesArrayCorrectly() {
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of(JsonString.create("first"),
+                                                                       JsonString.create("second"))));
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) '"'));
+        assertThat(parser.readString(), is("first"));
+        assertThat(parser.nextToken(), is((byte) ','));
+        assertThat(parser.nextToken(), is((byte) '"'));
+        assertThat(parser.readString(), is("second"));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserNextTokenAdvancesEmptyStructuresCorrectly() {
+        JsonParser arrayParser = JsonParser.create(JsonArray.EMPTY_ARRAY);
+        assertThat(arrayParser.nextToken(), is((byte) ']'));
+        assertThat(arrayParser.hasNext(), is(false));
+
+        JsonParser objectParser = JsonParser.create(JsonObject.EMPTY_OBJECT);
+        assertThat(objectParser.nextToken(), is((byte) '}'));
+        assertThat(objectParser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserPreservesNestedEndTokens() {
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of(JsonObject.EMPTY_OBJECT)));
+
+        assertThat(parser.nextToken(), is((byte) '{'));
+        assertThat(parser.nextToken(), is((byte) '}'));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserTokenizesEmptyObject() {
+        JsonParser parser = JsonParser.create(JsonObject.create(Map.of()));
+
+        assertThat(parser.currentByte(), is((byte) '{'));
+        assertThat(parser.nextToken(), is((byte) '}'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserTokenizesEmptyArray() {
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of()));
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserPreservesArrayTokensAroundNestedEmptyContainers() {
+        JsonArray array = JsonArray.create(JsonObject.empty(), JsonString.create("after"), JsonArray.empty());
+        JsonParser parser = JsonParser.create(array);
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) '{'));
+        assertThat(parser.nextToken(), is((byte) '}'));
+        assertThat(parser.nextToken(), is((byte) ','));
+        assertThat(parser.nextToken(), is((byte) '"'));
+        assertThat(parser.readString(), is("after"));
+        assertThat(parser.nextToken(), is((byte) ','));
+        assertThat(parser.nextToken(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserHasNextIncludesOuterEndAfterNestedEmptyContainer() {
+        JsonParser parser = JsonParser.create(JsonArray.create(JsonArray.empty()));
+        StringBuilder tokens = new StringBuilder().append((char) parser.currentByte());
+
+        while (parser.hasNext()) {
+            tokens.append((char) parser.nextToken());
+        }
+
+        assertThat(tokens.toString(), is("[[]]"));
+    }
+
+    @Test
     public void testJsonValueParserComplexObject() {
         JsonValue original = JsonObject.create(
                 Map.of("users", JsonArray.create(
@@ -298,7 +555,7 @@ class JsonValueParserTest {
         JsonObject result = parser.readJsonObject();
         JsonArray users = result.arrayValue("users").orElseThrow();
 
-        assertThat(users.values().size(), is(2));
+        assertThat(users.size(), is(2));
 
         JsonObject alice = users.get(0, JsonNull.instance()).asObject();
         assertThat(alice.stringValue("name").orElseThrow(), is("Alice"));
@@ -309,6 +566,261 @@ class JsonValueParserTest {
         assertThat(bob.stringValue("name").orElseThrow(), is("Bob"));
         assertThat(bob.intValue("age").orElseThrow(), is(25));
         assertThat(bob.booleanValue("active").orElseThrow(), is(false));
+    }
+
+    @Test
+    public void testJsonValueParserTraversesLargeObject() {
+        Map<String, JsonValue> values = new LinkedHashMap<>();
+        for (int i = 0; i < 120; i++) {
+            values.put("key" + i, JsonNumber.create(i + 1));
+        }
+        JsonParser parser = JsonParser.create(JsonObject.create(values));
+
+        Set<String> seen = new HashSet<>();
+        byte token = parser.nextToken();
+        for (int i = 0; i < 120; i++) {
+            assertThat(token, is((byte) '"'));
+            String key = parser.readString();
+            seen.add(key);
+            int expectedValue = Integer.parseInt(key.substring(3)) + 1;
+            assertThat(parser.nextToken(), is((byte) ':'));
+            assertThat(parser.nextToken(), is((byte) Integer.toString(expectedValue).charAt(0)));
+            assertThat(parser.readInt(), is(expectedValue));
+            token = parser.nextToken();
+            if (i < 119) {
+                assertThat(token, is((byte) ','));
+                token = parser.nextToken();
+            }
+        }
+
+        assertThat(token, is((byte) '}'));
+        assertThat(seen.size(), is(120));
+        assertThat(seen.contains("key119"), is(true));
+    }
+
+    @Test
+    public void testJsonValueParserResetsAfterManyTokens() {
+        Map<String, JsonValue> values = new LinkedHashMap<>();
+        for (int i = 0; i < 12; i++) {
+            values.put("key" + i, JsonNumber.create(i + 1));
+        }
+        JsonParser parser = JsonParser.create(JsonObject.create(values));
+
+        parser.mark();
+        for (int i = 0; i < 20; i++) {
+            parser.nextToken();
+        }
+        parser.resetToMark();
+
+        JsonObject result = parser.readJsonObject();
+        assertThat(result.size(), is(12));
+        assertThat(result.intValue("key11").orElseThrow(), is(12));
+    }
+
+    @Test
+    public void testJsonValueParserKeepsOuterTokensAroundLargeNestedObject() {
+        StringBuilder json = new StringBuilder("{\"a\":{");
+        for (int i = 0; i < 120; i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append("\"k").append(i).append("\":").append(i);
+        }
+        json.append("},\"z\":999}");
+
+        JsonValue value = JsonParser.create(json.toString()).readJsonValue();
+        JsonParser parser = JsonParser.create(value);
+
+        while (parser.hasNext()) {
+            parser.nextToken();
+        }
+    }
+
+    @Test
+    void testJsonValueParserTraversesRepeatedlyAccessedParsedObject() {
+        StringBuilder json = new StringBuilder("{");
+        Map<String, String> expected = new LinkedHashMap<>();
+        for (int i = 0; i < 25; i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            String key = "key" + i;
+            String value = "value" + i;
+            expected.put(key, value);
+            json.append('"').append(key).append("\":\"").append(value).append('"');
+        }
+        json.append('}');
+
+        JsonObject object = JsonParser.create(json.toString()).readJsonObject();
+        assertThat(object.stringValue("key24").orElseThrow(), is("value24"));
+        assertThat(object.stringValue("key24").orElseThrow(), is("value24"));
+
+        JsonParser parser = JsonParser.create(object);
+        Map<String, String> actual = new LinkedHashMap<>();
+        byte token = parser.nextToken();
+        while (token != '}') {
+            assertThat(token, is((byte) '"'));
+            String key = parser.readString();
+            assertThat(parser.nextToken(), is((byte) ':'));
+            assertThat(parser.nextToken(), is((byte) '"'));
+            actual.put(key, parser.readString());
+            token = parser.nextToken();
+            if (token == ',') {
+                token = parser.nextToken();
+            }
+        }
+
+        assertThat(actual, is(expected));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    void testJsonValueParserPreservesWideNestedArray() {
+        List<JsonValue> values = new ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            values.add(JsonString.create("value" + i));
+        }
+        JsonParser parser = JsonParser.create(JsonArray.create(JsonArray.create(values), JsonString.create("after")));
+
+        assertThat(parser.nextToken(), is((byte) '['));
+        for (int i = 0; i < 50; i++) {
+            assertThat(parser.nextToken(), is((byte) '"'));
+            assertThat(parser.readString(), is("value" + i));
+            if (i < 49) {
+                assertThat(parser.nextToken(), is((byte) ','));
+            }
+        }
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.nextToken(), is((byte) ','));
+        assertThat(parser.nextToken(), is((byte) '"'));
+        assertThat(parser.readString(), is("after"));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    @Test
+    void testJsonValueParserGrowsWithNestingDepth() {
+        JsonValue value = JsonString.create("leaf");
+        String expected = "\"";
+        for (int i = 0; i < 12; i++) {
+            if (i % 2 == 0) {
+                value = JsonArray.create(value);
+                expected = "[" + expected + "]";
+            } else {
+                value = JsonObject.builder().set("nested", value).build();
+                expected = "{\":" + expected + "}";
+            }
+        }
+
+        JsonParser parser = JsonParser.create(value);
+        StringBuilder actual = new StringBuilder().append((char) parser.currentByte());
+        while (parser.hasNext()) {
+            actual.append((char) parser.nextToken());
+        }
+
+        assertThat(actual.toString(), is(expected));
+    }
+
+    @Test
+    public void testJsonValueParserNextTokenForZeroNumber() {
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of(JsonNumber.create(0))));
+
+        assertThat(parser.nextToken(), is((byte) '0'));
+    }
+
+    @Test
+    public void testJsonValueParserNextTokenForNegativeFraction() {
+        JsonValue value = JsonParser.create("[-0.5]").readJsonValue();
+        JsonParser parser = JsonParser.create(value);
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) '-'));
+        assertThat(parser.readBigDecimal(), is(new BigDecimal("-0.5")));
+    }
+
+    @Test
+    public void testJsonValueParserNextTokenForConstructedNegativeFraction() {
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of(JsonNumber.create(new BigDecimal("-0.5")))));
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is((byte) '-'));
+        assertThat(parser.readBigDecimal(), is(new BigDecimal("-0.5")));
+    }
+
+    @Test
+    public void testJsonValueParserDerivesLargeNumberTokenLazily() {
+        TrackingBigDecimal value = new TrackingBigDecimal();
+        JsonParser parser = JsonParser.create(JsonArray.create(List.of(JsonNumber.create(value))));
+
+        assertThat(value.unscaledValueCalls(), is(0));
+        assertThat(parser.nextToken(), is((byte) '1'));
+        assertThat(value.unscaledValueCalls(), is(1));
+        assertThat(parser.readBigDecimal(), is(value));
+        assertThat(parser.currentByte(), is((byte) '1'));
+        assertThat(value.unscaledValueCalls(), is(1));
+    }
+
+    private static void assertNestedEmptyContainerSkipped(JsonValue emptyContainer, byte start, byte end) {
+        JsonParser parser = JsonParser.create(JsonArray.create(emptyContainer, JsonString.create("after")));
+
+        assertThat(parser.currentByte(), is((byte) '['));
+        assertThat(parser.nextToken(), is(start));
+        parser.skip();
+        assertThat(parser.currentByte(), is(end));
+        assertThat(parser.hasNext(), is(true));
+        assertThat(parser.nextToken(), is((byte) ','));
+        assertThat(parser.nextToken(), is((byte) '"'));
+        assertThat(parser.readString(), is("after"));
+        assertThat(parser.nextToken(), is((byte) ']'));
+        assertThat(parser.hasNext(), is(false));
+    }
+
+    private static final class BigIntegerGuardDecimal extends BigDecimal {
+        private static final long serialVersionUID = 1L;
+
+        private BigIntegerGuardDecimal(String value) {
+            super(value);
+        }
+
+        @Override
+        public BigInteger toBigInteger() {
+            throw new AssertionError("Unexpected BigInteger conversion");
+        }
+
+        @Override
+        public BigInteger toBigIntegerExact() {
+            throw new AssertionError("Unexpected exact BigInteger conversion");
+        }
+    }
+
+    private static final class TrackingBigDecimal extends BigDecimal {
+        private static final long serialVersionUID = 1L;
+
+        private int unscaledValueCalls;
+
+        private TrackingBigDecimal() {
+            super(BigInteger.TEN.pow(20));
+        }
+
+        @Override
+        public BigInteger unscaledValue() {
+            unscaledValueCalls++;
+            return super.unscaledValue();
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return super.equals(obj);
+        }
+
+        @Override
+        public int hashCode() {
+            return super.hashCode();
+        }
+
+        private int unscaledValueCalls() {
+            return unscaledValueCalls;
+        }
     }
 
 }

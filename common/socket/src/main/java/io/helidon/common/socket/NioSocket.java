@@ -24,12 +24,14 @@ import java.net.UnixDomainSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 
+import io.helidon.common.Api;
 import io.helidon.common.buffers.BufferData;
 
 /**
  * Plain socket based on NIO {@link java.nio.channels.SocketChannel}.
  * This socket uses ByteBuffer for reading and writing.
  */
+@Api.Internal
 public sealed class NioSocket implements HelidonSocket permits TlsNioSocket {
     private static final int BUFFER_LENGTH = 8 * 1024;
 
@@ -188,6 +190,26 @@ public sealed class NioSocket implements HelidonSocket permits TlsNioSocket {
             return delegate.read(buffer);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Read from the underlying socket/channel in non-blocking mode.
+     * The original blocking mode is restored before this method returns.
+     *
+     * @param buffer buffer to read to
+     * @return number of bytes read
+     * @throws IOException in case of an I/O error
+     */
+    protected int readNonBlocking(ByteBuffer buffer) throws IOException {
+        boolean blocking = delegate.isBlocking();
+        try {
+            delegate.configureBlocking(false);
+            return delegate.read(buffer);
+        } finally {
+            if (delegate.isOpen()) {
+                delegate.configureBlocking(blocking);
+            }
         }
     }
 

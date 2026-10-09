@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,22 +47,19 @@ class NoOpMeter implements Meter, NoOpWrapper {
     private final String unit;
     private final String description;
     private final Type type;
-    private final String scope;
 
     private NoOpMeter(NoOpMeter.Builder<?, ?> builder) {
         this(new NoOpMeter.Id(builder.name, builder.tags),
              builder.unit,
              builder.description,
-             builder.type,
-             builder.scope);
+             builder.type);
     }
 
-    private NoOpMeter(Id id, String baseUnit, String description, Type type, String scope) {
+    private NoOpMeter(Id id, String baseUnit, String description, Type type) {
         this.id = id;
         this.unit = Objects.requireNonNullElse(baseUnit, "");
         this.description = Objects.requireNonNullElse(description, "");
         this.type = type;
-        this.scope = scope;
     }
 
     static Map<String, String> tagsMap(Iterable<Tag> tags) {
@@ -91,11 +88,6 @@ class NoOpMeter implements Meter, NoOpWrapper {
         return type;
     }
 
-    @Override
-    public Optional<String> scope() {
-        return Optional.ofNullable(scope);
-    }
-
     private static NoOpMeter.Id create(NoOpMeter.Builder<?, ?> builder) {
         return new NoOpMeter.Id(builder.name(), builder.tags());
 
@@ -107,7 +99,7 @@ class NoOpMeter implements Meter, NoOpWrapper {
 
         private Id(String name, Map<String, String> tags) {
             this.name = name;
-            tags.forEach((k, v) -> this.tags.add(Tag.create(k, v)));
+            tags.forEach((k, v) -> this.tags.add(new NoOpTag(k, v)));
             this.tags.sort(Comparator.comparing(Tag::key));
         }
 
@@ -158,7 +150,7 @@ class NoOpMeter implements Meter, NoOpWrapper {
         private final Type type;
         private String description;
         private String unit;
-        private String scope;
+        private String origin;
 
         private Builder(String name, Type type) {
             this.name = name;
@@ -187,8 +179,8 @@ class NoOpMeter implements Meter, NoOpWrapper {
             return identity();
         }
 
-        public B scope(String scope) {
-            this.scope = scope;
+        public B origin(String origin) {
+            this.origin = Objects.requireNonNull(origin);
             return identity();
         }
 
@@ -212,8 +204,8 @@ class NoOpMeter implements Meter, NoOpWrapper {
             return Optional.ofNullable(description);
         }
 
-        public Optional<String> scope() {
-            return Optional.ofNullable(scope);
+        public Optional<String> origin() {
+            return Optional.ofNullable(origin);
         }
 
         @Override
@@ -800,4 +792,3 @@ class NoOpMeter implements Meter, NoOpWrapper {
         }
     }
 }
-

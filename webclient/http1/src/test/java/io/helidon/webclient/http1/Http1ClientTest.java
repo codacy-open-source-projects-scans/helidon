@@ -16,18 +16,41 @@
 
 package io.helidon.webclient.http1;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.StandardProtocolFamily;
 import java.net.URI;
+import java.net.UnixDomainSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.StringTokenizer;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.stream.Stream;
 
 import io.helidon.common.GenericType;
@@ -37,33 +60,51 @@ import io.helidon.common.buffers.DataReader;
 import io.helidon.common.buffers.DataWriter;
 import io.helidon.common.socket.HelidonSocket;
 import io.helidon.common.socket.PeerInfo;
+import io.helidon.common.socket.SocketContext;
+import io.helidon.config.Config;
+import io.helidon.config.ConfigSources;
+import io.helidon.http.ClientRequestHeaders;
+import io.helidon.http.ClientResponseHeaders;
 import io.helidon.http.Header;
 import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.Headers;
 import io.helidon.http.Http1HeadersParser;
+import io.helidon.http.HttpLogConfig;
 import io.helidon.http.Method;
 import io.helidon.http.Status;
 import io.helidon.http.WritableHeaders;
+import io.helidon.http.http1.Http1ConnectionListener;
+import io.helidon.http.http1.Http1LoggingConnectionListener;
 import io.helidon.http.media.EntityReader;
 import io.helidon.http.media.EntityWriter;
 import io.helidon.http.media.MediaContext;
 import io.helidon.http.media.MediaContextConfig;
 import io.helidon.logging.common.LogConfig;
 import io.helidon.webclient.api.ClientConnection;
+import io.helidon.webclient.api.ClientRequestBase;
+import io.helidon.webclient.api.ClientUri;
+import io.helidon.webclient.api.HttpClientConfig;
+import io.helidon.webclient.api.HttpClientRequest;
 import io.helidon.webclient.api.HttpClientResponse;
 import io.helidon.webclient.api.Proxy;
+import io.helidon.webclient.api.WebClient;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.hasHeader;
 import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.noHeader;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.CoreMatchers.startsWith;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -74,6 +115,8 @@ class Http1ClientTest {
     public static final String VALID_HEADER_NAME = "Valid-Header-Name";
     public static final String BAD_HEADER_PATH = "/badHeader";
     public static final String HEADER_NAME_VALUE_DELIMETER = "->";
+    public static final String PROXY_HOST = "http://www-proxy-hqdc.us.oracle.com";
+    public static final String PROXY_PORT = "80";
     private static final Header REQ_CHUNKED_HEADER = HeaderValues.create(
             HeaderNames.create("X-Req-Chunked"), "true");
     private static final Header REQ_EXPECT_100_HEADER_NAME = HeaderValues.create(
@@ -86,17 +129,10 @@ class Http1ClientTest {
     private static final int dummyPort = 1234;
     private static final String TARGET_HOST = "www.oracle.com";
     private static final String TARGET_URI_PATH = "/test";
-    public static final String PROXY_HOST = "http://www-proxy-hqdc.us.oracle.com";
-    public static final String PROXY_PORT = "80";
-
-    private enum RelativeUrisValue {
-        TRUE, FALSE, DEFAULT
-    }
-    private enum ProxyConfiguration {
-        UNSET, NO_PROXY, HTTP, HTTP_SET_NO_PROXY_HOST, SYSTEM_UNSET, SYSTEM_SET_PROXY, SYSTEM_SET_PROXY_AND_NON_PROXY_HOST
-    }
+    private static final String CLIENT_SEND_LOGGER_NAME = Http1LoggingConnectionListener.class.getName() + ".cl-send";
 
     @Test
+    @SuppressWarnings("deprecation")
     void testMaxHeaderSizeFail() {
         Http1Client client = Http1Client.create(builder -> builder.protocolConfig(pc -> pc.maxHeaderSize(15)));
 
@@ -104,12 +140,145 @@ class Http1ClientTest {
     }
 
     @Test
+    @SuppressWarnings("deprecation")
     void testMaxHeaderSizeSuccess() {
         Http1Client client = Http1Client.builder()
                 .protocolConfig(pc -> pc.maxHeaderSize(500))
                 .build();
 
         validateSuccessfulResponse(client, new FakeHttp1ClientConnection());
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void testMaxHeadersSizeBackwardCompatibleAlias() {
+        Http1ClientProtocolConfig defaultConfig = Http1ClientProtocolConfig.create();
+        Http1ClientProtocolConfig config = Http1ClientProtocolConfig.builder()
+                .maxHeadersSize(512)
+                .build();
+        Http1ClientProtocolConfig legacyConfig = Http1ClientProtocolConfig.builder()
+                .maxHeaderSize(256)
+                .build();
+
+        assertThat(defaultConfig.maxHeaderSize(), is(16384));
+        assertThat(defaultConfig.maxHeadersSize(), is(16384));
+        assertThat(config.maxHeaderSize(), is(512));
+        assertThat(config.maxHeadersSize(), is(512));
+        assertThat(legacyConfig.maxHeaderSize(), is(256));
+        assertThat(legacyConfig.maxHeadersSize(), is(256));
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void deprecatedBuilderGetterRetainsBaseDefaultBeforeBuild() {
+        Http1ClientProtocolConfig.Builder builder = Http1ClientProtocolConfig.builder();
+
+        assertThat(builder.maxHeaderSize(), is(16384));
+        assertThat(builder.maxHeadersSize(), is(16384));
+
+        builder.maxHeadersSize(512);
+
+        assertThat(builder.maxHeaderSize(), is(16384));
+        assertThat(builder.maxHeadersSize(), is(512));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonPositiveHeaderSizes")
+    @SuppressWarnings("deprecation")
+    void deprecatedHeaderSizeRejectsNonPositiveValues(int value) {
+        assertThrows(IllegalArgumentException.class,
+                     () -> Http1ClientProtocolConfig.builder().maxHeaderSize(value).build());
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonPositiveHeaderSizes")
+    void deprecatedHeaderSizeConfigRejectsNonPositiveValues(int value) {
+        Config config = Config.create(ConfigSources.create(Map.of("max-header-size", Integer.toString(value))));
+
+        assertThrows(IllegalArgumentException.class, () -> Http1ClientProtocolConfig.create(config));
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void unbuiltBuilderCopyRetainsCommonHeaderLimit() {
+        Http1ClientProtocolConfig.Builder source = Http1ClientProtocolConfig.builder()
+                .maxHeadersSize(512);
+
+        Http1ClientProtocolConfig config = Http1ClientProtocolConfig.builder()
+                .from(source)
+                .build();
+
+        assertThat(config.maxHeaderSize(), is(512));
+        assertThat(config.maxHeadersSize(), is(512));
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void unbuiltBuilderCopyRetainsHeaderLimitSetterOrder() {
+        Http1ClientProtocolConfig legacyThenCommon = Http1ClientProtocolConfig.builder()
+                .from(Http1ClientProtocolConfig.builder()
+                              .maxHeaderSize(256)
+                              .maxHeadersSize(512))
+                .build();
+        Http1ClientProtocolConfig commonThenLegacy = Http1ClientProtocolConfig.builder()
+                .from(Http1ClientProtocolConfig.builder()
+                              .maxHeadersSize(512)
+                              .maxHeaderSize(256))
+                .build();
+
+        assertThat(legacyThenCommon.maxHeaderSize(), is(512));
+        assertThat(legacyThenCommon.maxHeadersSize(), is(512));
+        assertThat(commonThenLegacy.maxHeaderSize(), is(256));
+        assertThat(commonThenLegacy.maxHeadersSize(), is(256));
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void unbuiltBuilderCopyClearsStaleLegacyHeaderLimit() {
+        Http1ClientProtocolConfig.Builder source = Http1ClientProtocolConfig.builder()
+                .maxHeadersSize(512);
+        Http1ClientProtocolConfig.Builder target = Http1ClientProtocolConfig.builder()
+                .maxHeaderSize(256);
+
+        Http1ClientProtocolConfig config = target.from(source).build();
+
+        assertThat(config.maxHeaderSize(), is(512));
+        assertThat(config.maxHeadersSize(), is(512));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonPositiveHeaderSizes")
+    @SuppressWarnings("deprecation")
+    void unbuiltBuilderCopyRejectsExplicitInvalidLegacyHeaderLimit(int value) {
+        Http1ClientProtocolConfig.Builder source = Http1ClientProtocolConfig.builder()
+                .maxHeaderSize(value);
+
+        assertThrows(IllegalArgumentException.class,
+                     () -> Http1ClientProtocolConfig.builder().from(source).build());
+    }
+
+    @Test
+    void deprecatedBuilderGetterDescriptorIsPreserved() throws NoSuchMethodException {
+        var method = Http1ClientProtocolConfig.BuilderBase.class.getMethod("maxHeaderSize");
+
+        assertThat(method.getReturnType(), sameInstance(int.class));
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void customProtocolConfigRetainsLegacyHeaderLimit() {
+        Http1Client client = Http1Client.builder()
+                .protocolConfig(customProtocolConfig(15))
+                .build();
+
+        validateFailedResponse(client, new FakeHttp1ClientConnection(), "Header size exceeded");
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonPositiveHeaderSizes")
+    void customProtocolConfigRejectsNonPositiveLegacyHeaderLimit(int value) {
+        assertThrows(IllegalArgumentException.class,
+                     () -> Http1ClientConfigSupport.maxHeadersSize(customProtocolConfig(value)));
     }
 
     @Test
@@ -149,6 +318,850 @@ class Http1ClientTest {
         assertThat(response.entity().as(String.class), is("Sending Something"));
         assertThat(connection.releaseCount(), is(1));
         assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testCloseDelimitedResponseClosesConnectionAfterEntityConsumed() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection();
+        Http1ClientResponse response = new Http1ClientResponseImpl(HttpClientConfig.builder().build(),
+                                                                   Http1ClientProtocolConfig.create(),
+                                                                   Status.OK_200,
+                                                                   Method.GET,
+                                                                   ClientRequestHeaders.create(WritableHeaders.create()),
+                                                                   ClientResponseHeaders.create(WritableHeaders.create()),
+                                                                   connection,
+                                                                   new ByteArrayInputStream(
+                                                                           "body".getBytes(StandardCharsets.US_ASCII)),
+                                                                   MediaContext.create(),
+                                                                   ClientUri.create(URI.create("http://localhost/test")),
+                                                                   new CompletableFuture<>(),
+                                                                   null);
+
+        try (response) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.headers(), noHeader(HeaderNames.CONTENT_LENGTH));
+            assertThat(response.entity().as(String.class), is("body"));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testTransferEncodingOverridesContentLengthZero() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.CONTENT_LENGTH_ZERO,
+                                                                                     HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "4\r\nbody\r\n0\r\n\r\n"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.entity().as(String.class), is("body"));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testTransferEncodingIgnoresInvalidContentLength() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.create(
+                                                                                     HeaderNames.CONTENT_LENGTH,
+                                                                                     "invalid"),
+                                                                                     HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "4\r\nbody\r\n0\r\n\r\n"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.entity().as(String.class), is("body"));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testUnreadTransferEncodingWithContentLengthZeroClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.CONTENT_LENGTH_ZERO,
+                                                                                     HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             null);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testUnreadNonChunkedTransferEncodingWithContentLengthZeroClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.CONTENT_LENGTH_ZERO,
+                                                                                     HeaderValues.create(
+                                                                                             HeaderNames.TRANSFER_ENCODING,
+                                                                                             "gzip")),
+                                                                             null);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testHeadResponseWithoutLengthReusesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200, false);
+
+        try (Http1ClientResponse response = client.head("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.headers(), noHeader(HeaderNames.CONTENT_LENGTH));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testHeadResponseWithTrailerHeaderReusesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.create(
+                                                                                     HeaderNames.TRAILER,
+                                                                                     "X-Test")),
+                                                                             null);
+
+        try (Http1ClientResponse response = client.head("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.headers(), hasHeader(HeaderNames.TRAILER, "X-Test"));
+            assertThrows(IllegalStateException.class, response::trailers);
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThat(response.trailers().size(), is(0));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testHeadResetContentWithFramingMetadataReusesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             null);
+
+        try (Http1ClientResponse response = client.head("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testHeadResponseWithBufferedEntityClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.OK_200,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.create(
+                                                                                     HeaderNames.CONTENT_LENGTH, "4")),
+                                                                             "body".getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.head("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_LENGTH, "4"));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @ParameterizedTest
+    @MethodSource("noBodyStatusResponses")
+    void testHeaderTerminatedNoBodyStatusResponseWithoutLengthReusesConnection(Status status) {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(status, false);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(status));
+            assertThat(response.headers(), noHeader(HeaderNames.CONTENT_LENGTH));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testResetContentResponseWithoutLengthClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205, false);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), noHeader(HeaderNames.CONTENT_LENGTH));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithContentLengthZeroReusesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205, true);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_LENGTH, "0"));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedTerminatorReusesConnectionWithoutEntityAccess() throws IOException {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.TRANSFER_ENCODING, "chunked"));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedTerminatorAndStaleBytesClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "0\r\n\r\nstale"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedTerminatorExtensionReusesConnection() throws IOException {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "0;ext=value\r\n\r\n"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.TRANSFER_ENCODING, "chunked"));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testResetContentResponseWithContentLengthBodyClosesConnectionWithoutEntity() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.create(
+                                                                                     HeaderNames.CONTENT_LENGTH, "4")),
+                                                                             "body".getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_LENGTH, "4"));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithContentLengthDoesNotParseBodyAsTrailers() {
+        byte[] responseEntity = "X-Test: body\r\n\r\nstale".getBytes(StandardCharsets.US_ASCII);
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.create(
+                                                                                             HeaderNames.CONTENT_LENGTH,
+                                                                                             Integer.toString(responseEntity.length)),
+                                                                                     HeaderValues.create(HeaderNames.TRAILER,
+                                                                                                         "X-Test")),
+                                                                             responseEntity);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThrows(IllegalStateException.class, response::trailers);
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedBodyClosesConnectionWithoutEntity() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED),
+                                                                             "4\r\nbody\r\n0\r\n\r\n"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.TRANSFER_ENCODING, "chunked"));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedTrailersReusesConnectionAfterTrailersRead() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED,
+                                                                                     HeaderValues.create(
+                                                                                             HeaderNames.TRAILER,
+                                                                                             "X-Test")),
+                                                                             "0;ext=value\r\nX-Test: value\r\n\r\n"
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.headers(), hasHeader(HeaderNames.TRANSFER_ENCODING, "chunked"));
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThat(response.trailers(), hasHeader(HeaderNames.create("X-Test"), "value"));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedTrailersAndStaleBytesClosesConnection() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED,
+                                                                                     HeaderValues.create(HeaderNames.TRAILER,
+                                                                                                         "X-Test")),
+                                                                             ("0\r\n"
+                                                                                     + "X-Test: value\r\n\r\n"
+                                                                                     + "stale")
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThrows(IllegalStateException.class, response::trailers);
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedBodyDoesNotExposeBodyAsTrailers() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED,
+                                                                                     HeaderValues.create(
+                                                                                             HeaderNames.TRAILER,
+                                                                                             "X-Test")),
+                                                                             ("10\r\n"
+                                                                                     + "X-Test: body\r\n\r\n"
+                                                                                     + "\r\n0\r\n"
+                                                                                     + "X-Test: trailer\r\n\r\n")
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.RESET_CONTENT_205));
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThrows(IllegalStateException.class, response::trailers);
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithChunkedBodyRejectsRepeatedTrailerAccess() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED,
+                                                                                     HeaderValues.create(
+                                                                                             HeaderNames.TRAILER,
+                                                                                             "X-Test")),
+                                                                             ("13\r\n"
+                                                                                     + "0\r\nX-Test: body\r\n\r\n"
+                                                                                     + "\r\n0\r\n"
+                                                                                     + "X-Test: trailer\r\n\r\n")
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThrows(IllegalStateException.class, response::trailers);
+            IllegalStateException exception = assertThrows(IllegalStateException.class, response::trailers);
+            assertThat(exception.getMessage(), is("Response framing cannot be read after a previous failure"));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @Test
+    void testResetContentResponseWithInvalidChunkSizeRejectsRepeatedTrailerAccess() {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.RESET_CONTENT_205,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(HeaderValues.TRANSFER_ENCODING_CHUNKED,
+                                                                                     HeaderValues.create(
+                                                                                             HeaderNames.TRAILER,
+                                                                                             "X-Test")),
+                                                                             ("invalid\r\n"
+                                                                                     + "0\r\n"
+                                                                                     + "X-Test: value\r\n\r\n")
+                                                                                     .getBytes(StandardCharsets.US_ASCII));
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.entity().hasEntity(), is(false));
+            assertThrows(IllegalArgumentException.class, response::trailers);
+            IllegalStateException exception = assertThrows(IllegalStateException.class, response::trailers);
+            assertThat(exception.getMessage(), is("Response framing cannot be read after a previous failure"));
+        }
+
+        assertThat(connection.releaseCount(), is(0));
+        assertThat(connection.closeCount(), is(1));
+    }
+
+    @ParameterizedTest
+    @MethodSource("notModifiedResponseMetadata")
+    void testNotModifiedResponseWithEntityMetadataReusesConnection(Header responseHeader) {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(Status.NOT_MODIFIED_304,
+                                                                             true,
+                                                                             false,
+                                                                             List.of(responseHeader),
+                                                                             null);
+
+        try (Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .request()) {
+            assertThat(response.status(), is(Status.NOT_MODIFIED_304));
+            assertThat(response.headers(), hasHeader(HeaderNames.create(responseHeader.name()), responseHeader.get()));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+
+        assertThat(connection.releaseCount(), is(1));
+        assertThat(connection.closeCount(), is(0));
+    }
+
+    @Test
+    void testRequestHeaderLoggingRedactsUnsafeValues() {
+        Logger logger = Logger.getLogger(CLIENT_SEND_LOGGER_NAME);
+        Level previousLevel = logger.getLevel();
+        boolean previousUseParentHandlers = logger.getUseParentHandlers();
+        List<String> messages = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                messages.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+        logger.setLevel(Level.FINER);
+
+        try {
+            Http1LoggingConnectionListener listener = Http1LoggingConnectionListener.create(HttpLogConfig.create(),
+                                                                                            "cl-send");
+            WritableHeaders<?> headers = WritableHeaders.create()
+                    .add(HeaderNames.AUTHORIZATION, "Bearer secret-token")
+                    .add(HeaderNames.COOKIE, "session=secret-cookie")
+                    .add(HeaderNames.create("X-Safe"), "first\r\nForged: value")
+                    .add(HeaderNames.CONTENT_TYPE, "text/plain");
+
+            Http1CallChainBase.writeHeaders(new FakeHttp1ClientConnection(),
+                                            headers,
+                                            BufferData.growing(128),
+                                            false,
+                                            false,
+                                            listener);
+
+            assertThat(messages.size(), is(1));
+            String message = messages.getFirst();
+            assertThat(message, containsString("Authorization: <redacted>"));
+            assertThat(message, containsString("Cookie: <redacted>"));
+            assertThat(message, containsString("Content-Type: text/plain"));
+            assertThat(message, not(containsString("Bearer secret-token")));
+            assertThat(message, not(containsString("session=secret-cookie")));
+            assertThat(message, not(containsString("\r")));
+            assertThat(message, not(containsString("\nForged:")));
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(previousLevel);
+            logger.setUseParentHandlers(previousUseParentHandlers);
+            handler.close();
+        }
+    }
+
+    @Test
+    void testRequestHeaderLoggingReportsRawValuesWhenUnsafeEnabled() {
+        Logger logger = Logger.getLogger(CLIENT_SEND_LOGGER_NAME);
+        Level previousLevel = logger.getLevel();
+        boolean previousUseParentHandlers = logger.getUseParentHandlers();
+        List<String> messages = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                messages.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+        logger.setLevel(Level.FINER);
+
+        try {
+            Http1LoggingConnectionListener listener = Http1LoggingConnectionListener.create(HttpLogConfig.builder()
+                                                                                                    .unsafeRawData(true)
+                                                                                                    .build(),
+                                                                                            "cl-send");
+            WritableHeaders<?> headers = WritableHeaders.create()
+                    .add(HeaderNames.AUTHORIZATION, "Bearer secret-token")
+                    .add(HeaderNames.COOKIE, "session=secret-cookie");
+
+            Http1CallChainBase.writeHeaders(new FakeHttp1ClientConnection(),
+                                            headers,
+                                            BufferData.growing(128),
+                                            false,
+                                            false,
+                                            listener);
+
+            assertThat(messages.size(), is(1));
+            String message = messages.getFirst();
+            assertThat(message, containsString("Authorization: Bearer secret-token"));
+            assertThat(message, containsString("Cookie: session=secret-cookie"));
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(previousLevel);
+            logger.setUseParentHandlers(previousUseParentHandlers);
+            handler.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testRequestFragmentOmittedFromWireAndSendLog(boolean outputStream) {
+        String fragment = "send-listener-fragment";
+        Logger logger = Logger.getLogger(CLIENT_SEND_LOGGER_NAME);
+        Level previousLevel = logger.getLevel();
+        boolean previousUseParentHandlers = logger.getUseParentHandlers();
+        List<String> messages = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                messages.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+        logger.setLevel(Level.FINER);
+
+        try {
+            Http1Client client = Http1Client.builder()
+                    .protocolConfig(it -> it.log(log -> log.sendLog(true)
+                            .receiveLog(false)
+                            .unsafeRawData(true)))
+                    .build();
+            FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection();
+            Http1ClientRequest request = client.put("http://localhost:" + dummyPort + "/test")
+                    .fragment(fragment);
+            request.connection(connection);
+
+            Http1ClientResponse response = outputStream
+                    ? getHttp1ClientResponseFromOutputStream(request, new String[] {"Sending Something"})
+                    : request.submit("Sending Something");
+            assertThat(response.entity().as(String.class), is("Sending Something"));
+
+            assertThat(connection.getPrologue(), not(containsString(fragment)));
+            List<String> prologueMessages = messages.stream()
+                    .filter(message -> message.contains(" prologue: "))
+                    .toList();
+            assertThat(prologueMessages.isEmpty(), is(false));
+            assertThat(prologueMessages.toString(), not(containsString(fragment)));
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(previousLevel);
+            logger.setUseParentHandlers(previousUseParentHandlers);
+            handler.close();
+        }
+    }
+
+    @Test
+    void automaticProxyConnectionHeaderIsScopedToSerialization() {
+        WritableHeaders<?> headers = WritableHeaders.create();
+        BufferData buffer = BufferData.growing(128);
+        AtomicBoolean listenerObservedHeader = new AtomicBoolean();
+        Http1ConnectionListener listener = new Http1ConnectionListener() {
+            @Override
+            public void headers(SocketContext ctx, Headers sentHeaders) {
+                listenerObservedHeader.set(sentHeaders.contains(ClientRequestBase.PROXY_CONNECTION.headerName()));
+            }
+        };
+
+        Http1CallChainBase.writeHeaders(new FakeHttp1ClientConnection(),
+                                        headers,
+                                        buffer,
+                                        true,
+                                        false,
+                                        listener);
+
+        assertThat(new String(buffer.readBytes(), StandardCharsets.US_ASCII),
+                   containsString("Proxy-Connection: keep-alive\r\n"));
+        assertThat(listenerObservedHeader.get(), is(true));
+        assertThat(headers.contains(ClientRequestBase.PROXY_CONNECTION.headerName()), is(false));
+
+        headers.set(ClientRequestBase.PROXY_CONNECTION);
+        Http1CallChainBase.writeHeaders(new FakeHttp1ClientConnection(),
+                                        headers,
+                                        BufferData.growing(128),
+                                        true,
+                                        false,
+                                        listener);
+        assertThat(headers.contains(ClientRequestBase.PROXY_CONNECTION.headerName()), is(true));
+    }
+
+    @Test
+    void testProtocolLogConfigUsed() {
+        Http1ClientConfig config = Http1ClientConfig.builder()
+                .protocolConfig(it -> it.log(log -> log.sendLog(false)
+                        .receiveLog(false)))
+                .buildPrototype();
+        Http1ClientImpl client = new Http1ClientImpl(null, config);
+
+        assertThat(client.sendListener().enabled(), is(false));
+        assertThat(client.recvListener().enabled(), is(false));
+    }
+
+    @Test
+    void testInterimResponseIsSkipped() {
+        String rawResponse = "HTTP/1.1 103 Early Hints\r\n"
+                + "Link: </style.css>; rel=preload\r\n"
+                + "\r\n"
+                + "HTTP/1.1 200 OK\r\n"
+                + "Content-Length: 2\r\n"
+                + "\r\n"
+                + "OK";
+
+        Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(new FakeHttp1ClientConnection(rawResponse))
+                .request();
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity().as(String.class), is("OK"));
+    }
+
+    @Test
+    void testSwitchingProtocolsWithCustomReasonIsNotSkipped() {
+        String rawResponse = "HTTP/1.1 101 Custom Upgrade\r\n"
+                + "Upgrade: test\r\n"
+                + "\r\n"
+                + "upgraded-data\r\n";
+
+        Http1ClientResponse response = client.get("http://localhost:" + dummyPort + "/test")
+                .connection(new FakeHttp1ClientConnection(rawResponse))
+                .request();
+
+        assertThat(response.status().code(), is(Status.SWITCHING_PROTOCOLS_101.code()));
+        assertThat(response.status().reasonPhrase(), is("Custom Upgrade"));
+    }
+
+    @Test
+    void testMalformedReasonPhraseClosesConnection() {
+        String rawResponse = "HTTP/1.1 200 unsafe\u0000value\r\n\r\n";
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(rawResponse);
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                                                        () -> client.get("http://localhost:" + dummyPort + "/test")
+                                                                .connection(connection)
+                                                                .request());
+
+        assertThat(exception.getMessage(), is("HTTP response contained an invalid reason phrase"));
+        assertThat(connection.closeCount(), is(1));
+        assertThat(connection.releaseCount(), is(0));
+    }
+
+    @Test
+    void testMalformedReasonPhraseBeforeContinueClosesConnection() {
+        String rawContinueResponse = "HTTP/1.1 100 unsafe\u0000value\r\n\r\n";
+        String rawResponse = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        Http1Client expectContinueClient = Http1Client.builder()
+                .sendExpectContinue(true)
+                .build();
+        Http1ClientRequest request = expectContinueClient.put("http://localhost:" + dummyPort + "/test");
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(rawResponse, rawContinueResponse);
+        request.connection(connection);
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                                                        () -> getHttp1ClientResponseFromOutputStream(request,
+                                                                                                     new String[] {"OK"}));
+
+        assertThat(exception.getMessage(), is("HTTP response contained an invalid reason phrase"));
+        assertThat(connection.closeCount(), is(1));
+        assertThat(connection.releaseCount(), is(0));
+    }
+
+    @Test
+    void testInterimResponseBeforeContinueIsSkipped() {
+        String rawContinueResponse = "HTTP/1.1 103 Early Hints\r\n"
+                + "Link: </style.css>; rel=preload\r\n"
+                + "\r\n"
+                + "HTTP/1.1 100 Continue\r\n"
+                + "\r\n";
+        String rawResponse = "HTTP/1.1 200 OK\r\n"
+                + "Content-Length: 2\r\n"
+                + "\r\n"
+                + "OK";
+        Http1Client expectContinueClient = Http1Client.builder()
+                .sendExpectContinue(true)
+                .build();
+        Http1ClientRequest request = expectContinueClient.put("http://localhost:" + dummyPort + "/test");
+        request.connection(new FakeHttp1ClientConnection(rawResponse, rawContinueResponse));
+
+        Http1ClientResponse response = getHttp1ClientResponseFromOutputStream(request, new String[] {"OK"});
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity().as(String.class), is("OK"));
+    }
+
+    @Test
+    void testExpectContinueHeaderTimeoutFailsRequest() {
+        String rawContinueResponse = "HTTP/1.1 417 Expectation Failed\r\n";
+        Http1Client expectContinueClient = Http1Client.builder()
+                .sendExpectContinue(true)
+                .build();
+        Http1ClientRequest request = expectContinueClient.put("http://localhost:" + dummyPort + "/test");
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection(null, rawContinueResponse, true);
+        request.connection(connection);
+
+        UncheckedIOException exception = assertThrows(UncheckedIOException.class,
+                                                       () -> getHttp1ClientResponseFromOutputStream(request,
+                                                                                                   new String[] {"body"}));
+
+        assertThat(exception.getCause(), instanceOf(SocketTimeoutException.class));
+        assertThat(connection.closeCount(), is(1));
     }
 
     @Test
@@ -215,6 +1228,37 @@ class Http1ClientTest {
         assertThat(response.headers(), hasHeader(REQ_EXPECT_100_HEADER_NAME));
     }
 
+    @ParameterizedTest(name = "HEAD response: {0}")
+    @ValueSource(booleans = {false, true})
+    void testUpgradeRequiredEntityDoesNotContaminateConnection(boolean head) throws Exception {
+        try (UpgradeRequiredServer server = UpgradeRequiredServer.start(head)) {
+            Http1Client testClient = Http1Client.builder()
+                    .baseUri(server.uri())
+                    .readTimeout(Duration.ofSeconds(5))
+                    .build();
+            try {
+                try (Http1ClientResponse response = testClient.method(head ? Method.HEAD : Method.GET)
+                        .uri("/upgrade")
+                        .request()) {
+                    assertThat(response.status(), is(Status.UPGRADE_REQUIRED_426));
+                    if (head) {
+                        assertThat(response.entity().hasEntity(), is(false));
+                    } else {
+                        assertThat(response.entity().inputStream().readAllBytes(),
+                                   is("upgrade".getBytes(StandardCharsets.UTF_8)));
+                    }
+                }
+                try (Http1ClientResponse response = testClient.get("/next").request()) {
+                    assertThat(response.status(), is(Status.OK_200));
+                    assertThat(response.entity().inputStream().readAllBytes(), is("ok".getBytes(StandardCharsets.UTF_8)));
+                }
+                server.awaitCompletion();
+            } finally {
+                testClient.closeResource();
+            }
+        }
+    }
+
     // validates that HEAD is not allowed with entity payload
     @Test
     void testHeadMethod() {
@@ -250,32 +1294,37 @@ class Http1ClientTest {
 
     @ParameterizedTest
     @MethodSource("relativeUris")
-    void testRelativeUris(ProxyConfiguration proxyConfig, RelativeUrisValue relativeUris, boolean outputStream, String requestUri, String expectedUriStart) {
+    void testRelativeUris(ProxyConfiguration proxyConfig,
+                          RelativeUrisValue relativeUris,
+                          boolean outputStream,
+                          String requestUri,
+                          String expectedUriStart) {
         Proxy proxy = null;
         switch (proxyConfig) {
-        case UNSET -> {} // proxy is already initialized to null which is the goal of this condition, so no-op
+        case UNSET -> {
+        } // proxy is already initialized to null which is the goal of this condition, so no-op
         case NO_PROXY -> proxy = Proxy.noProxy();
-            case HTTP -> proxy = createHttpProxyBuilder().build();
-            case HTTP_SET_NO_PROXY_HOST -> proxy = createHttpProxyBuilder().addNoProxy(TARGET_HOST).build();
-            case SYSTEM_UNSET -> proxy = Proxy.create();
-            case SYSTEM_SET_PROXY -> {
-                proxy = Proxy.create();
-                System.setProperty("http.proxyHost", PROXY_HOST);
-                System.setProperty("http.proxyPort", PROXY_PORT);
-            }
-            case SYSTEM_SET_PROXY_AND_NON_PROXY_HOST -> {
-                proxy = Proxy.create();
-                System.setProperty("http.proxyHost", PROXY_HOST);
-                System.setProperty("http.proxyPort", PROXY_PORT);
-                System.setProperty("http.nonProxyHosts", "localhost|127.0.0.1|10.*.*.*|*.example.com|etc|" + TARGET_HOST);
-            }
+        case HTTP -> proxy = createHttpProxyBuilder().build();
+        case HTTP_SET_NO_PROXY_HOST -> proxy = createHttpProxyBuilder().addNoProxy(TARGET_HOST).build();
+        case SYSTEM_UNSET -> proxy = Proxy.create();
+        case SYSTEM_SET_PROXY -> {
+            proxy = Proxy.create();
+            System.setProperty("http.proxyHost", PROXY_HOST);
+            System.setProperty("http.proxyPort", PROXY_PORT);
+        }
+        case SYSTEM_SET_PROXY_AND_NON_PROXY_HOST -> {
+            proxy = Proxy.create();
+            System.setProperty("http.proxyHost", PROXY_HOST);
+            System.setProperty("http.proxyPort", PROXY_PORT);
+            System.setProperty("http.nonProxyHosts", "localhost|127.0.0.1|10.*.*.*|*.example.com|etc|" + TARGET_HOST);
+        }
         }
 
         Http1Client client;
         switch (relativeUris) {
-            case TRUE -> client = Http1Client.builder().relativeUris(true).build();
-            case FALSE -> client = Http1Client.builder().relativeUris(false).build();
-            default -> client = Http1Client.create();   // Don't set relativeUris and accept whatever is the default
+        case TRUE -> client = Http1Client.builder().relativeUris(true).build();
+        case FALSE -> client = Http1Client.builder().relativeUris(false).build();
+        default -> client = Http1Client.create();   // Don't set relativeUris and accept whatever is the default
         }
         FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection();
         Http1ClientRequest request = proxy != null ? client.put(requestUri).proxy(proxy) : client.put(requestUri);
@@ -290,19 +1339,97 @@ class Http1ClientTest {
         st.nextToken();
         // Validate URI part
         assertThat(st.nextToken(), startsWith(expectedUriStart));
+        boolean expectedProxyConnection = proxyConfig == ProxyConfiguration.HTTP
+                || proxyConfig == ProxyConfiguration.SYSTEM_SET_PROXY;
+        assertThat(connection.proxyConnectionHeader, is(expectedProxyConnection));
 
         // Clear proxy system properties that were set
         switch (proxyConfig) {
-            case SYSTEM_SET_PROXY -> {
-                System.clearProperty("http.proxyHost");
-                System.clearProperty("http.proxyPort");
+        case SYSTEM_SET_PROXY -> {
+            System.clearProperty("http.proxyHost");
+            System.clearProperty("http.proxyPort");
+        }
+        case SYSTEM_SET_PROXY_AND_NON_PROXY_HOST -> {
+            System.clearProperty("http.proxyHost");
+            System.clearProperty("http.proxyPort");
+            System.clearProperty("http.nonProxyHosts");
+        }
+        }
+    }
+
+    @Test
+    void testUnixDomainSocketUsesRelativeUriAndNoProxyConnectionHeader(@TempDir Path tempDir) throws Exception {
+        UnixDomainSocketAddress address = UnixDomainSocketAddress.of(tempDir.resolve("helidon-http1-test.sock"));
+        WebClient webClient = WebClient.builder()
+                .shareConnectionCache(false)
+                .protocolPreference(List.of(Http1Client.PROTOCOL_ID))
+                .build();
+        try (RawHttp1CaptureServer server = RawHttp1CaptureServer.start(address)) {
+            HttpClientRequest request = webClient.put("http://" + TARGET_HOST + ":1111" + TARGET_URI_PATH)
+                    .address(address)
+                    .proxy(createHttpProxyBuilder().build());
+
+            try (HttpClientResponse response = request.submit("Sending Something")) {
+                CapturedHttp1Request capturedRequest = server.awaitRequest();
+
+                assertThat(response.status(), is(Status.OK_200));
+                StringTokenizer st = new StringTokenizer(capturedRequest.prologue(), " ");
+                st.nextToken();
+                assertThat(st.nextToken(), is(TARGET_URI_PATH));
+                assertThat(capturedRequest.hasHeader("Proxy-Connection"), is(false));
             }
-            case SYSTEM_SET_PROXY_AND_NON_PROXY_HOST -> {
-                System.clearProperty("http.proxyHost");
-                System.clearProperty("http.proxyPort");
-                System.clearProperty("http.nonProxyHosts");
+        } finally {
+            webClient.closeResource();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testInvalidHeaderClosesAcquiredConnection(boolean outputStream) throws Exception {
+        try (ConnectionCloseServer server = ConnectionCloseServer.start()) {
+            Http1Client testClient = Http1Client.builder()
+                    .connectionCacheSize(1)
+                    .build();
+            try {
+                Http1ClientRequest request = testClient.put(server.uri())
+                        .header(HeaderNames.create("X-Test"), "\u0100");
+
+                assertThrows(IllegalArgumentException.class, () -> {
+                    if (outputStream) {
+                        request.outputStream(OutputStream::close);
+                    } else {
+                        request.submit("test");
+                    }
+                });
+                assertThat(server.awaitFirstConnectionClose(), is(true));
+
+                try (Http1ClientResponse response = testClient.get(server.uri()).request()) {
+                    assertThat(response.status(), is(Status.OK_200));
+                }
+                server.awaitCompletion();
+            } finally {
+                testClient.closeResource();
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testInvalidHeaderDoesNotCloseExplicitConnection(boolean outputStream) {
+        FakeHttp1ClientConnection connection = new FakeHttp1ClientConnection();
+        Http1ClientRequest request = client.put("http://localhost:" + dummyPort + "/test")
+                .connection(connection)
+                .header(HeaderNames.create("X-Test"), "\u0100");
+
+        assertThrows(IllegalArgumentException.class, () -> {
+            if (outputStream) {
+                request.outputStream(OutputStream::close);
+            } else {
+                request.submit("test");
+            }
+        });
+        assertThat(connection.closeCount(), is(0));
+        assertThat(connection.releaseCount(), is(0));
     }
 
     @ParameterizedTest
@@ -402,6 +1529,35 @@ class Http1ClientTest {
         assertThat(response.status(), is(Status.OK_200));
         String responseHeaderValue = response.headers().get(HeaderNames.create(headerName)).values();
         assertThat(responseHeaderValue, is(headerValue.trim()));
+    }
+
+    private static Stream<Integer> nonPositiveHeaderSizes() {
+        return Stream.of(0, -1, Integer.MIN_VALUE);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static Http1ClientProtocolConfig customProtocolConfig(int maxHeaderSize) {
+        return new Http1ClientProtocolConfig() {
+            @Override
+            public String name() {
+                return "custom";
+            }
+
+            @Override
+            public boolean defaultKeepAlive() {
+                return true;
+            }
+
+            @Override
+            public int maxHeaderSize() {
+                return maxHeaderSize;
+            }
+
+            @Override
+            public int maxStatusLineLength() {
+                return 256;
+            }
+        };
     }
 
     private static void validateSuccessfulResponse(Http1Client client, ClientConnection connection) {
@@ -537,6 +1693,20 @@ class Http1ClientTest {
         );
     }
 
+    private static Stream<Arguments> noBodyStatusResponses() {
+        return Stream.of(
+                arguments(Status.NO_CONTENT_204),
+                arguments(Status.NOT_MODIFIED_304)
+        );
+    }
+
+    private static Stream<Arguments> notModifiedResponseMetadata() {
+        return Stream.of(
+                arguments(HeaderValues.create(HeaderNames.CONTENT_LENGTH, "4")),
+                arguments(HeaderValues.TRANSFER_ENCODING_CHUNKED)
+        );
+    }
+
     private static Stream<Arguments> headerValues() {
         return Stream.of(
                 // Valid header values
@@ -632,15 +1802,30 @@ class Http1ClientTest {
         );
     }
 
+    private enum RelativeUrisValue {
+        TRUE, FALSE, DEFAULT
+    }
+
+    private enum ProxyConfiguration {
+        UNSET, NO_PROXY, HTTP, HTTP_SET_NO_PROXY_HOST, SYSTEM_UNSET, SYSTEM_SET_PROXY, SYSTEM_SET_PROXY_AND_NON_PROXY_HOST
+    }
+
     private static class FakeHttp1ClientConnection implements ClientConnection {
         private final DataReader clientReader;
         private final DataWriter clientWriter;
         private final DataReader serverReader;
         private final DataWriter serverWriter;
         private final boolean includeKeepAliveHeader;
+        private final String rawResponse;
+        private final String rawContinueResponse;
+        private final Status responseStatus;
+        private final boolean includeContentLength;
+        private final List<Header> additionalResponseHeaders;
+        private final byte[] responseEntity;
         private Throwable serverException;
         private ExecutorService webServerEmulator;
         private String prologue;
+        private boolean proxyConnectionHeader;
         private int releaseCount;
         private int closeCount;
 
@@ -649,14 +1834,89 @@ class Http1ClientTest {
         }
 
         FakeHttp1ClientConnection(boolean includeKeepAliveHeader) {
+            this(Status.OK_200, includeKeepAliveHeader, true);
+        }
+
+        FakeHttp1ClientConnection(String rawResponse) {
+            this(rawResponse, null);
+        }
+
+        FakeHttp1ClientConnection(String rawResponse, String rawContinueResponse) {
+            this(true, rawResponse, rawContinueResponse);
+        }
+
+        FakeHttp1ClientConnection(String rawResponse,
+                                  String rawContinueResponse,
+                                  boolean timeoutAfterFirstResponseRead) {
+            this(Status.OK_200,
+                 true,
+                 true,
+                 List.of(),
+                 null,
+                 rawResponse,
+                 rawContinueResponse,
+                 timeoutAfterFirstResponseRead);
+        }
+
+        FakeHttp1ClientConnection(boolean includeKeepAliveHeader, String rawResponse, String rawContinueResponse) {
+            this(Status.OK_200, includeKeepAliveHeader, true, List.of(), null, rawResponse, rawContinueResponse, false);
+        }
+
+        FakeHttp1ClientConnection(Status responseStatus, boolean includeContentLength) {
+            this(responseStatus, true, includeContentLength);
+        }
+
+        FakeHttp1ClientConnection(Status responseStatus, boolean includeKeepAliveHeader, boolean includeContentLength) {
+            this(responseStatus, includeKeepAliveHeader, includeContentLength, List.of(), null);
+        }
+
+        FakeHttp1ClientConnection(Status responseStatus,
+                                  boolean includeKeepAliveHeader,
+                                  boolean includeContentLength,
+                                  List<Header> additionalResponseHeaders,
+                                  byte[] responseEntity) {
+            this(responseStatus, includeKeepAliveHeader, includeContentLength, additionalResponseHeaders, responseEntity, null, null);
+        }
+
+        private FakeHttp1ClientConnection(Status responseStatus,
+                                          boolean includeKeepAliveHeader,
+                                          boolean includeContentLength,
+                                          List<Header> additionalResponseHeaders,
+                                          byte[] responseEntity,
+                                          String rawResponse,
+                                          String rawContinueResponse) {
+            this(responseStatus,
+                 includeKeepAliveHeader,
+                 includeContentLength,
+                 additionalResponseHeaders,
+                 responseEntity,
+                 rawResponse,
+                 rawContinueResponse,
+                 false);
+        }
+
+        private FakeHttp1ClientConnection(Status responseStatus,
+                                          boolean includeKeepAliveHeader,
+                                          boolean includeContentLength,
+                                          List<Header> additionalResponseHeaders,
+                                          byte[] responseEntity,
+                                          String rawResponse,
+                                          String rawContinueResponse,
+                                          boolean timeoutAfterFirstResponseRead) {
             ArrayBlockingQueue<byte[]> serverToClient = new ArrayBlockingQueue<>(1024);
             ArrayBlockingQueue<byte[]> clientToServer = new ArrayBlockingQueue<>(1024);
 
-            this.clientReader = reader(serverToClient);
+            this.clientReader = reader(serverToClient, timeoutAfterFirstResponseRead);
             this.clientWriter = writer(clientToServer);
-            this.serverReader = reader(clientToServer);
+            this.serverReader = reader(clientToServer, false);
             this.serverWriter = writer(serverToClient);
             this.includeKeepAliveHeader = includeKeepAliveHeader;
+            this.rawResponse = rawResponse;
+            this.rawContinueResponse = rawContinueResponse;
+            this.responseStatus = responseStatus;
+            this.includeContentLength = includeContentLength;
+            this.additionalResponseHeaders = additionalResponseHeaders;
+            this.responseEntity = responseEntity;
         }
 
         @Override
@@ -757,15 +2017,23 @@ class Http1ClientTest {
             };
         }
 
-        private DataReader reader(ArrayBlockingQueue<byte[]> queue) {
+        private DataReader reader(ArrayBlockingQueue<byte[]> queue, boolean timeoutAfterFirstRead) {
+            AtomicBoolean dataRead = new AtomicBoolean();
+            AtomicBoolean timeoutTriggered = new AtomicBoolean();
             return DataReader.create(() -> {
                 if (serverException != null) {
                     throw new IllegalStateException("Server exception", serverException);
                 }
                 byte[] data;
                 try {
-                    data = queue.poll(5, TimeUnit.SECONDS);
+                    long timeout = timeoutAfterFirstRead && dataRead.get() && !timeoutTriggered.get()
+                            ? 100
+                            : 5_000;
+                    data = queue.poll(timeout, TimeUnit.MILLISECONDS);
                     if (data == null) {
+                        if (timeoutAfterFirstRead && dataRead.get() && timeoutTriggered.compareAndSet(false, true)) {
+                            throw new UncheckedIOException(new SocketTimeoutException("Simulated response header timeout"));
+                        }
                         return null;
                     }
                 } catch (InterruptedException e) {
@@ -774,6 +2042,7 @@ class Http1ClientTest {
                 if (data.length == 0) {
                     return null;
                 }
+                dataRead.set(true);
                 return data;
             });
         }
@@ -793,6 +2062,7 @@ class Http1ClientTest {
             WritableHeaders<?> reqHeaders = null;
             try {
                 reqHeaders = Http1HeadersParser.readHeaders(serverReader, 16384, false);
+                proxyConnectionHeader = reqHeaders.contains(ClientRequestBase.PROXY_CONNECTION.headerName());
                 for (Iterator<Header> it = reqHeaders.iterator(); it.hasNext(); ) {
                     Header header = it.next();
                     header.validate();
@@ -806,8 +2076,10 @@ class Http1ClientTest {
                 if (reqHeaders.contains(HeaderValues.TRANSFER_ENCODING_CHUNKED)) {
                     // Send 100-Continue if requested
                     if (reqHeaders.contains(HeaderValues.EXPECT_100)) {
-                        serverWriter.write(
-                                BufferData.create("HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.UTF_8)));
+                        String continueResponse = rawContinueResponse == null
+                                ? "HTTP/1.1 100 Continue\r\n\r\n"
+                                : rawContinueResponse;
+                        serverWriter.write(BufferData.create(continueResponse.getBytes(StandardCharsets.UTF_8)));
                     }
 
                     // Assemble the entity from the chunks
@@ -855,25 +2127,259 @@ class Http1ClientTest {
                 resHeaders.add(HeaderValues.create(header[0], header[1]));
             }
 
-            String responseMessage = !requestFailed ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 400 Bad Request\r\n";
+            if (rawResponse != null) {
+                serverWriter.write(BufferData.create(rawResponse.getBytes(StandardCharsets.US_ASCII)));
+                return;
+            }
+
+            String responseMessage = !requestFailed
+                    ? "HTTP/1.1 " + responseStatus.code() + " " + responseStatus.reasonPhrase() + "\r\n"
+                    : "HTTP/1.1 400 Bad Request\r\n";
             serverWriter.write(BufferData.create(responseMessage.getBytes(StandardCharsets.UTF_8)));
 
             // Send the headers
-            resHeaders.add(HeaderNames.CONTENT_LENGTH, Integer.toString(entitySize));
+            if (includeContentLength) {
+                resHeaders.add(HeaderNames.CONTENT_LENGTH, Integer.toString(entitySize));
+            }
+            for (Header header : additionalResponseHeaders) {
+                resHeaders.add(header);
+            }
             BufferData entityBuffer = BufferData.growing(128);
             for (Header header : resHeaders) {
-header.writeHttp1Header(entityBuffer);
+                header.writeHttp1Header(entityBuffer);
             }
             entityBuffer.write(Bytes.CR_BYTE);
             entityBuffer.write(Bytes.LF_BYTE);
-            serverWriter.write(entityBuffer);
 
             // Send the entity if it exist
-            if (entitySize > 0) {
+            if (responseEntity == null) {
+                serverWriter.write(entityBuffer);
+            } else {
+                entityBuffer.write(responseEntity);
+                serverWriter.write(entityBuffer);
+            }
+            if (responseEntity == null && entitySize > 0) {
                 serverWriter.write(entity);
             }
         }
 
+    }
+
+    private record CapturedHttp1Request(String prologue, List<String> headerLines) {
+        boolean hasHeader(String headerName) {
+            String headerPrefix = headerName + ":";
+            return headerLines.stream()
+                    .anyMatch(line -> line.regionMatches(true, 0, headerPrefix, 0, headerPrefix.length()));
+        }
+    }
+
+    private record RawHttp1CaptureServer(ServerSocketChannel channel,
+                                         CompletableFuture<CapturedHttp1Request> request) implements AutoCloseable {
+        static RawHttp1CaptureServer start(UnixDomainSocketAddress address) throws IOException {
+            ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+            server.bind(address);
+            CompletableFuture<CapturedHttp1Request> request = CompletableFuture.supplyAsync(() -> {
+                try (SocketChannel socket = server.accept()) {
+                    CapturedHttp1Request captured = readRequest(socket);
+                    writeResponse(socket);
+                    return captured;
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                } finally {
+                    try {
+                        server.close();
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+            });
+            return new RawHttp1CaptureServer(server, request);
+        }
+
+        CapturedHttp1Request awaitRequest() throws Exception {
+            return request.get(5, TimeUnit.SECONDS);
+        }
+
+        @Override
+        public void close() {
+            try {
+                channel.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        private static CapturedHttp1Request readRequest(SocketChannel socket) throws IOException {
+            ByteArrayOutputStream rawRequest = new ByteArrayOutputStream();
+            ByteBuffer buffer = ByteBuffer.allocate(1024);
+            while (socket.read(buffer) >= 0) {
+                buffer.flip();
+                while (buffer.hasRemaining()) {
+                    rawRequest.write(buffer.get());
+                }
+                String rawRequestText = new String(rawRequest.toByteArray(), StandardCharsets.US_ASCII);
+                if (rawRequestText.contains("\r\n\r\n")) {
+                    return parse(rawRequestText);
+                }
+                buffer.clear();
+            }
+            throw new IllegalStateException("HTTP/1 request headers were not complete");
+        }
+
+        private static CapturedHttp1Request parse(String rawRequestText) {
+            int headerEnd = rawRequestText.indexOf("\r\n\r\n");
+            String[] headerLines = rawRequestText.substring(0, headerEnd).split("\r\n");
+            return new CapturedHttp1Request(headerLines[0], Arrays.asList(headerLines).subList(1, headerLines.length));
+        }
+
+        private static void writeResponse(SocketChannel socket) throws IOException {
+            ByteBuffer response = ByteBuffer.wrap(("HTTP/1.1 200 OK\r\n"
+                    + "Connection: close\r\n"
+                    + "Content-Length: 0\r\n"
+                    + "\r\n").getBytes(StandardCharsets.US_ASCII));
+            while (response.hasRemaining()) {
+                socket.write(response);
+            }
+        }
+    }
+
+    private record UpgradeRequiredServer(ServerSocket server,
+                                         CompletableFuture<Void> completion) implements AutoCloseable {
+        private static final byte[] UPGRADE_HEADERS = ("HTTP/1.1 426 Upgrade Required\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Upgrade: h2c\r\n"
+                + "Content-Length: 7\r\n"
+                + "\r\n").getBytes(StandardCharsets.US_ASCII);
+        private static final byte[] NEXT_RESPONSE = ("HTTP/1.1 200 OK\r\n"
+                + "Content-Length: 2\r\n"
+                + "\r\n"
+                + "ok").getBytes(StandardCharsets.US_ASCII);
+
+        static UpgradeRequiredServer start(boolean head) throws IOException {
+            ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
+            server.setSoTimeout(5_000);
+            CompletableFuture<Void> completion = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    socket.setSoTimeout(5_000);
+                    InputStream inputStream = socket.getInputStream();
+                    OutputStream outputStream = socket.getOutputStream();
+                    readHeaders(inputStream);
+                    outputStream.write(UPGRADE_HEADERS);
+                    if (!head) {
+                        outputStream.write("upgrade".getBytes(StandardCharsets.US_ASCII));
+                    }
+                    outputStream.flush();
+                    readHeaders(inputStream);
+                    outputStream.write(NEXT_RESPONSE);
+                    outputStream.flush();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+            return new UpgradeRequiredServer(server, completion);
+        }
+
+        String uri() {
+            return "http://127.0.0.1:" + server.getLocalPort();
+        }
+
+        void awaitCompletion() throws Exception {
+            completion.get(5, TimeUnit.SECONDS);
+        }
+
+        @Override
+        public void close() {
+            try {
+                server.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        private static void readHeaders(InputStream inputStream) throws IOException {
+            int matched = 0;
+            while (matched < 4) {
+                int next = inputStream.read();
+                if (next == -1) {
+                    throw new IllegalStateException("HTTP/1 request headers were not complete");
+                }
+                matched = switch (matched) {
+                case 0, 2 -> next == '\r' ? matched + 1 : 0;
+                case 1, 3 -> next == '\n' ? matched + 1 : next == '\r' ? 1 : 0;
+                default -> throw new IllegalStateException("Unexpected header parser state");
+                };
+            }
+        }
+    }
+
+    private record ConnectionCloseServer(ServerSocket server,
+                                         CompletableFuture<Boolean> firstConnectionClosed,
+                                         CompletableFuture<Void> completion) implements AutoCloseable {
+        private static final byte[] RESPONSE = ("HTTP/1.1 200 OK\r\n"
+                + "Connection: close\r\n"
+                + "Content-Length: 0\r\n"
+                + "\r\n").getBytes(StandardCharsets.US_ASCII);
+
+        static ConnectionCloseServer start() throws IOException {
+            ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
+            server.setSoTimeout(5_000);
+            CompletableFuture<Boolean> firstConnectionClosed = new CompletableFuture<>();
+            CompletableFuture<Void> completion = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    socket.setSoTimeout(5_000);
+                    firstConnectionClosed.complete(socket.getInputStream().read() == -1);
+                } catch (IOException e) {
+                    firstConnectionClosed.completeExceptionally(e);
+                    throw new UncheckedIOException(e);
+                }
+
+                try (Socket socket = server.accept()) {
+                    socket.setSoTimeout(5_000);
+                    readHeaders(socket.getInputStream());
+                    socket.getOutputStream().write(RESPONSE);
+                    socket.getOutputStream().flush();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+            return new ConnectionCloseServer(server, firstConnectionClosed, completion);
+        }
+
+        String uri() {
+            return "http://127.0.0.1:" + server.getLocalPort() + "/test";
+        }
+
+        boolean awaitFirstConnectionClose() throws Exception {
+            return firstConnectionClosed.get(5, TimeUnit.SECONDS);
+        }
+
+        void awaitCompletion() throws Exception {
+            completion.get(5, TimeUnit.SECONDS);
+        }
+
+        @Override
+        public void close() {
+            try {
+                server.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        private static void readHeaders(InputStream inputStream) throws IOException {
+            int matched = 0;
+            while (matched < 4) {
+                int next = inputStream.read();
+                if (next == -1) {
+                    throw new IllegalStateException("HTTP/1 request headers were not complete");
+                }
+                matched = switch (matched) {
+                case 0, 2 -> next == '\r' ? matched + 1 : 0;
+                case 1, 3 -> next == '\n' ? matched + 1 : next == '\r' ? 1 : 0;
+                default -> throw new IllegalStateException("Unexpected header parser state");
+                };
+            }
+        }
     }
 
     private static class FakeSocket implements HelidonSocket {

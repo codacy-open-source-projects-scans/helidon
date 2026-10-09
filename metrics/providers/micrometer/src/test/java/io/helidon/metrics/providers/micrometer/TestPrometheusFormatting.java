@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,36 +15,55 @@
  */
 package io.helidon.metrics.providers.micrometer;
 
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 import io.helidon.common.media.type.MediaTypes;
 import io.helidon.common.testing.junit5.OptionalMatcher;
 import io.helidon.metrics.api.Counter;
+import io.helidon.metrics.api.DistributionSummary;
+import io.helidon.metrics.api.Gauge;
 import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MeterRegistryFormatter;
 import io.helidon.metrics.api.MetricsConfig;
 import io.helidon.metrics.api.MetricsFactory;
-import io.helidon.metrics.api.ScopingConfig;
-import io.helidon.metrics.api.SystemTagsManager;
 import io.helidon.metrics.api.Timer;
+import io.helidon.service.registry.Services;
 
+import io.micrometer.core.instrument.FunctionTimer;
+import io.micrometer.core.instrument.LongTaskTimer;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Measurement;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Statistic;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.prometheusmetrics.PrometheusConfig;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.hamcrest.Matchers;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.endsWith;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.sameInstance;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class TestPrometheusFormatting {
 
-    private static final String SCOPE_TAG_NAME = "this-scope";
+    private static final String TEST_TAG_NAME = "this-scope";
 
     /*
     Only OpenMetrics format, not the Prometheus exposition format, has the trailing EOF which (for example) the Prometheus
@@ -52,52 +71,72 @@ class TestPrometheusFormatting {
     media type.
      */
     private static final String OPENMETRICS_EOF = "# EOF\n";
+    private static MetricsFactory metricsFactory;
     private static MeterRegistry meterRegistry;
 
     private static MetricsConfig metricsConfig;
 
     @BeforeAll
     static void prep() {
-        MetricsConfig.Builder metricsConfigBuilder = MetricsConfig.builder()
-                .scoping(ScopingConfig.builder()
-                                 .tagName(SCOPE_TAG_NAME)
-                                 .defaultValue("app"));
-
-        metricsConfig = metricsConfigBuilder.build();
-        meterRegistry = MetricsFactory.getInstance().globalRegistry(metricsConfig);
+        metricsConfig = MetricsConfig.create();
+        metricsFactory = Services.get(MetricsFactory.class);
+        meterRegistry = metricsFactory.createMeterRegistry(metricsConfig);
     }
 
-    /**
-     * Sets the system tags according to what this test expects.
-     * <p>
-     *     When a metrics factory is obtained via MetricsFactory.getInstance(metricsConfig), that config object initializes
-     *     the system tags manager. This happens after the @BeforeAll method runs. So re-assert the values we want for the
-     *     test here. We would only need to do it once, not before each test, but it's low cost esp. in a test environment.
-     *
-     * </p>
-     */
-    @BeforeEach
-    void setUpSystemTags() {
-        SystemTagsManager.instance(metricsConfig);
+    @AfterAll
+    static void cleanUp() {
+        meterRegistry.close();
+    }
+
+    @Test
+    void testCustomRegistryDoesNotUseMicrometerGlobalRegistry() {
+        assertThat(meterRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class),
+                   not(sameInstance(Metrics.globalRegistry)));
+    }
+
+    @Test
+    void testServiceRegistryOwnedRegistryDoesNotUseMicrometerGlobalRegistry() {
+        MeterRegistry globalRegistry = Services.get(MeterRegistry.class);
+
+        assertThat(globalRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class),
+                   not(sameInstance(Metrics.globalRegistry)));
+        assertThat(globalRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class),
+                   not(sameInstance(meterRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class))));
+    }
+
+    @Test
+    void testCustomRegistryOwnsPublishers() {
+        MetricsConfig customConfig = MetricsConfig.builder(metricsConfig)
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry customRegistry = metricsFactory.createMeterRegistry(customConfig);
+        CompositeMeterRegistry delegate = (CompositeMeterRegistry) customRegistry
+                .unwrap(io.micrometer.core.instrument.MeterRegistry.class);
+        Set<io.micrometer.core.instrument.MeterRegistry> publishers = delegate.getRegistries();
+
+        assertThat("Publisher count", publishers.size(), is(1));
+        customRegistry.close();
+        publishers.forEach(publisher -> assertThat("Publisher is closed", publisher.isClosed(), is(true)));
     }
 
     @Test
     void testRetrievingAll() {
-        Counter c = meterRegistry.getOrCreate(Counter.builder("c1"));
+        Counter c = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c1")
+                                                       .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         assertThat("Initial counter value", c.count(), Matchers.is(0L));
         c.increment();
         assertThat("After increment", c.count(), Matchers.is(1L));
 
-        Timer d = meterRegistry.getOrCreate(Timer.builder("t1")
-                                                    .scope("other"));
+        Timer d = meterRegistry.getOrCreate(metricsFactory.timerBuilder("t1")
+                                                    .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "other")));
         d.record(3, TimeUnit.SECONDS);
 
-        Timer e = meterRegistry.getOrCreate(Timer.builder("t1-1"));
+        Timer e = meterRegistry.getOrCreate(metricsFactory.timerBuilder("t1-1")
+                                                    .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         e.record(2, TimeUnit.SECONDS);
 
         MicrometerPrometheusFormatter formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeTagName(SCOPE_TAG_NAME)
                 .build();
         Optional<Object> outputOpt = formatter.format();
 
@@ -111,7 +150,7 @@ class TestPrometheusFormatting {
                          containsString(scopeExpr("t1_seconds_count",
                                                   "this_scope",
                                                   "other",
-                                                  "1.0")),
+                                                  "1")),
                          containsString(scopeExpr("t1_seconds_sum",
                                                   "this_scope",
                                                   "other",
@@ -119,24 +158,25 @@ class TestPrometheusFormatting {
                          containsString(scopeExpr("t1_1_seconds_count",
                                                   "this_scope",
                                                   "app",
-                                                  "1.0")),
+                                                  "1")),
                          endsWith(OPENMETRICS_EOF)));
 
     }
 
     @Test
     void testRetrievingByName() {
-        Counter c = meterRegistry.getOrCreate(Counter.builder("c2"));
+        Counter c = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c2")
+                                                       .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         assertThat("Initial counter value", c.count(), Matchers.is(0L));
         c.increment();
         assertThat("After increment", c.count(), Matchers.is(1L));
 
-        Timer d = meterRegistry.getOrCreate(Timer.builder("t2"));
+        Timer d = meterRegistry.getOrCreate(metricsFactory.timerBuilder("t2")
+                                                    .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         d.record(7, TimeUnit.SECONDS);
 
         MicrometerPrometheusFormatter formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeTagName(SCOPE_TAG_NAME)
                 .meterNameSelection(Set.of("c2"))
                 .build();
         Optional<Object> outputOpt = formatter.format();
@@ -159,25 +199,29 @@ class TestPrometheusFormatting {
     }
 
     @Test
-    void testRetrievingByScope() {
+    void testRetrievingByTag() {
 
-        Counter c = meterRegistry.getOrCreate(Counter.builder("c3"));
+        Counter c = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c3")
+                                                       .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         assertThat("Initial counter value", c.count(), is(0L));
         c.increment();
         assertThat("After increment", c.count(), is(1L));
 
-        Timer d = meterRegistry.getOrCreate(Timer.builder("t3")
-                                                    .scope("other-scope"));
+        Timer d = meterRegistry.getOrCreate(metricsFactory.timerBuilder("t3")
+                                                    .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "other-scope")));
         d.record(7, TimeUnit.SECONDS);
 
-        Timer e = meterRegistry.getOrCreate(Timer.builder("t3-1"));
+        Timer e = meterRegistry.getOrCreate(metricsFactory.timerBuilder("t3-1")
+                                                    .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         e.record(2, TimeUnit.SECONDS);
 
-        MicrometerPrometheusFormatter formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
-                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeTagName(SCOPE_TAG_NAME)
-                .scopeSelection(Set.of("app"))
-                .build();
+        MeterRegistryFormatter formatter = new MicrometerPrometheusFormatterProvider()
+                .formatter(MediaTypes.APPLICATION_OPENMETRICS_TEXT,
+                           metricsConfig,
+                           meterRegistry,
+                           Map.<String, Collection<String>>of(TEST_TAG_NAME, Set.of("app")),
+                           Set.of())
+                .orElseThrow();
 
         Optional<Object> outputOpt = formatter.format();
 
@@ -198,25 +242,157 @@ class TestPrometheusFormatting {
                          containsString(scopeExpr("t3_1_seconds_count",
                                                   "this_scope",
                                                   "app",
-                                                  "1.0")),
+                                                  "1")),
                          endsWith(OPENMETRICS_EOF)));
     }
 
     @Test
+    void testGeneratedLabelsDoNotSatisfyTagSelection() {
+        DistributionSummary summary = meterRegistry.getOrCreate(metricsFactory.distributionSummaryBuilder(
+                "generatedLabelSelection",
+                metricsFactory.distributionStatisticsConfigBuilder()
+                        .buckets(1, 2)
+                        .percentiles(0.5)));
+        summary.record(1);
+
+        var bucketFormatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("generatedLabelSelection"))
+                .tagSelection(Map.of("le", Set.of("+Inf")))
+                .build();
+        var quantileFormatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("generatedLabelSelection"))
+                .tagSelection(Map.of("quantile", Set.of("0.5")))
+                .build();
+
+        assertThat("Generated bucket label does not match a meter tag selection",
+                   bucketFormatter.format(),
+                   OptionalMatcher.optionalEmpty());
+        assertThat("Generated quantile label does not match a meter tag selection",
+                   quantileFormatter.format(),
+                   OptionalMatcher.optionalEmpty());
+    }
+
+    @Test
+    void testLegacyCounterActualGeneratedNameTagIsSelectable() {
+        MetricsConfig legacyConfig = MetricsConfig.builder()
+                .addPublisher(PrometheusPublisher.builder()
+                                      .namingConvention(builder -> builder.nonLetterPrefix("m_"))
+                                      .build())
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry legacyRegistry = metricsFactory.createMeterRegistry(legacyConfig);
+        try {
+            legacyRegistry.getOrCreate(metricsFactory.counterBuilder("jobs")
+                                               .addTag(metricsFactory.tagCreate("le", "actual")))
+                    .increment();
+
+            var formatter = MicrometerPrometheusFormatter.builder(legacyRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .meterNameSelection(Set.of("jobs"))
+                    .tagSelection(Map.of("le", Set.of("actual")))
+                    .build();
+
+            assertThat("Actual counter tag which shares a generated label name remains selectable with legacy naming",
+                       checkAndCast(formatter.format()),
+                       containsString("jobs_total{le=\"actual\"} 1.0"));
+        } finally {
+            legacyRegistry.close();
+        }
+    }
+
+    @Test
+    void testGeneratedCommonLabelDoesNotSatisfyTagSelection() {
+        Meter.builder("generatedCommonLabel",
+                      Meter.Type.OTHER,
+                      List.of(new Measurement(() -> 1, Statistic.COUNT),
+                              new Measurement(() -> 2, Statistic.TOTAL)))
+                .tag("real", "yes")
+                .register(MicrometerPrometheusFormatter.prometheusMeterRegistry(meterRegistry).orElseThrow());
+        meterRegistry.getOrCreate(metricsFactory.gaugeBuilder("actualStatisticTag", () -> 3)
+                                          .addTag(metricsFactory.tagCreate("statistic", "COUNT")));
+
+        var statisticFormatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("generatedCommonLabel"))
+                .tagSelection(Map.of("statistic", Set.of("COUNT")))
+                .build();
+        var realTagFormatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .tagSelection(Map.of("real", Set.of("yes")))
+                .build();
+        var actualStatisticTagFormatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("actualStatisticTag"))
+                .tagSelection(Map.of("statistic", Set.of("COUNT")))
+                .build();
+
+        assertThat("Generated common label does not match a meter tag selection",
+                   statisticFormatter.format(),
+                   OptionalMatcher.optionalEmpty());
+        assertThat("Actual meter tag selection retains the complete custom meter family",
+                   checkAndCast(realTagFormatter.format()),
+                   allOf(containsString("generatedCommonLabel_total{real=\"yes\",statistic=\"COUNT\"} 1.0"),
+                         containsString("generatedCommonLabel_sum_total{real=\"yes\",statistic=\"TOTAL\"} 2.0")));
+        assertThat("Actual meter tag which shares a generated label name remains selectable",
+                   checkAndCast(actualStatisticTagFormatter.format()),
+                   containsString("actualStatisticTag{statistic=\"COUNT\"} 3.0"));
+    }
+
+    @Test
+    void testActualTagSelectionRetainsCompleteDistributionFamily() {
+        DistributionSummary summary = meterRegistry.getOrCreate(metricsFactory.distributionSummaryBuilder(
+                "actualTagDistribution",
+                metricsFactory.distributionStatisticsConfigBuilder()
+                        .buckets(1, 2)
+                        .percentiles(0.5))
+                                                                         .addTag(metricsFactory.tagCreate("kind",
+                                                                                                         "selected")));
+        DistributionSummary other = meterRegistry.getOrCreate(metricsFactory.distributionSummaryBuilder(
+                "actualTagDistribution",
+                metricsFactory.distributionStatisticsConfigBuilder()
+                        .buckets(1, 2)
+                        .percentiles(0.5))
+                                                                       .addTag(metricsFactory.tagCreate("kind", "other")));
+        summary.record(1);
+        other.record(2);
+
+        var formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("actualTagDistribution"))
+                .tagSelection(Map.of("kind", Set.of("selected")))
+                .build();
+
+        assertThat("Actual meter tag selection retains the complete distribution family",
+                   checkAndCast(formatter.format()),
+                   allOf(containsString("actualTagDistribution_bucket{kind=\"selected\",le=\"1.0\"} 1"),
+                         containsString("actualTagDistribution_bucket{kind=\"selected\",le=\"2.0\"} 1"),
+                         containsString("actualTagDistribution_bucket{kind=\"selected\",le=\"+Inf\"} 1"),
+                         containsString("actualTagDistribution_count{kind=\"selected\"} 1"),
+                         containsString("actualTagDistribution_sum{kind=\"selected\"} 1.0"),
+                         containsString("actualTagDistribution_max{kind=\"selected\"} 1.0"),
+                         not(containsString("kind=\"other\""))));
+    }
+
+    @Test
     void testMeterNameWithColon() {
-        Counter withColon = meterRegistry.getOrCreate(Counter.builder("c:withColon"));
+        Counter withColon = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c:withColon")
+                                                               .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         withColon.increment();
 
-        Counter withoutColon = meterRegistry.getOrCreate(Counter.builder("cWithoutColon"));
+        Counter withoutColon = meterRegistry.getOrCreate(metricsFactory.counterBuilder("cWithoutColon")
+                                                                  .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         withoutColon.increment(2L);
 
-        Counter withQuestionMark = meterRegistry.getOrCreate(Counter.builder("c?withQuestionMark"));
+        Counter withQuestionMark = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c?withQuestionMark")
+                                                                      .addTag(metricsFactory.tagCreate(TEST_TAG_NAME,
+                                                                                                      "app")));
         withQuestionMark.increment();
 
         MicrometerPrometheusFormatter formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeTagName(SCOPE_TAG_NAME)
-                .scopeSelection(Set.of("app"))
+                .tagSelection(Map.of(TEST_TAG_NAME, Set.of("app")))
                 .build();
 
         Optional<Object> outputOpt = formatter.format();
@@ -240,14 +416,17 @@ class TestPrometheusFormatting {
 
     @Test
     void testMeterNameWithSpecialChars() {
-        Counter counterWithDashes = meterRegistry.getOrCreate(Counter.builder("counter-with-dashes"));
+        Counter counterWithDashes = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counter-with-dashes")
+                                                                       .addTag(metricsFactory.tagCreate(TEST_TAG_NAME,
+                                                                                                       "app")));
         counterWithDashes.increment(3L);
 
-        Counter counterWithUmlauts = meterRegistry.getOrCreate(Counter.builder("counter-with-umlaut-äöü"));
+        Counter counterWithUmlauts = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counter-with-umlaut-äöü")
+                                                                        .addTag(metricsFactory.tagCreate(TEST_TAG_NAME,
+                                                                                                        "app")));
         counterWithUmlauts.increment(4L);
         var formatter =  MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeTagName(SCOPE_TAG_NAME)
                 .build();
 
         Optional<Object> output = formatter.format();
@@ -268,13 +447,13 @@ class TestPrometheusFormatting {
 
     @Test
     void testSelectiveByName() {
-        Counter counter = meterRegistry.getOrCreate(Counter.builder("counterByName"));
+        Counter counter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counterByName")
+                                                             .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         counter.increment();
 
         var formatter =  MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
                 .meterNameSelection(Set.of("counterByName"))
-                .scopeTagName(SCOPE_TAG_NAME)
                 .build();
 
         Optional<Object> output = formatter.format();
@@ -287,15 +466,15 @@ class TestPrometheusFormatting {
     }
 
     @Test
-    void testSelectiveByNameAndScope() {
-        Counter counter = meterRegistry.getOrCreate(Counter.builder("counterByNameAndScope"));
+    void testSelectiveByNameAndTag() {
+        Counter counter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counterByNameAndScope")
+                                                             .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         counter.increment(6L);
 
         var formatter =  MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
                 .meterNameSelection(Set.of("counterByNameAndScope"))
-                .scopeSelection(Set.of("app"))
-                .scopeTagName(SCOPE_TAG_NAME)
+                .tagSelection(Map.of(TEST_TAG_NAME, Set.of("app")))
                 .build();
 
         Optional<Object> output = formatter.format();
@@ -308,20 +487,298 @@ class TestPrometheusFormatting {
     }
 
     @Test
-    void testSelectNonExistentScope() {
-        Counter counter = meterRegistry.getOrCreate(Counter.builder("counterByBadScope"));
+    void testEachSelectedTagMustMatch() {
+        Counter matching = meterRegistry.getOrCreate(metricsFactory.counterBuilder("sameNameByTags")
+                                                              .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app"))
+                                                              .addTag(metricsFactory.tagCreate("kind", "selected")));
+        Counter wrongKind = meterRegistry.getOrCreate(metricsFactory.counterBuilder("sameNameByTags")
+                                                               .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app"))
+                                                               .addTag(metricsFactory.tagCreate("kind", "other")));
+        Counter wrongScope = meterRegistry.getOrCreate(metricsFactory.counterBuilder("sameNameByTags")
+                                                                .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "other"))
+                                                                .addTag(metricsFactory.tagCreate("kind", "selected")));
+        matching.increment();
+        wrongKind.increment(2L);
+        wrongScope.increment(3L);
+
+        var formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("sameNameByTags"))
+                .tagSelection(Map.of(TEST_TAG_NAME, Set.of("app"),
+                                     "kind", Set.of("selected")))
+                .build();
+
+        assertThat("Every selected tag must match",
+                   checkAndCast(formatter.format()),
+                   allOf(containsString("sameNameByTags_total{kind=\"selected\",this_scope=\"app\"} 1.0"),
+                         not(containsString("kind=\"other\"")),
+                         not(containsString("this_scope=\"other\""))));
+    }
+
+    @Test
+    void testTagOnlySelectionDoesNotExpandHighCardinalityMeterNames() {
+        MetricsConfig customConfig = MetricsConfig.builder(metricsConfig)
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry customRegistry = metricsFactory.createMeterRegistry(customConfig);
+        CompositeMeterRegistry delegate = (CompositeMeterRegistry) customRegistry
+                .unwrap(io.micrometer.core.instrument.MeterRegistry.class);
+        io.micrometer.core.instrument.MeterRegistry originalPublisher = delegate.getRegistries().iterator().next();
+        delegate.remove(originalPublisher);
+        originalPublisher.close();
+
+        var trackingRegistry = new TrackingPrometheusMeterRegistry();
+        delegate.add(trackingRegistry);
+        try {
+            int cardinality = 256;
+            for (int i = 0; i < cardinality; i++) {
+                String tagValue = i == cardinality - 1 ? "selected" : "unselected";
+                String cardinalityValue = Integer.toString(i);
+                Counter counter = customRegistry.getOrCreate(metricsFactory.counterBuilder("highCardinality")
+                                                                      .addTag(metricsFactory.tagCreate(TEST_TAG_NAME,
+                                                                                                      tagValue))
+                                                                      .addTag(metricsFactory.tagCreate("cardinality",
+                                                                                                      cardinalityValue)));
+                counter.increment(i + 1);
+            }
+
+            trackingRegistry.resetMeterInspectionCounts();
+            var formatter = MicrometerPrometheusFormatter.builder(customRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .tagSelection(Map.of(TEST_TAG_NAME, Set.of("selected")))
+                    .build();
+
+            String output = checkAndCast(formatter.format());
+            assertThat("Tag-only selection bypasses meter name expansion",
+                       trackingRegistry.meterEnumerationCount(),
+                       is(0));
+            assertThat("Ordinary tag-only selection does not traverse meter IDs",
+                       trackingRegistry.meterIterationCount(),
+                       is(0));
+            assertThat("Only the matching high-cardinality sample is formatted",
+                       output,
+                       allOf(containsString("highCardinality_total{cardinality=\"255\",this_scope=\"selected\"} 256.0"),
+                             not(containsString("this_scope=\"unselected\""))));
+        } finally {
+            customRegistry.close();
+        }
+    }
+
+    @Test
+    void testSelectNonExistentTagValue() {
+        Counter counter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counterByBadScope")
+                                                             .addTag(metricsFactory.tagCreate(TEST_TAG_NAME, "app")));
         counter.increment(7L);
 
         var formatter =  MicrometerPrometheusFormatter.builder(meterRegistry)
                 .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
-                .scopeSelection(Set.of("missing"))
-                .scopeTagName(SCOPE_TAG_NAME)
+                .tagSelection(Map.of(TEST_TAG_NAME, Set.of("missing")))
                 .build();
 
         Optional<Object> output = formatter.format();
-        assertThat("Selective by non-existent scope",
+        assertThat("Selective by non-existent tag value",
                    output,
                    OptionalMatcher.optionalEmpty());
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void testScopeSelectionIsIgnored() {
+        Counter counter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("counterByIgnoredScope")
+                                                             .scope("explicit"));
+        counter.increment(8L);
+
+        var formatter = MicrometerPrometheusFormatter.builder(meterRegistry)
+                .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                .meterNameSelection(Set.of("counterByIgnoredScope"))
+                .scopeSelection(Set.of("missing"))
+                .scopeTagName(TEST_TAG_NAME)
+                .build();
+
+        assertThat("Scope selection is ignored",
+                   checkAndCast(formatter.format()),
+                   containsString("counterByIgnoredScope_total 8.0"));
+
+        MeterRegistryFormatter providerFormatter = new MicrometerPrometheusFormatterProvider()
+                .formatter(MediaTypes.APPLICATION_OPENMETRICS_TEXT,
+                           metricsConfig,
+                           meterRegistry,
+                           Optional.of(TEST_TAG_NAME),
+                           Set.of("missing"),
+                           Set.of("counterByIgnoredScope"))
+                .orElseThrow();
+        assertThat("Provider scope selection is ignored",
+                   checkAndCast(providerFormatter.format()),
+                   containsString("counterByIgnoredScope_total 8.0"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testLegacyNamingSelectiveScrapeUsesOriginalNamesAndIncludesMaxFamilies() {
+        MetricsConfig legacyConfig = MetricsConfig.builder()
+                .addPublisher(PrometheusPublisher.builder()
+                                      .namingConvention(builder -> builder.nonLetterPrefix("m_"))
+                                      .build())
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry legacyRegistry = metricsFactory.createMeterRegistry(legacyConfig);
+        try {
+            AtomicLong gaugeValue = new AtomicLong(4);
+            Gauge.Builder<Double> gaugeBuilder = metricsFactory.gaugeBuilder("build.info",
+                                                                             gaugeValue,
+                                                                             AtomicLong::doubleValue);
+            gaugeBuilder.unwrap(io.micrometer.core.instrument.Gauge.Builder.class).strongReference(true);
+            legacyRegistry.getOrCreate(gaugeBuilder);
+
+            legacyRegistry.getOrCreate(metricsFactory.counterBuilder("1counter")).increment();
+            Timer timer = legacyRegistry.getOrCreate(metricsFactory.timerBuilder("request.time"));
+            timer.record(2, TimeUnit.SECONDS);
+            DistributionSummary summary = legacyRegistry.getOrCreate(metricsFactory.distributionSummaryBuilder(
+                    "payload.size",
+                    metricsFactory.distributionStatisticsConfigBuilder()));
+            summary.record(5);
+            legacyRegistry.getOrCreate(metricsFactory.counterBuilder("unselected")).increment();
+
+            var formatter = MicrometerPrometheusFormatter.builder(legacyRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .meterNameSelection(Set.of("1counter", "build.info", "request.time", "payload.size"))
+                    .build();
+
+            assertThat("Legacy selective output",
+                       checkAndCast(formatter.format()),
+                       allOf(containsString("m_1counter_total 1.0"),
+                             containsString("build_info 4.0"),
+                             containsString("request_time_seconds_count 1"),
+                             containsString("request_time_seconds_max 2.0"),
+                             containsString("payload_size_count 1"),
+                             containsString("payload_size_max 5.0"),
+                             not(containsString("unselected_total"))));
+        } finally {
+            legacyRegistry.close();
+        }
+    }
+
+    @Test
+    void testRejectedPrometheusMeterIsNotAvailableForSelectiveScrape() {
+        MetricsConfig localConfig = MetricsConfig.builder()
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry localRegistry = metricsFactory.createMeterRegistry(localConfig);
+        try {
+            localRegistry.getOrCreate(metricsFactory.timerBuilder("collision"));
+            AtomicLong gaugeValue = new AtomicLong(1);
+            Gauge.Builder<Double> gaugeBuilder = metricsFactory.gaugeBuilder("collision_seconds_count",
+                                                                             gaugeValue,
+                                                                             AtomicLong::doubleValue);
+            gaugeBuilder.unwrap(io.micrometer.core.instrument.Gauge.Builder.class).strongReference(true);
+
+            assertThrows(IllegalArgumentException.class, () -> localRegistry.getOrCreate(gaugeBuilder));
+            assertThat(localRegistry.meters().stream().map(meter -> meter.id().name()).toList(),
+                       not(hasItem("collision_seconds_count")));
+
+            var formatter = MicrometerPrometheusFormatter.builder(localRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .meterNameSelection(Set.of("collision_seconds_count"))
+                    .build();
+            assertThat(formatter.format(), OptionalMatcher.optionalEmpty());
+        } finally {
+            localRegistry.close();
+        }
+    }
+
+    @Test
+    void testSelectiveScrapeUsesExpositionName() {
+        MetricsConfig localConfig = MetricsConfig.builder()
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry localRegistry = metricsFactory.createMeterRegistry(localConfig);
+        try {
+            PrometheusMeterRegistry prometheusRegistry = MicrometerPrometheusFormatter
+                    .prometheusMeterRegistry(localRegistry)
+                    .orElseThrow();
+            io.micrometer.core.instrument.Gauge.builder("payload", () -> 1)
+                    .baseUnit("bytes/second")
+                    .tag("le", "actual")
+                    .register(prometheusRegistry);
+
+            var formatter = MicrometerPrometheusFormatter.builder(localRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .meterNameSelection(Set.of("payload"))
+                    .tagSelection(Map.of("le", Set.of("actual")))
+                    .build();
+
+            assertThat(checkAndCast(formatter.format()),
+                       containsString("payload_bytes_second{le=\"actual\"} 1.0"));
+        } finally {
+            localRegistry.close();
+        }
+    }
+
+    @Test
+    void testFunctionTimerSelectiveScrapeDoesNotIncludeUnrelatedMaxFamily() {
+        MetricsConfig localConfig = MetricsConfig.builder()
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry localRegistry = metricsFactory.createMeterRegistry(localConfig);
+        try {
+            PrometheusMeterRegistry prometheusRegistry = MicrometerPrometheusFormatter
+                    .prometheusMeterRegistry(localRegistry)
+                    .orElseThrow();
+            AtomicLong count = new AtomicLong(1);
+            AtomicLong totalTime = new AtomicLong(2);
+            FunctionTimer.builder("operation", count,
+                                  AtomicLong::get,
+                                  _ -> totalTime.get(),
+                                  TimeUnit.SECONDS)
+                    .register(prometheusRegistry);
+            io.micrometer.core.instrument.Gauge.builder("operation_seconds_max", () -> 3)
+                    .register(prometheusRegistry);
+
+            var formatter = MicrometerPrometheusFormatter.builder(localRegistry)
+                    .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                    .meterNameSelection(Set.of("operation"))
+                    .build();
+            String output = checkAndCast(formatter.format());
+
+            assertThat(output,
+                       allOf(containsString("operation_seconds_count 1"),
+                             containsString("operation_seconds_sum 2.0"),
+                             not(containsString("operation_seconds_max"))));
+        } finally {
+            localRegistry.close();
+        }
+    }
+
+    @Test
+    void testLongTaskTimerSelectiveScrapeIncludesMaxFamily() {
+        MetricsConfig localConfig = MetricsConfig.builder()
+                .warnOnMultipleRegistries(false)
+                .build();
+        MeterRegistry localRegistry = metricsFactory.createMeterRegistry(localConfig);
+        try {
+            PrometheusMeterRegistry prometheusRegistry = MicrometerPrometheusFormatter
+                    .prometheusMeterRegistry(localRegistry)
+                    .orElseThrow();
+            LongTaskTimer longTaskTimer = LongTaskTimer.builder("operation")
+                    .register(prometheusRegistry);
+            LongTaskTimer.Sample sample = longTaskTimer.start();
+            try {
+                var formatter = MicrometerPrometheusFormatter.builder(localRegistry)
+                        .resultMediaType(MediaTypes.APPLICATION_OPENMETRICS_TEXT)
+                        .meterNameSelection(Set.of("operation"))
+                        .build();
+                String output = checkAndCast(formatter.format());
+
+                assertThat(output,
+                           allOf(containsString("operation_seconds_count 1"),
+                                 containsString("operation_seconds_sum"),
+                                 containsString("operation_seconds_max")));
+            } finally {
+                sample.stop();
+            }
+        } finally {
+            localRegistry.close();
+        }
     }
 
     private static String scopeExpr(String meterName, String key, String value, String suffix) {
@@ -333,5 +790,40 @@ class TestPrometheusFormatting {
         assertThat("Formatted output", outputOpt.get(), is(instanceOf(String.class)));
 
         return (String) outputOpt.get();
+    }
+
+    private static class TrackingPrometheusMeterRegistry extends PrometheusMeterRegistry {
+
+        private int meterEnumerationCount;
+        private int meterIterationCount;
+
+        private TrackingPrometheusMeterRegistry() {
+            super(PrometheusConfig.DEFAULT);
+        }
+
+        @Override
+        public List<Meter> getMeters() {
+            meterEnumerationCount++;
+            return super.getMeters();
+        }
+
+        @Override
+        public void forEachMeter(Consumer<? super Meter> consumer) {
+            meterIterationCount++;
+            super.forEachMeter(consumer);
+        }
+
+        private int meterEnumerationCount() {
+            return meterEnumerationCount;
+        }
+
+        private int meterIterationCount() {
+            return meterIterationCount;
+        }
+
+        private void resetMeterInspectionCounts() {
+            meterEnumerationCount = 0;
+            meterIterationCount = 0;
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +32,34 @@ class RedirectionProcessor {
     }
 
     static boolean redirectionStatusCode(Status status) {
-        return status.family() == Status.Family.REDIRECTION;
+        // 304 is not a redirect; it instructs a cache to reuse its stored representation.
+        return status.code() != Status.NOT_MODIFIED_304.code()
+                && status.family() == Status.Family.REDIRECTION;
+    }
+
+    static boolean keepsMethodAndEntity(Method method, Status status) {
+        int statusCode = status.code();
+        return statusCode == Status.TEMPORARY_REDIRECT_307.code()
+                || statusCode == Status.PERMANENT_REDIRECT_308.code()
+                || (Method.QUERY.equals(method)
+                        && (statusCode == Status.MOVED_PERMANENTLY_301.code()
+                        || statusCode == Status.FOUND_302.code()));
+    }
+
+    static void validateEntityRedirect(Http2ClientRequestImpl request,
+                                       Status status,
+                                       ClientUri redirectUri,
+                                       boolean hasEntity) {
+        if (keepsMethodAndEntity(request.method(), status)
+                && hasEntity
+                && !request.canReplayEntityTo(redirectUri)) {
+            throw new IllegalStateException("Cross-origin redirect with request entity is disabled.");
+        }
+    }
+
+    static IllegalStateException maxRedirectsReached(int maxRedirects) {
+        return new IllegalStateException("Maximum number of request redirections ("
+                                                 + maxRedirects + ") reached.");
     }
 
     static void checkRedirectHeaders(Http2Headers headerValues) {
@@ -56,12 +83,17 @@ class RedirectionProcessor {
         Http2ClientRequestImpl clientRequest = request;
         //Entity to be sent with the request. Will be changed when redirect happens to prevent entity sending.
         Object entityToBeSent = entity;
-        for (int i = initial; i < request.maxRedirects(); i++) {
+        int followedRedirects = initial;
+        while (true) {
             Http2ClientResponseImpl clientResponse = clientRequest.invokeEntity(entityToBeSent);
             if (!redirectionStatusCode(clientResponse.status())) {
                 return clientResponse;
             }
             try (clientResponse) {
+                if (followedRedirects >= request.maxRedirects()) {
+                    throw maxRedirectsReached(request.maxRedirects());
+                }
+                followedRedirects++;
                 if (!clientResponse.headers().contains(HeaderNames.LOCATION)) {
                     throw new IllegalStateException("There is no " + HeaderNames.LOCATION
                                                             + " header present in the response! "
@@ -83,24 +115,28 @@ class RedirectionProcessor {
                 redirectUri.host(resolvedUri.host());
                 redirectUri.port(resolvedUri.port());
             }
-            //Method and entity is required to be the same as with original request with 307 and 308 requests
-            if (clientResponse.status() == Status.TEMPORARY_REDIRECT_307
-                    || clientResponse.status() == Status.PERMANENT_REDIRECT_308) {
+            // Method and entity must be retained for 307 and 308, and for QUERY with 301 and 302.
+            validateEntityRedirect(clientRequest, clientResponse.status(), redirectUri, clientResponse.hasRequestEntity());
+            if (keepsMethodAndEntity(clientRequest.method(), clientResponse.status())) {
+                Object requestEntity = clientResponse.requestEntity();
+                if (requestEntity != null) {
+                    entityToBeSent = requestEntity;
+                }
                 clientRequest = new Http2ClientRequestImpl(clientRequest,
                                                            clientRequest.method(),
                                                            redirectUri,
-                                                           request.properties());
+                                                           request.properties(),
+                                                           true);
             } else {
                 //It is possible to change to GET and send no entity with all other redirect codes
                 entityToBeSent = BufferData.EMPTY_BYTES; //We do not want to send entity after this redirect
                 clientRequest = new Http2ClientRequestImpl(clientRequest,
                                                            Method.GET,
                                                            redirectUri,
-                                                           request.properties());
+                                                           request.properties(),
+                                                           false);
             }
         }
-        throw new IllegalStateException("Maximum number of request redirections ("
-                                                + request.maxRedirects() + ") reached.");
     }
 
 }

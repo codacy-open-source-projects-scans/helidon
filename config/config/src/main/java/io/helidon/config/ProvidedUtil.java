@@ -25,10 +25,17 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import io.helidon.builder.api.Option.Provider.ConfigForm;
+import io.helidon.builder.api.Option.Provider.Identity;
 import io.helidon.builder.api.Prototype;
 import io.helidon.common.HelidonServiceLoader;
+import io.helidon.common.Weighted;
+import io.helidon.common.Weights;
+import io.helidon.config.ConfigBuilderSupport.ProviderSettings;
+import io.helidon.service.registry.GlobalServiceRegistry;
+import io.helidon.service.registry.Lookup;
+import io.helidon.service.registry.ServiceInstance;
 import io.helidon.service.registry.ServiceRegistry;
-import io.helidon.service.registry.Services;
 
 @SuppressWarnings("ALL")
 final class ProvidedUtil {
@@ -87,9 +94,34 @@ final class ProvidedUtil {
             boolean discoverServices,
             Optional<S> existingValue) {
 
+        return discoverService(config,
+                               configKey,
+                               serviceLoader,
+                               providerType,
+                               configType,
+                               ProviderSettings.create(Identity.TYPE_AND_NAME,
+                                                       ConfigForm.AUTO,
+                                                       discoverServices),
+                               existingValue);
+    }
+
+    static <S extends NamedService,
+            T extends ConfiguredProvider<S>> Optional<S> discoverService(
+            Config config,
+            String configKey,
+            HelidonServiceLoader<T> serviceLoader,
+            Class<T> providerType,
+            Class<S> configType,
+            ProviderSettings settings,
+            Optional<S> existingValue) {
+
         // there is an explicit configuration for this service, ignore configuration
         if (existingValue.isPresent()) {
             return Optional.empty();
+        }
+
+        if (settings.validateConfig()) {
+            validateProviderConfig(config.get(configKey), settings.identity(), settings.configForm());
         }
 
         // all child nodes of the current node
@@ -107,7 +139,7 @@ final class ProvidedUtil {
                                             serviceLoader,
                                             providerType,
                                             configType,
-                                            discoverServices,
+                                            settings.withoutConfigValidation(),
                                             List.of());
 
         return services.isEmpty() ? Optional.empty() : Optional.of(services.getFirst());
@@ -139,44 +171,34 @@ final class ProvidedUtil {
             boolean allFromServiceLoader,
             List<S> existingInstances) {
 
-        // type and name is a unique identification of a service - for services already defined on the builder
-        // do not add them from configuration (as this would duplicate service instances)
-        Set<TypeAndName> ignoredServices = new HashSet<>();
-        existingInstances.forEach(it -> ignoredServices.add(new TypeAndName(it.type(), it.name())));
+        return discoverServices(config,
+                                configKey,
+                                serviceLoader,
+                                providerType,
+                                configType,
+                                ProviderSettings.create(Identity.TYPE_AND_NAME,
+                                                        ConfigForm.AUTO,
+                                                        allFromServiceLoader),
+                                existingInstances);
+    }
 
-        boolean discoverServices = config.get(configKey + "-discover-services").asBoolean().orElse(allFromServiceLoader);
-        Config providersConfig = config.get(configKey);
+    static <S extends NamedService,
+            T extends ConfiguredProvider<S>> List<S> discoverServices(
+            Config config,
+            String configKey,
+            HelidonServiceLoader<T> serviceLoader,
+            Class<T> providerType,
+            Class<S> configType,
+            ProviderSettings settings,
+            List<S> existingInstances) {
 
-        List<ConfiguredService> configuredServices = new ArrayList<>();
-
-        // all child nodes of the current node
-        List<Config> serviceConfigList = providersConfig.asNodeList()
-                .orElseGet(List::of);
-        boolean isList = providersConfig.isList();
-
-        for (Config serviceConfig : serviceConfigList) {
-            configuredServices.add(configuredService(serviceConfig, isList));
-        }
-
-        // now we have all service configurations, we can start building up instances
-        if (providersConfig.isList()) {
-            // driven by order of declaration in config
-            return servicesFromList(serviceLoader,
-                                    providerType,
-                                    configType,
-                                    configuredServices,
-                                    discoverServices,
-                                    ignoredServices);
-        } else {
-            // driven by service loader order
-            return servicesFromObject(providersConfig,
-                                      serviceLoader,
-                                      providerType,
-                                      configType,
-                                      configuredServices,
-                                      discoverServices,
-                                      ignoredServices);
-        }
+        return discoverServices(config,
+                                configKey,
+                                new ServiceLoaderProviderSource<>(serviceLoader),
+                                providerType,
+                                configType,
+                                settings,
+                                existingInstances);
     }
 
     static <S extends NamedService,
@@ -188,47 +210,36 @@ final class ProvidedUtil {
             boolean allFromRegistry,
             List<S> existingValues) {
 
-        // type and name is a unique identification of a service - for services already defined on the builder
-        // do not add them from configuration (as this would duplicate service instances)
-        Set<TypeAndName> ignoredServices = new HashSet<>();
-        existingValues.forEach(it -> ignoredServices.add(new TypeAndName(it.type(), it.name())));
+        return discoverServices(config,
+                                configKey,
+                                serviceRegistry,
+                                providerType,
+                                configType,
+                                ProviderSettings.create(Identity.TYPE_AND_NAME,
+                                                        ConfigForm.AUTO,
+                                                        allFromRegistry),
+                                existingValues);
+    }
 
-        boolean discoverServices = config.get(configKey + "-discover-services").asBoolean().orElse(allFromRegistry);
-        Config providersConfig = config.get(configKey);
+    static <S extends NamedService,
+            T extends ConfiguredProvider<S>> List<S> discoverServices(Config config,
+            String configKey,
+            Optional<ServiceRegistry> serviceRegistry,
+            Class<T> providerType,
+            Class<S> configType,
+            ProviderSettings settings,
+            List<S> existingValues) {
 
-        List<ConfiguredService> configuredServices = new ArrayList<>();
-
-        // all child nodes of the current node
-        List<Config> serviceConfigList = providersConfig.asNodeList()
-                .orElseGet(List::of);
-        boolean isList = providersConfig.isList();
-
-        for (Config serviceConfig : serviceConfigList) {
-            configuredServices.add(configuredService(serviceConfig, isList));
-        }
-        RegistryWrap wrap = serviceRegistry.isPresent()
-                ? new RealRegistry(serviceRegistry.get())
-                : StaticAccessRegistry.INSTANCE;
-
-        // now we have all service configurations, we can start building up instances
-        if (providersConfig.isList()) {
-            // driven by order of declaration in config
-            return servicesFromList(wrap,
-                                    providerType,
-                                    configType,
-                                    configuredServices,
-                                    discoverServices,
-                                    ignoredServices);
-        } else {
-            // driven by service loader order
-            return servicesFromObject(providersConfig,
-                                      wrap,
-                                      providerType,
-                                      configType,
-                                      configuredServices,
-                                      discoverServices,
-                                      ignoredServices);
-        }
+        ProviderSource<S, T> providerSource = serviceRegistry
+                .<ProviderSource<S, T>>map(registry -> new RegistryProviderSource<>(registry, providerType))
+                .orElseGet(() -> new StaticProviderSource<>(providerType));
+        return discoverServices(config,
+                                configKey,
+                                providerSource,
+                                providerType,
+                                configType,
+                                settings,
+                                existingValues);
     }
 
     static <S extends NamedService,
@@ -241,9 +252,34 @@ final class ProvidedUtil {
             boolean discoverServices,
             Optional<S> existingValue) {
 
+        return discoverService(config,
+                               configKey,
+                               serviceRegistry,
+                               providerType,
+                               configType,
+                               ProviderSettings.create(Identity.TYPE_AND_NAME,
+                                                       ConfigForm.AUTO,
+                                                       discoverServices),
+                               existingValue);
+    }
+
+    static <S extends NamedService,
+            T extends ConfiguredProvider<S>> Optional<S> discoverService(
+            Config config,
+            String configKey,
+            Optional<ServiceRegistry> serviceRegistry,
+            Class<T> providerType,
+            Class<S> configType,
+            ProviderSettings settings,
+            Optional<S> existingValue) {
+
         // there is an explicit configuration for this service, ignore configuration
         if (existingValue.isPresent()) {
             return Optional.empty();
+        }
+
+        if (settings.validateConfig()) {
+            validateProviderConfig(config.get(configKey), settings.identity(), settings.configForm());
         }
 
         // all child nodes of the current node
@@ -261,130 +297,72 @@ final class ProvidedUtil {
                                             serviceRegistry,
                                             providerType,
                                             configType,
-                                            discoverServices,
+                                            settings.withoutConfigValidation(),
                                             List.of());
 
         return services.isEmpty() ? Optional.empty() : Optional.of(services.getFirst());
     }
 
     private static <S extends NamedService,
-            T extends ConfiguredProvider<S>> List<S> servicesFromObject(
-            Config providersConfig,
-            HelidonServiceLoader<T> serviceLoader,
+            T extends ConfiguredProvider<S>> List<S> discoverServices(
+            Config config,
+            String configKey,
+            ProviderSource<S, T> providerSource,
             Class<T> providerType,
             Class<S> configType,
-            List<ConfiguredService> configuredServices,
-            boolean allFromServiceLoader,
-            Set<TypeAndName> ignoredServices) {
+            ProviderSettings settings,
+            List<S> existingValues) {
 
-        // order is determined by service loader
-        Set<String> availableProviders = new HashSet<>();
-        Map<String, ConfiguredService> allConfigs = new HashMap<>();
-        configuredServices.forEach(it -> allConfigs.put(it.typeAndName().type, it));
-        Set<String> unusedConfigs = new HashSet<>(allConfigs.keySet());
+        // Do not add a configured or discovered service whose selected identity is already present on the builder.
+        Set<TypeAndName> ignoredServices = existingIdentities(configKey, settings.identity(), existingValues);
 
-        List<S> result = new ArrayList<>();
-
-        serviceLoader.forEach(provider -> {
-            ConfiguredService configuredService = allConfigs.get(provider.configKey());
-            availableProviders.add(provider.configKey());
-            unusedConfigs.remove(provider.configKey());
-            if (configuredService == null) {
-                if (allFromServiceLoader) {
-                    // even though the specific key does not exist, we want to have the real config tree, so we can get to the
-                    // root of it
-                    // when there is no configuration, the name defaults to the type
-                    String type = provider.configKey();
-                    if (ignoredServices.add(new TypeAndName(type, type))) {
-                        result.add(provider.create(providersConfig.get(type), type));
-                    } else {
-                        if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
-                            PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + new TypeAndName(type, type)
-                                    + " is already added in builder, ignoring configured one.");
-                        }
-                    }
-                }
-            } else {
-                if (configuredService.enabled()) {
-                    if (ignoredServices.add(configuredService.typeAndName())) {
-                        result.add(provider.create(configuredService.serviceConfig(),
-                                                   configuredService.typeAndName().name()));
-                    } else {
-                        if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
-                            PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + configuredService.typeAndName()
-                                    + " is already added in builder, ignoring configured one.");
-                        }
-                    }
-                }
-            }
-        });
-        if (!unusedConfigs.isEmpty()) {
-            throw new ConfigException("Unknown provider configured. Expected providers with types: " + unusedConfigs
-                                              + ", but only the following providers are supported: " + availableProviders
-                                              + ", provider interface: " + providerType.getName()
-                                              + ", configured service: " + configType.getName());
+        boolean discoverServices = config.get(configKey + "-discover-services")
+                .asBoolean()
+                .orElse(settings.discoverServices());
+        Config providersConfig = config.get(configKey);
+        if (settings.validateConfig()) {
+            validateProviderConfig(providersConfig, settings.identity(), settings.configForm());
         }
-        return result;
+
+        List<ConfiguredService> configuredServices = new ArrayList<>();
+
+        // all child nodes of the current node
+        List<Config> serviceConfigList = providersConfig.asNodeList()
+                .orElseGet(List::of);
+        boolean isList = providersConfig.isList();
+
+        for (Config serviceConfig : serviceConfigList) {
+            configuredServices.add(configuredService(serviceConfig, isList, settings.identity()));
+        }
+
+        // now we have all service configurations, we can start building up instances
+        if (providersConfig.isList()) {
+            // driven by order of declaration in config
+            return servicesFromList(providerSource,
+                                    providerType,
+                                    configType,
+                                    configuredServices,
+                                    discoverServices,
+                                    ignoredServices);
+        }
+
+        // driven by provider source order
+        return servicesFromObject(providersConfig,
+                                  providerSource,
+                                  providerType,
+                                  configType,
+                                  configuredServices,
+                                  discoverServices,
+                                  ignoredServices);
     }
 
-    private static <S extends NamedService,
-            T extends ConfiguredProvider<S>> List<S> servicesFromList(
-            HelidonServiceLoader<T> serviceLoader,
-            Class<T> providerType,
-            Class<S> configType,
-            List<ConfiguredService> configuredServices,
-            boolean allFromServiceLoader,
-            Set<TypeAndName> ignoredServices) {
-
-        Map<String, T> allProvidersByType = new HashMap<>();
-        Map<String, T> unusedProvidersByType = new LinkedHashMap<>();
-        serviceLoader.forEach(it -> {
-            allProvidersByType.putIfAbsent(it.configKey(), it);
-            unusedProvidersByType.putIfAbsent(it.configKey(), it);
-        });
-
-        List<S> result = new ArrayList<S>();
-
-        // first add all configured
-        for (ConfiguredService service : configuredServices) {
-            TypeAndName typeAndName = service.typeAndName();
-            if (!ignoredServices.add(typeAndName)) {
-                unusedProvidersByType.remove(typeAndName.type());
-
-                if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
-                    PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + typeAndName
-                            + " is already added in builder, ignoring configured one.");
-                }
-
-                continue;
-            }
-            T provider = allProvidersByType.get(typeAndName.type());
-            if (provider == null) {
-                throw new ConfigException("Unknown provider configured. Expecting a provider with type \"" + typeAndName.type()
-                                                  + "\", but only the following providers are supported: "
-                                                  + allProvidersByType.keySet() + ", "
-                                                  + "provider interface: " + providerType.getName()
-                                                  + ", configured service: " + configType.getName());
-            }
-            unusedProvidersByType.remove(typeAndName.type());
-            if (service.enabled()) {
-                result.add(provider.create(service.serviceConfig(), typeAndName.name()));
-            }
+    private static ConfiguredService configuredService(Config serviceConfig, boolean isList, Identity identity) {
+        if (identity == Identity.TYPE_ONLY && !isList) {
+            String type = serviceConfig.name();
+            boolean enabled = !serviceConfig.isObject()
+                    || serviceConfig.get(KEY_SERVICE_ENABLED).asBoolean().orElse(true);
+            return new ConfiguredService(new TypeAndName(type, type), serviceConfig, enabled);
         }
-
-        // then (if desired) add the rest
-        if (allFromServiceLoader) {
-            unusedProvidersByType.forEach((type, provider) -> {
-                if (ignoredServices.add(new TypeAndName(type, type))) {
-                    result.add(provider.create(Config.empty(), type));
-                }
-            });
-        }
-
-        return result;
-    }
-
-    private static ConfiguredService configuredService(Config serviceConfig, boolean isList) {
         if (isList) {
             // order is significant
             String type = serviceConfig.get(KEY_SERVICE_TYPE).asString().orElse(null);
@@ -416,19 +394,134 @@ final class ProvidedUtil {
         return new ConfiguredService(new TypeAndName(type, name), serviceConfig, enabled);
     }
 
+    static void validateProviderConfig(Config providersConfig, Identity identity, ConfigForm configForm) {
+        if (!providersConfig.exists()) {
+            return;
+        }
+
+        ConfigForm resolvedForm = configForm == ConfigForm.AUTO
+                ? identity == Identity.TYPE_ONLY ? ConfigForm.OBJECT : ConfigForm.OBJECT_OR_LIST
+                : configForm;
+
+        switch (resolvedForm) {
+        case OBJECT -> {
+            if (!providersConfig.isObject()) {
+                throw new ConfigException("Configured providers at " + providersConfig.key()
+                                                  + " must use object form");
+            }
+        }
+        case LIST -> {
+            if (!providersConfig.isList()) {
+                throw new ConfigException("Configured providers at " + providersConfig.key()
+                                                  + " must use list form");
+            }
+        }
+        case OBJECT_OR_LIST -> {
+            if (!providersConfig.isObject() && !providersConfig.isList()) {
+                throw new ConfigException("Configured providers at " + providersConfig.key()
+                                                  + " must use object or list form");
+            }
+        }
+        default -> throw new IllegalStateException("Unexpected resolved provider configuration form: " + resolvedForm);
+        }
+
+        if (providersConfig.isList()) {
+            if (identity == Identity.TYPE_ONLY) {
+                validateTypeOnlyList(providersConfig);
+            } else {
+                validateTypeAndNameList(providersConfig);
+            }
+        } else if (identity == Identity.TYPE_ONLY) {
+            validateTypeOnlyObject(providersConfig);
+        }
+    }
+
+    private static void validateTypeAndNameList(Config providersConfig) {
+        Set<TypeAndName> configuredIdentities = new HashSet<>();
+        for (Config serviceConfig : providersConfig.asNodeList().orElseGet(List::of)) {
+            TypeAndName identity = configuredService(serviceConfig, true, Identity.TYPE_AND_NAME).typeAndName();
+            if (!configuredIdentities.add(identity)) {
+                throw new ConfigException("Duplicate configured provider identity at " + providersConfig.key()
+                                                  + ": type \"" + identity.type()
+                                                  + "\", name \"" + identity.name() + "\"");
+            }
+        }
+    }
+
+    private static void validateTypeOnlyObject(Config providersConfig) {
+        for (Config serviceConfig : providersConfig.asNodeList().orElseGet(List::of)) {
+            if (!serviceConfig.isObject()) {
+                continue;
+            }
+            if (serviceConfig.get(KEY_SERVICE_TYPE).exists()) {
+                throw new ConfigException("Configured provider \"" + serviceConfig.name()
+                                                  + "\" must not declare \"type\" when provider identity is TYPE_ONLY; "
+                                                  + "the object key is the provider type");
+            }
+            if (serviceConfig.get(KEY_SERVICE_NAME).exists()) {
+                throw new ConfigException("Configured provider \"" + serviceConfig.name()
+                                                  + "\" must not declare \"name\" when provider identity is TYPE_ONLY; "
+                                                  + "provider type is the sole identity");
+            }
+        }
+    }
+
+    private static void validateTypeOnlyList(Config providersConfig) {
+        Set<String> configuredTypes = new HashSet<>();
+        for (Config serviceConfig : providersConfig.asNodeList().orElseGet(List::of)) {
+            if (!serviceConfig.isObject()) {
+                throw new ConfigException("Configured provider list entries at " + providersConfig.key()
+                                                  + " must declare \"type\" when provider identity is TYPE_ONLY");
+            }
+            if (serviceConfig.get(KEY_SERVICE_NAME).exists()) {
+                throw new ConfigException("Configured provider list entries at " + providersConfig.key()
+                                                  + " must not declare \"name\" when provider identity is TYPE_ONLY; "
+                                                  + "provider type is the sole identity");
+            }
+            String type = serviceConfig.get(KEY_SERVICE_TYPE)
+                    .asString()
+                    .filter(it -> !it.isBlank())
+                    .orElseThrow(() -> new ConfigException("Configured provider list entries at " + providersConfig.key()
+                                                                  + " must declare \"type\" when provider identity is "
+                                                                  + "TYPE_ONLY"));
+            if (!configuredTypes.add(type)) {
+                throw new ConfigException("Duplicate configured provider type \"" + type + "\" at "
+                                                  + providersConfig.key()
+                                                  + "; provider identity TYPE_ONLY permits one instance per type");
+            }
+        }
+    }
+
+    private static <S extends NamedService> Set<TypeAndName> existingIdentities(String configKey,
+                                                                                Identity identity,
+                                                                                List<S> existingValues) {
+        Set<TypeAndName> identities = new HashSet<>();
+        for (S existingValue : existingValues) {
+            TypeAndName configuredIdentity = identity == Identity.TYPE_ONLY
+                    ? new TypeAndName(existingValue.type(), existingValue.type())
+                    : new TypeAndName(existingValue.type(), existingValue.name());
+            if (!identities.add(configuredIdentity) && identity == Identity.TYPE_ONLY) {
+                throw new ConfigException("Multiple configured provider instances of type \"" + existingValue.type()
+                                                  + "\" exist for " + configKey
+                                                  + "; provider identity TYPE_ONLY permits one instance per type");
+            }
+        }
+        return identities;
+    }
+
     private static <S extends NamedService,
             T extends ConfiguredProvider<S>> List<S> servicesFromList(
-            RegistryWrap serviceRegistry,
+            ProviderSource<S, T> providerSource,
             Class<T> providerType,
             Class<S> configType,
             List<ConfiguredService> configuredServices,
-            boolean allFromServiceLoader,
+            boolean discoverServices,
             Set<TypeAndName> ignoredServices) {
 
         Map<String, T> allProvidersByType = new HashMap<>();
         Map<String, T> unusedProvidersByType = new LinkedHashMap<>();
 
-        serviceRegistry.all(providerType)
+        providerSource.all()
                 .forEach(provider -> {
                     allProvidersByType.putIfAbsent(provider.configKey(), provider);
                     unusedProvidersByType.putIfAbsent(provider.configKey(), provider);
@@ -459,15 +552,15 @@ final class ProvidedUtil {
             }
             unusedProvidersByType.remove(typeAndName.type());
             if (service.enabled()) {
-                result.add(provider.create(service.serviceConfig(), typeAndName.name()));
+                result.add(providerSource.create(provider, service.serviceConfig(), typeAndName.name()));
             }
         }
 
         // then (if desired) add the rest
-        if (allFromServiceLoader) {
+        if (discoverServices) {
             unusedProvidersByType.forEach((type, provider) -> {
                 if (ignoredServices.add(new TypeAndName(type, type))) {
-                    result.add(provider.create(Config.empty(), type));
+                    result.add(providerSource.create(provider, Config.empty(), type));
                 }
             });
         }
@@ -478,34 +571,35 @@ final class ProvidedUtil {
     private static <S extends NamedService,
             T extends ConfiguredProvider<S>> List<S> servicesFromObject(
             Config providersConfig,
-            RegistryWrap serviceRegistry,
+            ProviderSource<S, T> providerSource,
             Class<T> providerType,
             Class<S> configType,
             List<ConfiguredService> configuredServices,
-            boolean allFromServiceLoader,
+            boolean discoverServices,
             Set<TypeAndName> ignoredServices) {
 
-        // order is determined by service loader
+        // Object configuration has no ordering contract; providers determine the result grouping order.
         Set<String> availableProviders = new HashSet<>();
-        Map<String, ConfiguredService> allConfigs = new HashMap<>();
-        configuredServices.forEach(it -> allConfigs.put(it.typeAndName().type, it));
+        Map<String, List<ConfiguredService>> allConfigs = new HashMap<>();
+        configuredServices.forEach(it -> allConfigs.computeIfAbsent(it.typeAndName().type, _ -> new ArrayList<>())
+                .add(it));
         Set<String> unusedConfigs = new HashSet<>(allConfigs.keySet());
 
         List<S> result = new ArrayList<>();
 
-        List<T> all = serviceRegistry.all(providerType);
+        List<T> all = providerSource.all();
         for (T provider : all) {
-            ConfiguredService configuredService = allConfigs.get(provider.configKey());
+            List<ConfiguredService> providerConfigs = allConfigs.get(provider.configKey());
             availableProviders.add(provider.configKey());
             unusedConfigs.remove(provider.configKey());
-            if (configuredService == null) {
-                if (allFromServiceLoader) {
+            if (providerConfigs == null) {
+                if (discoverServices) {
                     // even though the specific key does not exist, we want to have the real config tree, so we can get to the
                     // root of it
                     // when there is no configuration, the name defaults to the type
                     String type = provider.configKey();
                     if (ignoredServices.add(new TypeAndName(type, type))) {
-                        result.add(provider.create(providersConfig.get(type), type));
+                        result.add(providerSource.create(provider, providersConfig.get(type), type));
                     } else {
                         if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
                             PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + new TypeAndName(type, type)
@@ -514,14 +608,17 @@ final class ProvidedUtil {
                     }
                 }
             } else {
-                if (configuredService.enabled()) {
-                    if (ignoredServices.add(configuredService.typeAndName())) {
-                        result.add(provider.create(configuredService.serviceConfig(),
-                                                   configuredService.typeAndName().name()));
-                    } else {
-                        if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
-                            PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + configuredService.typeAndName()
-                                    + " is already added in builder, ignoring configured one.");
+                for (ConfiguredService configuredService : providerConfigs) {
+                    if (configuredService.enabled()) {
+                        if (ignoredServices.add(configuredService.typeAndName())) {
+                            result.add(providerSource.create(provider,
+                                                             configuredService.serviceConfig(),
+                                                             configuredService.typeAndName().name()));
+                        } else {
+                            if (PROVIDER_LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
+                                PROVIDER_LOGGER.log(System.Logger.Level.DEBUG, "Service: " + configuredService.typeAndName()
+                                        + " is already added in builder, ignoring configured one.");
+                            }
                         }
                     }
                 }
@@ -537,8 +634,10 @@ final class ProvidedUtil {
         return result;
     }
 
-    private interface RegistryWrap {
-        <T> List<T> all(Class<T> type);
+    private interface ProviderSource<S extends NamedService, T extends ConfiguredProvider<S>> {
+        List<T> all();
+
+        S create(T provider, Config config, String name);
     }
 
     private record TypeAndName(String type, String name) {
@@ -547,25 +646,85 @@ final class ProvidedUtil {
     private record ConfiguredService(TypeAndName typeAndName, Config serviceConfig, boolean enabled) {
     }
 
-    private static final class StaticAccessRegistry implements RegistryWrap {
-        private static final StaticAccessRegistry INSTANCE = new StaticAccessRegistry();
+    private record WeightedProvider<T>(T provider, double weight) implements Weighted {
+    }
+
+    private static final class ServiceLoaderProviderSource<S extends NamedService, T extends ConfiguredProvider<S>>
+            implements ProviderSource<S, T> {
+        private final HelidonServiceLoader<T> serviceLoader;
+
+        private ServiceLoaderProviderSource(HelidonServiceLoader<T> serviceLoader) {
+            this.serviceLoader = serviceLoader;
+        }
 
         @Override
-        public <T> List<T> all(Class<T> type) {
-            return Services.all(type);
+        public List<T> all() {
+            return serviceLoader.asList();
+        }
+
+        @Override
+        public S create(T provider, Config config, String name) {
+            return provider.create(config, name);
         }
     }
 
-    private static final class RealRegistry implements RegistryWrap {
-        private final ServiceRegistry serviceRegistry;
+    private static final class StaticProviderSource<S extends NamedService, T extends ConfiguredProvider<S>>
+            implements ProviderSource<S, T> {
+        private final Class<T> providerType;
 
-        private RealRegistry(ServiceRegistry serviceRegistry) {
-            this.serviceRegistry = serviceRegistry;
+        private StaticProviderSource(Class<T> providerType) {
+            this.providerType = providerType;
         }
 
         @Override
-        public <T> List<T> all(Class<T> type) {
-            return serviceRegistry.all(type);
+        public List<T> all() {
+            Map<String, WeightedProvider<T>> providers = new LinkedHashMap<>();
+            HelidonServiceLoader.create(providerType)
+                    .forEach(provider -> {
+                        double weight = Weights.find(provider, Weighted.DEFAULT_WEIGHT);
+                        providers.putIfAbsent(provider.configKey(), new WeightedProvider<>(provider, weight));
+            });
+            Map<String, WeightedProvider<T>> registryProviders = new LinkedHashMap<>();
+            List<ServiceInstance<T>> registryProviderInstances = GlobalServiceRegistry.registry()
+                    .lookupInstances(Lookup.create(providerType));
+            for (ServiceInstance<T> providerInstance : registryProviderInstances) {
+                T provider = providerInstance.get();
+                registryProviders.putIfAbsent(provider.configKey(),
+                                              new WeightedProvider<>(provider, providerInstance.weight()));
+            }
+            providers.putAll(registryProviders);
+
+            List<WeightedProvider<T>> sortedProviders = new ArrayList<>(providers.values());
+            Weights.sort(sortedProviders);
+            return sortedProviders.stream()
+                    .map(WeightedProvider::provider)
+                    .toList();
+        }
+
+        @Override
+        public S create(T provider, Config config, String name) {
+            return provider.create(config, name);
+        }
+    }
+
+    private static final class RegistryProviderSource<S extends NamedService, T extends ConfiguredProvider<S>>
+            implements ProviderSource<S, T> {
+        private final ServiceRegistry serviceRegistry;
+        private final Class<T> providerType;
+
+        private RegistryProviderSource(ServiceRegistry serviceRegistry, Class<T> providerType) {
+            this.serviceRegistry = serviceRegistry;
+            this.providerType = providerType;
+        }
+
+        @Override
+        public List<T> all() {
+            return serviceRegistry.all(providerType);
+        }
+
+        @Override
+        public S create(T provider, Config config, String name) {
+            return provider.create(config, name, serviceRegistry);
         }
     }
 }

@@ -17,14 +17,15 @@ package io.helidon.webclient.metrics;
 
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import io.helidon.config.Config;
 import io.helidon.http.Method;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.service.registry.Services;
 import io.helidon.webclient.api.WebClientServiceRequest;
 import io.helidon.webclient.api.WebClientServiceResponse;
 import io.helidon.webclient.spi.WebClientService;
@@ -33,6 +34,7 @@ abstract class WebClientMetric implements WebClientService {
 
     private static final int ERROR_STATUS_CODE = 400;
 
+    private final MetricsFactory metricsFactory;
     private final MeterRegistry registry;
     private final Set<String> methods;
     private final String nameFormat;
@@ -41,7 +43,10 @@ abstract class WebClientMetric implements WebClientService {
     private final boolean errors;
 
     WebClientMetric(Builder builder) {
-        this.registry = Metrics.globalRegistry();
+        this.registry = builder.meterRegistry == null
+                ? Services.get(MeterRegistry.class)
+                : builder.meterRegistry;
+        this.metricsFactory = registry.metricsFactory();
         this.methods = builder.methods;
         this.nameFormat = builder.nameFormat;
         this.description = builder.description;
@@ -60,6 +65,10 @@ abstract class WebClientMetric implements WebClientService {
 
     MeterRegistry meterRegistry() {
         return registry;
+    }
+
+    MetricsFactory metricsFactory() {
+        return metricsFactory;
     }
 
     Set<String> methods() {
@@ -129,29 +138,30 @@ abstract class WebClientMetric implements WebClientService {
     public static final class Builder implements io.helidon.common.Builder<Builder, WebClientMetric> {
 
         private final WebClientMetricType type;
-        private Set<String> methods = Collections.emptySet();
+        private Set<String> methods = Set.of();
         private String nameFormat;
         private String description;
         private boolean success = true;
         private boolean errors = true;
+        private MeterRegistry meterRegistry;
 
         private Builder(WebClientMetricType type) {
             this.type = type;
         }
 
         /**
-         * Adds metric supported methods.
+         * Adds exact, case-sensitive HTTP methods supported by the metric.
          *
          * @param methods metric supported methods
          * @return updated builder instance
          */
         public Builder methods(String... methods) {
-            this.methods = Arrays.stream(methods).map(String::toUpperCase).collect(Collectors.toSet());
+            this.methods = Set.copyOf(Arrays.asList(methods));
             return this;
         }
 
         /**
-         * Adds metric supported methods.
+         * Adds exact, case-sensitive HTTP methods supported by the metric.
          *
          * @param methods metric supported methods
          * @return updated builder instance
@@ -159,21 +169,18 @@ abstract class WebClientMetric implements WebClientService {
         public Builder methods(Method... methods) {
             this.methods = Arrays.stream(methods)
                                  .map(Method::text)
-                                 .map(String::toUpperCase)
                                  .collect(Collectors.toSet());
             return this;
         }
 
         /**
-         * Adds metric supported methods.
+         * Adds exact, case-sensitive HTTP methods supported by the metric.
          *
          * @param methods metric supported methods
          * @return updated builder instance
          */
         public Builder methods(Collection<String> methods) {
-            this.methods = methods.stream()
-                                  .map(String::toUpperCase)
-                                  .collect(Collectors.toSet());
+            this.methods = Set.copyOf(methods);
             return this;
         }
 
@@ -221,6 +228,11 @@ abstract class WebClientMetric implements WebClientService {
             return this;
         }
 
+        Builder meterRegistry(MeterRegistry meterRegistry) {
+            this.meterRegistry = Objects.requireNonNull(meterRegistry);
+            return this;
+        }
+
         /**
          * Configure a metric from configuration.
          * The following configuration key are used:
@@ -230,6 +242,11 @@ abstract class WebClientMetric implements WebClientService {
          *     <th>key</th>
          *     <th>default</th>
          *     <th>description</th>
+         * </tr>
+         * <tr>
+         *     <td>methods</td>
+         *     <td>All methods</td>
+         *     <td>HTTP methods for which this metric is applied</td>
          * </tr>
          * <tr>
          *     <td>errors</td>

@@ -18,15 +18,25 @@ package io.helidon.webclient.http2;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -34,9 +44,15 @@ import io.helidon.common.LazyValue;
 import io.helidon.common.configurable.Resource;
 import io.helidon.common.pki.Keys;
 import io.helidon.common.tls.Tls;
+import io.helidon.common.tls.TlsMaterial;
 import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.Status;
+import io.helidon.http.http2.Http2LoggingFrameListener;
+import io.helidon.webclient.api.Proxy;
+import io.helidon.webclient.api.ResolvedClientTarget;
+import io.helidon.webclient.api.WebClient;
+import io.helidon.webclient.http1.Http1Client;
 import io.helidon.webserver.WebServer;
 import io.helidon.webserver.WebServerConfig;
 import io.helidon.webserver.http.HttpRouting;
@@ -48,6 +64,7 @@ import io.helidon.webserver.testing.junit5.ServerTest;
 import io.helidon.webserver.testing.junit5.SetUpServer;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -57,7 +74,13 @@ import static io.helidon.http.Method.GET;
 import static io.helidon.http.Method.POST;
 import static io.helidon.http.Method.PUT;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.startsWith;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 
 @ServerTest
 class Http2WebClientTest {
@@ -66,9 +89,12 @@ class Http2WebClientTest {
     private static final HeaderName SERVER_CUSTOM_HEADER_NAME = HeaderNames.create("server-custom-header");
     private static final HeaderName SERVER_HEADER_FROM_PARAM_NAME = HeaderNames.create("header-from-param");
     private static final HeaderName CLIENT_USER_AGENT_HEADER_NAME = HeaderNames.create("client-user-agent");
+    private static final String CLIENT_SEND_LOGGER_NAME = Http2LoggingFrameListener.class.getName() + ".cl-send";
+    private static final String FINAL_TLS_SOCKET = "final-https";
     private static ExecutorService executorService;
     private static int plainPort;
     private static int tlsPort;
+    private static int finalTlsPort;
     private static Supplier<Http2Client> localCacheClient = () -> Http2Client.builder()
             .shareConnectionCache(false)
             .connectTimeout(Duration.ofMinutes(10))
@@ -104,6 +130,7 @@ class Http2WebClientTest {
     Http2WebClientTest(WebServer server) {
         plainPort = server.port();
         tlsPort = server.port("https");
+        finalTlsPort = server.port(FINAL_TLS_SOCKET);
     }
 
     @SetUpServer
@@ -130,6 +157,12 @@ class Http2WebClientTest {
                     res.header(SERVER_HEADER_FROM_PARAM_NAME, req.query().get("custQueryParam"));
                     res.send("HTTP/2 route");
                 }))
+                .route(Http2Route.route(GET,
+                                        "/connection-target",
+                                        (req, res) -> res.send(req.requestedUri().host() + "|" + req.socketId())))
+                .route(Http2Route.route(GET,
+                                        "/generic-retarget",
+                                        (req, res) -> res.send("bootstrap|" + req.socketId())))
                 .route(Http2Route.route(PUT, "/versionspecific", (req, res) -> {
                     res.header(SERVER_CUSTOM_HEADER_NAME, req.headers().get(CLIENT_CUSTOM_HEADER_NAME).get());
                     res.header(CLIENT_USER_AGENT_HEADER_NAME, req.headers().get(USER_AGENT).get());
@@ -174,6 +207,11 @@ class Http2WebClientTest {
                     }
                 }));
 
+        HttpRouting.Builder finalTlsRouter = HttpRouting.builder()
+                .route(Http2Route.route(GET,
+                                        "/generic-retarget",
+                                        (req, res) -> res.send("final|" + req.socketId())));
+
         serverBuilder
                 .port(-1)
                 .host("localhost")
@@ -189,9 +227,13 @@ class Http2WebClientTest {
                                 .socketReceiveBufferSize(4096))
                         .backlog(8192)
                 )
+                .putSocket(FINAL_TLS_SOCKET, builder -> builder.port(-1)
+                        .host("localhost")
+                        .tls(tls))
                 .routing(router)
                 // we want the same routing on the other socket
-                .routing("https", router.copy());
+                .routing("https", router.copy())
+                .routing(FINAL_TLS_SOCKET, finalTlsRouter);
     }
 
     static Stream<Arguments> clientTypes() {
@@ -275,6 +317,94 @@ class Http2WebClientTest {
         }
     }
 
+    @Test
+    void sharedCachedConnectionUsesCurrentClientStreamLogConfig() {
+        Logger logger = Logger.getLogger(CLIENT_SEND_LOGGER_NAME);
+        Level previousLevel = logger.getLevel();
+        boolean previousUseParentHandlers = logger.getUseParentHandlers();
+        List<String> messages = new CopyOnWriteArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                messages.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+        logger.setLevel(Level.FINER);
+
+        try {
+            String baseUri = "http://127.0.0.1:" + plainPort + "/versionspecific";
+            Http2Client unsafeClient = Http2Client.builder()
+                    .shareConnectionCache(true)
+                    .baseUri(baseUri)
+                    .protocolConfig(it -> it.priorKnowledge(true)
+                            .log(log -> log.unsafeRawData(true)))
+                    .build();
+            try (Http2ClientResponse response = unsafeClient.method(POST)
+                    .queryParam("custQueryParam", "warmup")
+                    .header(CLIENT_CUSTOM_HEADER_NAME, "warmup")
+                    .submit("warmup")) {
+                assertThat(response.status(), is(Status.OK_200));
+            }
+            messages.clear();
+
+            Http2Client safeClient = Http2Client.builder()
+                    .shareConnectionCache(true)
+                    .baseUri(baseUri)
+                    .protocolConfig(it -> it.priorKnowledge(true))
+                    .build();
+            try (Http2ClientResponse response = safeClient.method(POST)
+                    .queryParam("custQueryParam", "submit")
+                    .header(CLIENT_CUSTOM_HEADER_NAME, "submit")
+                    .header(HeaderNames.AUTHORIZATION, "Bearer safe-client-token")
+                    .submit("safe-client-body")) {
+                assertThat(response.status(), is(Status.OK_200));
+            }
+
+            String submitMessages = String.join("\n", messages);
+            assertThat(submitMessages, containsString(":method: POST"));
+            assertThat(submitMessages, containsString(":path: /versionspecific"));
+            assertThat(submitMessages, containsString("Authorization: <redacted>"));
+            assertThat(submitMessages, not(containsString("Bearer safe-client-token")));
+            assertThat(submitMessages, not(containsString("safe-client-body")));
+            messages.clear();
+
+            try (Http2ClientResponse response = safeClient.method(POST)
+                    .queryParam("custQueryParam", "output-stream")
+                    .header(CLIENT_CUSTOM_HEADER_NAME, "output-stream")
+                    .header(HeaderNames.AUTHORIZATION, "Bearer safe-stream-token")
+                    .outputStream(out -> {
+                        out.write("safe-stream-body".getBytes(StandardCharsets.UTF_8));
+                        out.close();
+                    })) {
+                assertThat(response.status(), is(Status.OK_200));
+            }
+
+            String outputStreamMessages = String.join("\n", messages);
+            assertThat(outputStreamMessages, containsString(":method: POST"));
+            assertThat(outputStreamMessages, containsString(":path: /versionspecific"));
+            assertThat(outputStreamMessages, containsString("Authorization: <redacted>"));
+            assertThat(outputStreamMessages, not(containsString("Bearer safe-stream-token")));
+            assertThat(outputStreamMessages, not(containsString("safe-stream-body")));
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(previousLevel);
+            logger.setUseParentHandlers(previousUseParentHandlers);
+            handler.close();
+        }
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("clientTypes")
     void multiplexParallelStreamsGet(String clientType, Supplier<Http2Client> client)
@@ -348,5 +478,155 @@ class Http2WebClientTest {
                         .toList()
                         .toArray(new CompletableFuture[0])
         ).get(5, TimeUnit.MINUTES);
+    }
+
+    @Test
+    void serviceFinalTargetsSeparateAndReuseH2cConnections() {
+        Http2Client client = Http2Client.builder()
+                .shareConnectionCache(false)
+                .servicesDiscoverServices(false)
+                .dnsResolver((_, _) -> InetAddress.ofLiteral("127.0.0.1"))
+                .baseUri("http://bootstrap.example:" + plainPort + "/connection-target")
+                .addService((chain, request) -> {
+                    request.uri().host(request.properties().get("target-host"));
+                    return chain.proceed(request);
+                })
+                .build();
+
+        try {
+            String first = responseBody(client.get().property("target-host", "first.example"));
+            String second = responseBody(client.get().property("target-host", "second.example"));
+            String reused = responseBody(client.get().property("target-host", "first.example"));
+
+            assertThat(host(first), is("first.example"));
+            assertThat(host(second), is("second.example"));
+            assertThat(host(reused), is("first.example"));
+            assertThat(connectionId(reused), is(connectionId(first)));
+            assertThat(connectionId(second), not(is(connectionId(first))));
+        } finally {
+            client.closeResource();
+        }
+    }
+
+    @Test
+    void genericClientRetargetsAfterAlpnProtocolDiscovery() {
+        WebClient client = WebClient.builder()
+                .shareConnectionCache(false)
+                .servicesDiscoverServices(false)
+                .protocolPreference(List.of(Http2Client.PROTOCOL_ID, Http1Client.PROTOCOL_ID))
+                .baseUri("https://localhost:" + tlsPort + "/generic-retarget")
+                .tls(Tls.builder()
+                             .trust(trust -> trust
+                                     .keystore(store -> store
+                                             .passphrase("password")
+                                             .trustStore(true)
+                                             .keystore(Resource.create("client.p12"))))
+                             .build())
+                .addService((chain, request) -> {
+                    request.uri().port(finalTlsPort);
+                    return chain.proceed(request);
+                })
+                .build();
+
+        try {
+            String first = client.get().requestEntity(String.class);
+            String reused = client.get().requestEntity(String.class);
+
+            assertThat(first, startsWith("final|"));
+            assertThat(reused, startsWith("final|"));
+            assertThat(connectionId(reused), is(connectionId(first)));
+        } finally {
+            client.closeResource();
+        }
+    }
+
+    @Test
+    void reconnectUsesCurrentAddressBoundNoProxyTarget() throws IOException {
+        AtomicInteger resolutions = new AtomicInteger();
+        List<ResolvedClientTarget> targets = new CopyOnWriteArrayList<>();
+        List<Socket> sockets = new CopyOnWriteArrayList<>();
+        Proxy proxy = spy(Proxy.builder()
+                                  .host("proxy.example")
+                                  .port(8181)
+                                  .addNoProxy("192.0.2.1")
+                                  .addNoProxy("192.0.2.2")
+                                  .build());
+        doAnswer(invocation -> {
+            ResolvedClientTarget target = invocation.getArgument(1);
+            Socket socket = new Socket(InetAddress.ofLiteral("127.0.0.1"), plainPort);
+            targets.add(target);
+            sockets.add(socket);
+            return socket;
+        }).when(proxy).tcpSocket(any(), any(), any());
+
+        Http2Client client = Http2Client.builder()
+                .shareConnectionCache(false)
+                .servicesDiscoverServices(false)
+                .dnsResolver((_, _) -> resolutions.getAndIncrement() == 0
+                        ? InetAddress.ofLiteral("192.0.2.1")
+                        : InetAddress.ofLiteral("192.0.2.2"))
+                .proxy(proxy)
+                .baseUri("http://rotating.example:" + plainPort + "/versionspecific")
+                .protocolConfig(pc -> pc.priorKnowledge(true)
+                        .ping(true)
+                        .pingTimeout(Duration.ofSeconds(1)))
+                .build();
+
+        try {
+            assertThat(responseBody(client.get().queryParam("custQueryParam", "first")), is("HTTP/2 route"));
+            assertThat(sockets.size(), is(1));
+            assertThat(resolutions.get(), is(1));
+            assertThat(responseBody(client.get().queryParam("custQueryParam", "reused")), is("HTTP/2 route"));
+            assertThat(sockets.size(), is(1));
+            assertThat(targets.size(), is(1));
+            assertThat(resolutions.get(), is(1));
+
+            sockets.get(0).close();
+            assertThat(responseBody(client.get().queryParam("custQueryParam", "reconnected")), is("HTTP/2 route"));
+
+            assertThat(targets.size(), is(2));
+            assertThat(resolutions.get(), is(2));
+            ResolvedClientTarget first = targets.get(0);
+            ResolvedClientTarget second = targets.get(1);
+            assertThat(second.logicalTarget(), is(first.logicalTarget()));
+            assertThat(first.peerAddress().getAddress(), is(InetAddress.ofLiteral("192.0.2.1")));
+            assertThat(second.peerAddress().getAddress(), is(InetAddress.ofLiteral("192.0.2.2")));
+        } finally {
+            client.closeResource();
+        }
+    }
+
+    @Test
+    void tlsReloadRetiresPreviousTargetConnection() {
+        Tls tls = Tls.builder().trustAll(true).build();
+        Http2Client client = Http2Client.builder()
+                .shareConnectionCache(false)
+                .baseUri("https://localhost:" + tlsPort + "/connection-target")
+                .tls(tls)
+                .build();
+
+        try {
+            String first = responseBody(client.get());
+            tls.reload(TlsMaterial.builder().trustAll(true).build());
+            String reloaded = responseBody(client.get());
+
+            assertThat(connectionId(reloaded), not(is(connectionId(first))));
+        } finally {
+            client.closeResource();
+        }
+    }
+
+    private static String responseBody(Http2ClientRequest request) {
+        try (Http2ClientResponse response = request.request()) {
+            return response.as(String.class);
+        }
+    }
+
+    private static String host(String responseBody) {
+        return responseBody.substring(0, responseBody.indexOf('|'));
+    }
+
+    private static String connectionId(String responseBody) {
+        return responseBody.substring(responseBody.indexOf('|') + 1);
     }
 }

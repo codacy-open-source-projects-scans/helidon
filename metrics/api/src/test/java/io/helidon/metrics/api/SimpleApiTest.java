@@ -16,11 +16,15 @@
 package io.helidon.metrics.api;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
 import io.helidon.common.testing.junit5.OptionalMatcher;
 import io.helidon.config.Config;
+import io.helidon.metrics.spi.MetricsProgrammaticConfig;
+import io.helidon.service.registry.ServiceRegistry;
+import io.helidon.service.registry.Services;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -29,52 +33,101 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.sameInstance;
 
-@SuppressWarnings("removal")
 public class SimpleApiTest {
 
     private static final String COUNTER_1_DESC = "counter 1 description";
 
+    private static MetricsFactory metricsFactory;
+    private static MeterRegistry registry;
     private static Counter counter1;
     private static Counter counter2;
     private static Timer timer1;
 
     @BeforeAll
     static void prep() {
-        MeterRegistry registry = Metrics.globalRegistry();
+        metricsFactory = Services.get(MetricsFactory.class);
+        registry = Services.get(MeterRegistry.class);
         assertThat("Global registry", registry, notNullValue());
-        counter1 = Metrics.getOrCreate(Counter.builder("counter1")
-                                               .description(COUNTER_1_DESC));
-        counter2 = Metrics.getOrCreate(Counter.builder("counter2"));
+        counter1 = registry.getOrCreate(metricsFactory.counterBuilder("counter1")
+                                                .description(COUNTER_1_DESC));
+        counter2 = registry.getOrCreate(metricsFactory.counterBuilder("counter2"));
 
-        timer1 = Metrics.getOrCreate(Timer.builder("timer1")
-                                             .tags(Metrics.tags("t1", "v1",
-                                                                "t2", "v2"))
-                                             .maximumExpectedValue(Duration.ofSeconds(4)));
+        timer1 = registry.getOrCreate(metricsFactory.timerBuilder("timer1")
+                                           .tags(List.of(metricsFactory.tagCreate("t1", "v1"),
+                                                         metricsFactory.tagCreate("t2", "v2")))
+                                           .maximumExpectedValue(Duration.ofSeconds(4)));
     }
 
     @Test
     void testNoOpRegistrations() {
 
-        Optional<Counter> fetchedCounter = Metrics.getCounter("counter1");
+        Optional<Counter> fetchedCounter = registry.counter("counter1", Set.of());
         assertThat("Fetched counter 1", fetchedCounter, OptionalMatcher.optionalEmpty());
-        fetchedCounter = Metrics.getCounter("counter2", Set.of());
+        fetchedCounter = registry.counter("counter2", Set.of());
         assertThat("Fetched counter 2", fetchedCounter, OptionalMatcher.optionalEmpty());
 
-        Optional<Timer> fetchedTimer = Metrics.getTimer("timer1", Metrics.tags("t1", "v1",
-                                                                               "t2", "v2"));
+        Optional<Timer> fetchedTimer = registry.timer("timer1", List.of(metricsFactory.tagCreate("t1", "v1"),
+                                                                        metricsFactory.tagCreate("t2", "v2")));
         assertThat("Fetched timer", fetchedTimer, OptionalMatcher.optionalEmpty());
     }
 
     @Test
+    @SuppressWarnings("removal")
     void testConfig() {
         MetricsConfig metricsConfig = MetricsConfig.builder()
-                .scoping(ScopingConfig.builder())
+                .scoping(ScopingConfig.builder()
+                                 .defaultValue("legacy-default")
+                                 .tagName("legacy-scope"))
                 .build();
         ScopingConfig scopingConfig = metricsConfig.scoping();
-        assertThat("Scope tag name",
-                   scopingConfig.tagName(),
-                   OptionalMatcher.optionalValue(is(ScopingConfig.SCOPE_TAG_NAME_DEFAULT)));
+        assertThat(scopingConfig.tagName(), OptionalMatcher.optionalValue(is("legacy-scope")));
+        assertThat(scopingConfig.defaultValue(), OptionalMatcher.optionalValue(is("legacy-default")));
+        assertThat("Legacy scope does not affect enablement",
+                   metricsConfig.isMeterEnabled("counter", "legacy-default"),
+                   is(true));
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void testMeterScopeIsIgnored() {
+        Counter.Builder builder = metricsFactory.counterBuilder("scope-ignored");
+
+        assertThat(builder.scope("legacy-scope"), sameInstance(builder));
+        assertThat(builder.scope(), OptionalMatcher.optionalEmpty());
+        assertThat(registry.getOrCreate(builder).scope(), OptionalMatcher.optionalEmpty());
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void programmaticScopeOverridesAreIgnored() {
+        MetricsProgrammaticConfig programmaticConfig = new MetricsProgrammaticConfig() {
+            @Override
+            public Optional<String> scopeDefaultValue() {
+                return Optional.of("overridden-default");
+            }
+
+            @Override
+            public Optional<String> scopeTagName() {
+                return Optional.of("overridden-scope-tag");
+            }
+
+            @Override
+            public Optional<String> appTagName() {
+                return Optional.of("app-tag");
+            }
+        };
+        MetricsConfig result = programmaticConfig.apply(MetricsConfig.builder()
+                                                                  .scoping(ScopingConfig.builder()
+                                                                                   .defaultValue("legacy-default")
+                                                                                   .tagName("legacy-scope-tag")))
+                .build();
+
+        assertThat(result.scoping().defaultValue(), OptionalMatcher.optionalValue(is("legacy-default")));
+        assertThat(result.scoping().tagName(), OptionalMatcher.optionalValue(is("legacy-scope-tag")));
+        assertThat(result.appTagName(), OptionalMatcher.optionalValue(is("app-tag")));
+        assertThat(programmaticConfig.reservedTagNames(), is(Set.of("app-tag")));
     }
 
     @Test
@@ -82,9 +135,9 @@ public class SimpleApiTest {
         // This is a bit silly of a test, but it uses the create(config) method on the MetricsFactoryManager so checkstyle
         // won't complain.
         Config config = Config.empty();
-        MetricsFactory mf = MetricsFactoryManager.create(config);
+        MetricsFactory mf = MetricsFactoryManager.create(config, Services.get(ServiceRegistry.class));
 
-        MeterRegistry mr = mf.globalRegistry();
+        MeterRegistry mr = mf.createMeterRegistry(MetricsConfig.create());
         assertThat("No-op registry", mr.meters(), empty());
     }
 }

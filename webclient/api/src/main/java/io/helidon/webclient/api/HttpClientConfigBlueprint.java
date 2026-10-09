@@ -26,12 +26,14 @@ import java.util.concurrent.ExecutorService;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
+import io.helidon.common.Api;
 import io.helidon.common.media.type.ParserMode;
 import io.helidon.common.socket.SocketOptions;
 import io.helidon.common.uri.UriFragment;
 import io.helidon.common.uri.UriQuery;
 import io.helidon.http.ClientRequestHeaders;
 import io.helidon.http.Header;
+import io.helidon.http.HeaderName;
 import io.helidon.http.WritableHeaders;
 import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.MediaContext;
@@ -46,6 +48,7 @@ import io.helidon.webclient.spi.WebClientServiceProvider;
 @Prototype.Configured
 @Prototype.Blueprint(decorator = HttpClientConfigSupport.HttpBuilderDecorator.class)
 @Prototype.CustomMethods(HttpClientConfigSupport.HttpCustomMethods.class)
+@Prototype.RegistrySupport
 interface HttpClientConfigBlueprint extends HttpConfigBaseBlueprint {
     /**
      * Base uri used by the client in all requests.
@@ -58,10 +61,38 @@ interface HttpClientConfigBlueprint extends HttpConfigBaseBlueprint {
     /**
      * Base address used by the client in all requests.
      * This may be either an Inet address or a UNIX domain socket address.
+     * <p>
+     * A UNIX domain socket address overrides only the physical transport. The request URI resolved against
+     * {@link #baseUri()} or an absolute request URI still provides the logical HTTP authority used for the
+     * {@code Host} header, HTTP/2 {@code :authority}, SNI, and endpoint identification.
      *
      * @return base address of the client requests
      */
+    @Option.Configured
     Optional<SocketAddress> baseAddress();
+
+    /**
+     * Client-side TLS SNI configuration.
+     * <p>
+     * If this is not configured, WebClient preserves the configured {@link #tls()} SSL parameters and uses the JDK TLS
+     * defaults for SNI. If this is configured without an explicit {@code mode}, the resolved request URI host is used.
+     *
+     * @return SNI configuration
+     */
+    @Option.Configured
+    Optional<SniConfig> sni();
+
+    /**
+     * Client policy for accepting and using HTTP {@code Alt-Svc} response advertisements.
+     * <p>
+     * Alternative service handling is disabled when this configuration is absent. Configure an empty
+     * {@link ClientAltSvcConfig} to opt in with its defaults.
+     *
+     * @return alternative service policy, or empty if alternative service handling is disabled
+     */
+    @Api.Preview
+    @Option.Configured
+    Optional<ClientAltSvcConfig> altSvc();
 
     /**
      * Base query used by the client in all requests.
@@ -122,6 +153,46 @@ interface HttpClientConfigBlueprint extends HttpConfigBaseBlueprint {
      */
     @Option.Singular
     Set<Header> headers();
+
+    /**
+     * Whether headers sensitive to cross-origin redirects should be filtered before the redirected request is sent.
+     * <p>
+     * When enabled, header names from {@link #redirectSensitiveHeaders()} are stripped on cross-origin redirects.
+     *
+     * @return whether redirect header filtering is enabled
+     */
+    @Option.Configured
+    @Option.DefaultBoolean(true)
+    boolean filterRedirectHeaders();
+
+    /**
+     * Whether redirects that preserve request method and entity may be followed across origins.
+     * <p>
+     * When disabled, {@code 307} and {@code 308} redirects, and {@code 301} and {@code 302} redirects of a
+     * {@link io.helidon.http.Method#QUERY QUERY} request, to a different origin fail instead of replaying the request
+     * entity to the redirect target.
+     *
+     * @return whether cross-origin redirects may replay request entities
+     */
+    @Option.Configured
+    @Option.DefaultBoolean(false)
+    boolean followCrossOriginEntityRedirects();
+
+    /**
+     * Request header names to strip on cross-origin redirects.
+     * <p>
+     * Header names are matched case-insensitively.
+     * The returned set always contains {@value io.helidon.http.HeaderNames#AUTHORIZATION_NAME},
+     * {@value io.helidon.http.HeaderNames#COOKIE_NAME}, and
+     * {@value io.helidon.http.HeaderNames#PROXY_AUTHORIZATION_NAME}, even if any was not explicitly configured.
+     *
+     * @return sensitive redirect headers
+     */
+    @Option.Configured
+    @Option.Singular
+    @Option.DefaultCode("new @java.util.LinkedHashSet@<>(@java.util.Set@.of(@io.helidon.http.HeaderNames@.AUTHORIZATION, "
+            + "@io.helidon.http.HeaderNames@.COOKIE, @io.helidon.http.HeaderNames@.PROXY_AUTHORIZATION))")
+    Set<HeaderName> redirectSensitiveHeaders();
 
     /**
      * Default headers as a headers object. Creates a new instance for each call, so the returned value
@@ -214,12 +285,18 @@ interface HttpClientConfigBlueprint extends HttpConfigBaseBlueprint {
     boolean sendExpectContinue();
 
     /**
-     * Maximal size of the connection cache for a single connection key.
-     * A connection key is formed by the scheme, host, port, TLS configuration, DNS resolver, DNS address lookup, and proxy.
+     * Maximum number of reusable physical connections each HTTP protocol retains for a single connection target.
+     * A connection target identifies the logical HTTP authority, TLS configuration and generation, configured SNI, DNS
+     * resolver and address lookup, selected proxy route, and physical transport. For UNIX domain socket transports, the
+     * target includes the socket path and does not include proxy configuration.
      * <p>
-     * For most HTTP protocols, we may cache connections to various endpoints for keep alive (or stream reuse in case of HTTP/2).
-     * This option limits the size. Setting this number lower than the "usual" number of target services will cause connections
-     * to be closed and reopened frequently.
+     * Each configured HTTP protocol honors this common option independently; it is not an aggregate cache quota across
+     * protocol versions. This is a retention limit, not a limit on concurrent requests or streams and not a hard cap on
+     * live sockets. Active or draining connections may temporarily cause the number of live sockets for a target to
+     * exceed this value. Each protocol retains at most {@code 1,000} connection-target entries; adding another target
+     * retires the oldest cached target entry. The value must be greater than zero. Defaults to {@code 256}.
+     *
+     * @return maximum number of reusable physical connections retained per target by each HTTP protocol
      */
     @Option.Configured
     @Option.DefaultInt(256)
@@ -244,9 +321,20 @@ interface HttpClientConfigBlueprint extends HttpConfigBaseBlueprint {
     Duration readContinueTimeout();
 
     /**
-     * Whether to share connection cache between all the WebClient instances in JVM.
+     * Whether to use protocol-specific JVM-wide connection caches shared by compatible WebClient instances.
+     * <p>
+     * When {@code true}, each HTTP protocol uses its own JVM-wide cache. Closing an individual client does not close
+     * that shared cache. For each connection target, the first shared client to create the target entry establishes
+     * its capacity from {@link #connectionCacheSize()} for as long as that entry remains cached. When {@code false},
+     * each client owns its connection caches, which are closed when the client is closed. Defaults to {@code true}.
+     * <p>
+     * Transport observation partitions shared caches by observer configuration and meter registry. Observed clients
+     * cannot borrow unobserved connections or connections reporting to another registry. The last client owning an
+     * observed partition retires its cache when closed; asynchronous observer cleanup can finish after active
+     * connections close. Use {@link ReleasableResource#closeResourceAsync()} to await that cleanup after all sharing
+     * clients have been closed.
      *
-     * @return true if connection cache is shared
+     * @return whether to use protocol-specific JVM-wide shared connection caches
      */
     @Option.Configured
     @Option.DefaultBoolean(true)

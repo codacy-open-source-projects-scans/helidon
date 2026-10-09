@@ -20,6 +20,8 @@ import java.net.URL;
 import java.nio.file.Path;
 import java.util.Optional;
 
+import io.helidon.common.Api;
+
 /**
  * Media type detection based on a resource.
  * <p>The media type detection uses the following algorithm:
@@ -29,6 +31,7 @@ import java.util.Optional;
  *     <li>Checks built-in mapping provided by Helidon (with the usual the web relevant media types)</li>
  * </ul>
  */
+@Api.Stable
 public final class MediaTypes {
     /**
      * Wildcard media type.
@@ -122,6 +125,10 @@ public final class MediaTypes {
      * {@code text/yaml} media type.
      */
     public static final MediaType TEXT_YAML = MediaTypeEnum.TEXT_YAML;
+    /**
+     * {@code application/toml} media type.
+     */
+    public static final MediaType APPLICATION_TOML = MediaTypeEnum.APPLICATION_TOML;
     /**
      * {@code application/javascript} media type.
      */
@@ -231,6 +238,10 @@ public final class MediaTypes {
      * String value of media type: {@value}.
      */
     public static final String TEXT_YAML_VALUE = "text/yaml";
+    /**
+     * String value of media type: {@value}.
+     */
+    public static final String APPLICATION_TOML_VALUE = "application/toml";
     /**
      * String value of media type: {@value}.
      */

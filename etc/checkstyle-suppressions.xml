@@ -36,8 +36,8 @@ record here.
     - File exclusions (exceptions)
     - FileLength cannot be excluded using a @SuppressWarnings
     -->
-    <!-- the huffman constants are long, but this is not actual code, just a set of constants -->
-    <suppress files="http/http2/src/main/java/io/helidon/http/http2/Http2HuffmanConstants\.java"
+    <!-- the Huffman tables are long, but this is not actual code, just the tables from RFC 7541 -->
+    <suppress files="common/buffers/src/main/java/io/helidon/common/buffers/HuffmanTables\.java"
             checks="FileLength"/>
 
     <!-- Once the proper abstraction structure is found for the parsers, this can be removed-->
@@ -66,6 +66,10 @@ record here.
 
     <!-- This file is a generated source file, the real code (Blueprint) is much shorter -->
     <suppress files="common/types/src/main/java/io/helidon/common/types/TypeInfo\.java"
+            checks="FileLength"/>
+
+    <!-- Typed canonical OpenAPI document model. -->
+    <suppress files="openapi/openapi/src/main/java/io/helidon/openapi/OpenApiDocument\.java"
             checks="FileLength"/>
 
     <!--

@@ -16,9 +16,17 @@
 
 package io.helidon.json.smile;
 
-import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.math.BigDecimal;
 
+import io.helidon.json.JsonException;
 import io.helidon.json.JsonParser;
+
+import org.junit.jupiter.api.Test;
+
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Stream-backed execution of the spec-mapped parser cases documented in {@link SmileParserTestBase}.
@@ -26,6 +34,45 @@ import io.helidon.json.JsonParser;
 class SmileParserStreamTest extends SmileParserTestBase {
     @Override
     JsonParser createParser(byte[] smileData) {
-        return SmileParser.create(new ByteArrayInputStream(smileData), 5);
+        return SmileParser.create(new OneByteAtATimeInputStream(smileData), 5);
+    }
+
+    @Test
+    void excessiveBigIntegerExpansionReportsStreamPosition() throws Exception {
+        byte[] smileData = generateSmileBytes(gen -> gen.write(new BigDecimal("1E+4097")));
+        JsonException exception = assertThrows(JsonException.class,
+                                               () -> createParser(smileData).readBigInteger());
+
+        assertThat(exception.getMessage(), containsString("4096"));
+        assertThat(exception.getMessage(), containsString("stream position ~"));
+    }
+
+    private static final class OneByteAtATimeInputStream extends InputStream {
+        private final byte[] bytes;
+        private int index;
+
+        private OneByteAtATimeInputStream(byte[] bytes) {
+            this.bytes = bytes;
+        }
+
+        @Override
+        public int read() {
+            if (index == bytes.length) {
+                return -1;
+            }
+            return bytes[index++] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) {
+            if (len == 0) {
+                return 0;
+            }
+            if (index == bytes.length) {
+                return -1;
+            }
+            b[off] = bytes[index++];
+            return 1;
+        }
     }
 }

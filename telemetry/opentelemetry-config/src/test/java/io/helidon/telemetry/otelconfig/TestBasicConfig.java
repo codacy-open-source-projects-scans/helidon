@@ -23,12 +23,15 @@ import io.helidon.common.testing.junit5.OptionalMatcher;
 import io.helidon.config.Config;
 import io.helidon.config.ConfigSources;
 
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.exporter.logging.LoggingSpanExporter;
 import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
-import io.opentelemetry.exporter.zipkin.ZipkinSpanExporter;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
@@ -63,7 +66,7 @@ class TestBasicConfig {
                                 max-attempts: 4
                                 max-backoff: "PT1m"
                               name: my-otlp
-                            - type: zipkin
+                            - type: console
                           processors:
                             - max-queue-size: 21
                               type: batch
@@ -93,7 +96,7 @@ class TestBasicConfig {
         assertThat("Exporters",
                    openTelemetryTracingConfig.exporterConfigs().values(),
                    allOf(hasItems(instanceOf(OtlpHttpSpanExporter.class),
-                                  instanceOf(ZipkinSpanExporter.class)),
+                                  instanceOf(LoggingSpanExporter.class)),
                          iterableWithSize(2)));
 
         assertThat("Sampler",
@@ -114,6 +117,63 @@ class TestBasicConfig {
         OpenTelemetryConfig openTelemetry = OpenTelemetryConfig.create(config.get("telemetry"));
 
         assertThat("Global", openTelemetry.global(), is(true));
+        assertThat("Registered", openTelemetry.registered(), is(true));
         assertThat("Enabled", openTelemetry.enabled(), is(true));
+    }
+
+    @Test
+    void testDisabled() {
+        /*
+        The main point of this test is to make sure that we can build the OpenTelemetryConfig object without errors when
+        telemetry is disabled.
+         */
+        var config = Config.just(ConfigSources.create(
+                """
+                        telemetry:
+                          service: test
+                          enabled: false
+                        """,
+                MediaTypes.APPLICATION_YAML));
+
+        OpenTelemetryConfig openTelemetry = OpenTelemetryConfig.create(config.get("telemetry"));
+        assertThat("OpenTelemetry with config disabled", openTelemetry.openTelemetry(), is(equalTo(OpenTelemetry.noop())));
+        assertThat("OpenTelemetry SDK with config disabled", openTelemetry.openTelemetrySdk(), is(notNullValue()));
+        assertThat("OpenTelemetry SDK propagators with config disabled",
+                   openTelemetry.openTelemetrySdk().getPropagators(),
+                   is(equalTo(ContextPropagators.noop())));
+
+    }
+
+    @Test
+    void testBase2ExponentialHistogramRecordMinMaxDefault() {
+        var config = Config.just(ConfigSources.create(
+                """
+                        aggregation:
+                          max-buckets: 152
+                          max-scale: 19
+                        """,
+                MediaTypes.APPLICATION_YAML));
+
+        var aggregationConfig = Base2ExponentialHistogramAggregationConfig.create(config.get("aggregation"));
+
+        assertThat("Record min/max default",
+                   aggregationConfig.recordMinMax(),
+                   is(true));
+    }
+
+    @Test
+    void testExplicitBucketHistogramRecordMinMaxDefault() {
+        var config = Config.just(ConfigSources.create(
+                """
+                        aggregation:
+                          bucket-boundaries: [3, 5, 7]
+                        """,
+                MediaTypes.APPLICATION_YAML));
+
+        var aggregationConfig = ExplicitBucketHistogramAggregationConfig.create(config.get("aggregation"));
+
+        assertThat("Record min/max default",
+                   aggregationConfig.recordMinMax(),
+                   is(true));
     }
 }

@@ -18,21 +18,130 @@ package io.helidon.common.buffers;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.lang.reflect.Proxy;
+import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.hamcrest.Matchers;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class BufferDataTest {
     static Stream<TestContext> initParams() {
         return Stream.of(new TestContext("fixed", BufferData.create(1024)),
                          new TestContext("growing", BufferData.growing(0)),
                          new TestContext("byte[]", BufferData.create(new byte[1024]).clear()));
+    }
+
+    @Test
+    void growingBufferWriteBufferSurvivesLaterGrowth() {
+        byte[] prefix = new byte[250];
+        byte[] payload = new byte[20];
+        byte[] suffix = new byte[300];
+        Arrays.fill(prefix, (byte) 1);
+        Arrays.fill(payload, (byte) 2);
+        Arrays.fill(suffix, (byte) 3);
+
+        BufferData buffer = BufferData.growing(256);
+        buffer.write(prefix);
+        buffer.write(BufferData.create(payload));
+        buffer.write(suffix);
+
+        assertThat(buffer.readBytes(), is(concat(prefix, payload, suffix)));
+    }
+
+    @Test
+    void growingBufferWritePartialBufferSurvivesLaterGrowth() {
+        byte[] prefix = new byte[250];
+        byte[] payload = new byte[20];
+        byte[] suffix = new byte[300];
+        Arrays.fill(prefix, (byte) 1);
+        Arrays.fill(payload, (byte) 2);
+        Arrays.fill(suffix, (byte) 3);
+        BufferData source = BufferData.create(payload);
+
+        BufferData buffer = BufferData.growing(256);
+        buffer.write(prefix);
+        buffer.write(source, 10);
+        buffer.write(suffix);
+
+        assertThat(buffer.readBytes(), is(concat(prefix, Arrays.copyOf(payload, 10), suffix)));
+        assertThat(source.available(), is(10));
+    }
+
+    @Test
+    void growingBufferWriteDoesNotExposeBackingArray() {
+        AtomicReference<byte[]> retained = new AtomicReference<>();
+        BufferData source = (BufferData) Proxy.newProxyInstance(BufferData.class.getClassLoader(),
+                                                                 new Class<?>[] {BufferData.class},
+                                                                 (_, method, arguments) -> {
+                                                                     return switch (method.getName()) {
+                                                                         case "available" -> 1;
+                                                                         case "read" -> {
+                                                                             byte[] target = (byte[]) arguments[0];
+                                                                             retained.set(target);
+                                                                             target[0] = 1;
+                                                                             yield 1;
+                                                                         }
+                                                                         default -> throw new IllegalStateException(method.toString());
+                                                                     };
+                                                                 });
+        BufferData buffer = BufferData.growing(256);
+
+        buffer.write(source);
+        byte[] retainedBytes = retained.get();
+        assertThat(retainedBytes, Matchers.notNullValue());
+        retainedBytes[0] = 2;
+
+        assertThat(buffer.read(), is(1));
+    }
+
+    @Test
+    void growingBufferRetainsCompleteBufferDataWriteWhenCapacityIncreases() {
+        byte[] firstBytes = new byte[200];
+        byte[] secondBytes = new byte[100];
+        Arrays.fill(firstBytes, (byte) 1);
+        Arrays.fill(secondBytes, (byte) 2);
+
+        BufferData buffer = BufferData.growing(0);
+        buffer.write(BufferData.create(firstBytes));
+        buffer.write(secondBytes);
+
+        byte[] expected = new byte[300];
+        System.arraycopy(firstBytes, 0, expected, 0, firstBytes.length);
+        System.arraycopy(secondBytes, 0, expected, firstBytes.length, secondBytes.length);
+        assertArrayEquals(expected, buffer.readBytes());
+    }
+
+    @Test
+    void growingBufferRetainsLimitedBufferDataWriteWhenCapacityIncreases() {
+        byte[] firstBytes = new byte[100];
+        byte[] secondBytes = new byte[150];
+        byte[] thirdBytes = new byte[100];
+        Arrays.fill(firstBytes, (byte) 1);
+        Arrays.fill(secondBytes, (byte) 2);
+        Arrays.fill(thirdBytes, (byte) 3);
+
+        BufferData source = BufferData.create(secondBytes);
+        BufferData buffer = BufferData.growing(0);
+        buffer.write(firstBytes);
+        buffer.write(source, 100);
+        buffer.write(thirdBytes);
+
+        byte[] expected = new byte[300];
+        System.arraycopy(firstBytes, 0, expected, 0, firstBytes.length);
+        System.arraycopy(secondBytes, 0, expected, firstBytes.length, 100);
+        System.arraycopy(thirdBytes, 0, expected, 200, thirdBytes.length);
+        assertArrayEquals(expected, buffer.readBytes());
+        assertThat(source.available(), is(50));
     }
 
     @ParameterizedTest
@@ -63,6 +172,36 @@ class BufferDataTest {
         int index = b.lastIndexOf((byte) ':');
 
         assertThat(index, is(22));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void lastIndexOfWithLengthAfterPartialRead(TestContext context) {
+        BufferData b = context.bufferData();
+        b.writeAscii("01abcy");
+        b.skip(2);
+
+        assertThat(b.lastIndexOf((byte) 'y', 4), is(3));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void lastIndexOfClampsLengthToAvailable(TestContext context) {
+        BufferData b = context.bufferData();
+        b.writeAscii("01abcy");
+        b.skip(2);
+
+        assertThat(b.lastIndexOf((byte) 'y', 5), is(3));
+        assertThat(b.lastIndexOf((byte) 0, 5), is(-1));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void lastIndexOfIgnoresNegativeLength(TestContext context) {
+        BufferData b = context.bufferData();
+        b.writeAscii("abc");
+
+        assertThat(b.lastIndexOf((byte) 'a', Integer.MIN_VALUE), is(-1));
     }
 
     @ParameterizedTest
@@ -117,6 +256,110 @@ class BufferDataTest {
         expected = 42;
         buffer.clear();
         assertThat(buffer.readHpackInt(42, 8), is(expected));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsOverflowingHpackInt(TestContext context) {
+        BufferData buffer = context.bufferData();
+        buffer.write(0xff)
+                .write(0xff)
+                .write(0xff)
+                .write(0xff)
+                .write(0x08);
+
+        assertThrows(IllegalArgumentException.class, () -> buffer.readHpackInt(0xff, 7));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsTooLongHpackInt(TestContext context) {
+        BufferData buffer = context.bufferData();
+        buffer.write(0x80)
+                .write(0x80)
+                .write(0x80)
+                .write(0x80)
+                .write(0x80)
+                .write(0x00);
+
+        assertThrows(IllegalArgumentException.class, () -> buffer.readHpackInt(0xff, 7));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsTruncatedHpackInt(TestContext context) {
+        BufferData buffer = context.bufferData();
+        buffer.write(0x80);
+
+        assertThrows(IllegalArgumentException.class, () -> buffer.readHpackInt(0xff, 7));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testLongPrefixedIntegerRoundTrip(TestContext context) {
+        long expected = (1L << 33) + 42;
+        BufferData buffer = context.bufferData();
+
+        PrefixedIntegerCodec.writeLong(buffer, expected, 0b1010_0000, 5);
+
+        int first = buffer.read();
+        assertThat(first & 0b1110_0000, is(0b1010_0000));
+        assertThat(PrefixedIntegerCodec.readLong(buffer, first, 5), is(expected));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsOverflowingLongPrefixedInteger(TestContext context) {
+        BufferData buffer = context.bufferData();
+        for (int i = 0; i < 9; i++) {
+            buffer.write(0x80);
+        }
+        buffer.write(0x02);
+
+        assertThrows(IllegalArgumentException.class, () -> PrefixedIntegerCodec.readLong(buffer, 0x1f, 5));
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsInvalidPrefixWidthsWithoutBufferMutation(TestContext context) {
+        BufferData buffer = context.bufferData();
+        buffer.write(0x80);
+        int available = buffer.available();
+
+        for (int prefixBits : new int[] {0, 9}) {
+            assertThrows(IllegalArgumentException.class,
+                         () -> PrefixedIntegerCodec.readInt(buffer, 0xff, prefixBits));
+            assertThat(buffer.available(), is(available));
+            assertThrows(IllegalArgumentException.class,
+                         () -> PrefixedIntegerCodec.readLong(buffer, 0xff, prefixBits));
+            assertThat(buffer.available(), is(available));
+            assertThrows(IllegalArgumentException.class,
+                         () -> PrefixedIntegerCodec.writeInt(buffer, 0, 0, prefixBits));
+            assertThat(buffer.available(), is(available));
+            assertThrows(IllegalArgumentException.class,
+                         () -> PrefixedIntegerCodec.writeLong(buffer, 0, 0, prefixBits));
+            assertThat(buffer.available(), is(available));
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("initParams")
+    void testRejectsNegativePrefixedIntegerWithoutBufferMutation(TestContext context) {
+        BufferData buffer = context.bufferData();
+        int available = buffer.available();
+
+        assertThrows(IllegalArgumentException.class, () -> PrefixedIntegerCodec.writeInt(buffer, -1, 0, 5));
+        assertThat(buffer.available(), is(available));
+        assertThrows(IllegalArgumentException.class, () -> PrefixedIntegerCodec.writeLong(buffer, -1, 0, 5));
+        assertThat(buffer.available(), is(available));
+    }
+
+    @Test
+    void testRejectsNullPrefixedIntegerBuffers() {
+        assertThrows(NullPointerException.class, () -> PrefixedIntegerCodec.readInt(null, 0, 5));
+        assertThrows(NullPointerException.class, () -> PrefixedIntegerCodec.readLong(null, 0, 5));
+        assertThrows(NullPointerException.class, () -> PrefixedIntegerCodec.writeInt(null, 0, 0, 5));
+        assertThrows(NullPointerException.class, () -> PrefixedIntegerCodec.writeLong(null, 0, 0, 5));
     }
 
     @ParameterizedTest
@@ -335,6 +578,17 @@ class BufferDataTest {
     BufferData dataFromHex(String hexEncoded) {
         byte[] bytes = HexFormat.of().parseHex(hexEncoded.replace(" ", ""));
         return BufferData.create(bytes);
+    }
+
+    private static byte[] concat(byte[]... arrays) {
+        int length = Arrays.stream(arrays).mapToInt(array -> array.length).sum();
+        byte[] result = new byte[length];
+        int offset = 0;
+        for (byte[] array : arrays) {
+            System.arraycopy(array, 0, result, offset, array.length);
+            offset += array.length;
+        }
+        return result;
     }
 
     private record TestContext(String name, BufferData bufferData) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,16 @@
 package io.helidon.codegen;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 import io.helidon.codegen.spi.AnnotationMapper;
 import io.helidon.codegen.spi.ElementMapper;
 import io.helidon.codegen.spi.TypeMapper;
+import io.helidon.common.Api;
 import io.helidon.common.types.TypeInfo;
 import io.helidon.common.types.TypeName;
 import io.helidon.common.types.TypedElementInfo;
@@ -31,6 +34,7 @@ import io.helidon.common.types.TypedElementInfo;
 /**
  * Base of codegen context implementation that delegates common parts of the API to an existing instance.
  */
+@Api.Internal
 public abstract class CodegenContextDelegate implements CodegenContext {
     private final CodegenContext delegate;
 
@@ -76,6 +80,12 @@ public abstract class CodegenContextDelegate implements CodegenContext {
     @Override
     public Optional<TypeInfo> typeInfo(TypeName typeName, Predicate<TypedElementInfo> elementPredicate) {
         return delegate.typeInfo(typeName, elementPredicate);
+    }
+
+    @Override
+    public TypeHierarchyResolver typeHierarchyResolver(Function<TypeName, Optional<TypeInfo>> typeInfoLookup) {
+        Objects.requireNonNull(typeInfoLookup, "The type information lookup must not be null.");
+        return delegate.typeHierarchyResolver(typeInfoLookup);
     }
 
     @Override

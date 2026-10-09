@@ -16,48 +16,92 @@
 
 package io.helidon.webserver.staticcontent;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.JarURLConnection;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLClassLoader;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SecureDirectoryStream;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import io.helidon.common.LruCache;
+import io.helidon.common.Size;
 import io.helidon.common.buffers.BufferData;
 import io.helidon.common.media.type.MediaType;
 import io.helidon.common.media.type.MediaTypes;
 import io.helidon.common.uri.UriQuery;
+import io.helidon.http.ForbiddenException;
 import io.helidon.http.Header;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
+import io.helidon.http.HttpException;
 import io.helidon.http.HttpPrologue;
 import io.helidon.http.Method;
 import io.helidon.http.ServerRequestHeaders;
 import io.helidon.http.ServerResponseHeaders;
+import io.helidon.http.Status;
+import io.helidon.http.WritableHeaders;
 import io.helidon.webserver.http.ServerRequest;
 import io.helidon.webserver.http.ServerResponse;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
+import org.mockito.Mockito;
 
 import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.hasHeader;
+import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.noHeader;
+import static io.helidon.common.testing.junit5.OptionalMatcher.optionalEmpty;
 import static io.helidon.common.testing.junit5.OptionalMatcher.optionalPresent;
 import static java.lang.System.Logger.Level.TRACE;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.CoreMatchers.notNullValue;
+import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class CachedHandlerTest {
@@ -69,10 +113,13 @@ class CachedHandlerTest {
     private static ClassPathContentHandler classpathHandler;
     private static FileSystemContentHandler fsHandler;
 
+    @TempDir
+    Path tempDir;
+
     @BeforeAll
     static void initTestClass() {
         classpathHandler = (ClassPathContentHandler) StaticContentFeature.createService(
-                ClasspathHandlerConfig.builder()
+                classpathHandlerBuilder()
                         .location("/web")
                         .cachedFiles(Set.of("favicon.ico"))
                         .welcome("resource.txt")
@@ -80,7 +127,7 @@ class CachedHandlerTest {
         classpathHandler.beforeStart();
 
         fsHandler = (FileSystemContentHandler) StaticContentFeature.createService(
-                FileSystemHandlerConfig.builder()
+                fileSystemHandlerBuilder()
                         .location(Paths.get("./src/test/resources/web"))
                         .cachedFiles(Set.of("nested"))
                         .welcome("resource.txt")
@@ -96,8 +143,6 @@ class CachedHandlerTest {
         assertThat("Cached bytes must not be null", cached.bytes(), notNullValue());
         assertThat("Cached bytes must not be empty", cached.bytes(), not(BufferData.EMPTY_BYTES));
         assertThat("Content length", cached.contentLength(), is(1230));
-        assertThat("Last modified", cached.lastModified(), notNullValue());
-        assertThat("Media type", cached.mediaType(), is(MEDIA_TYPE_ICON));
     }
 
     @Test
@@ -148,12 +193,1655 @@ class CachedHandlerTest {
         Optional<CachedHandler> cachedHandler = classpathHandler.cacheHandler("web/resource.txt");
         assertThat("Handler should be cached", cachedHandler, optionalPresent());
         CachedHandler cached = cachedHandler.get();
-        assertThat("During tests, classpath should be loaded from file system", cached, instanceOf(CachedHandlerPath.class));
-        CachedHandlerPath pathHandler = (CachedHandlerPath) cached;
+        assertThat("Classpath metadata should be cached with the handler",
+                   cached,
+                   instanceOf(ClassPathContentHandler.CachedClassPathHandler.class));
+        CachedHandler delegate = ((ClassPathContentHandler.CachedClassPathHandler) cached).delegate();
+        assertThat("During tests, classpath should be loaded from file system", delegate, instanceOf(CachedHandlerPath.class));
+        CachedHandlerPath pathHandler = (CachedHandlerPath) delegate;
         assertThat("Path", pathHandler.path(), notNullValue());
-        assertThat("Last modified function", pathHandler.lastModified(), notNullValue());
-        assertThat("Last modified", pathHandler.lastModified().apply(pathHandler.path()), notNullValue());
-        assertThat("Media type", pathHandler.mediaType(), is(MediaTypes.TEXT_PLAIN));
+        assertThat("Last modified", pathHandler.metadata().lastModified(), notNullValue());
+        assertThat("Content length", pathHandler.metadata().contentLength(), is(7L));
+    }
+
+    @Test
+    void testClasspathCachedIdentityBytesSurviveRecordCacheEviction() throws IOException, URISyntaxException {
+        Path classPathRoot = tempDir.resolve("cached-identity-classpath");
+        Path resourceRoot = classPathRoot.resolve("web");
+        Path cachedResource = resourceRoot.resolve("cached.txt");
+        Files.createDirectories(resourceRoot);
+        Files.writeString(cachedResource, "Cached snapshot");
+        Files.writeString(resourceRoot.resolve("other.txt"), "Other content");
+
+        try (var classLoader = new URLClassLoader(new URL[] {classPathRoot.toUri().toURL()}, null)) {
+            ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                    classpathHandlerBuilder()
+                            .location("/web")
+                            .classLoader(classLoader)
+                            .cachedFiles(Set.of("cached.txt"))
+                            .recordCacheCapacity(1)
+                            .build());
+            handler.beforeStart();
+
+            Files.writeString(cachedResource, "Changed source");
+            assertThat(handler.doHandle(Method.GET,
+                                        "other.txt",
+                                        request("/other.txt", ServerRequestHeaders.create()),
+                                        response(ServerResponseHeaders.create(), new ByteArrayOutputStream()),
+                                        false), is(true));
+
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            assertThat(handler.doHandle(Method.GET,
+                                        "cached.txt",
+                                        request("/cached.txt", ServerRequestHeaders.create()),
+                                        response(ServerResponseHeaders.create(), body),
+                                        false), is(true));
+            assertThat(body.toString(StandardCharsets.UTF_8), is("Cached snapshot"));
+        }
+    }
+
+    @Test
+    void testClasspathCachedMetadataUsesCurrentMemoryCacheEntry() throws IOException {
+        String resource = "web/cached.txt";
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .build());
+        byte[] firstBytes = "First".getBytes(StandardCharsets.UTF_8);
+        byte[] currentBytes = "Current".getBytes(StandardCharsets.UTF_8);
+        CachedHandlerInMemory first = new CachedHandlerInMemory(
+                StaticContentMetadata.create(MediaTypes.TEXT_PLAIN, firstBytes.length), firstBytes);
+        CachedHandlerInMemory current = new CachedHandlerInMemory(
+                StaticContentMetadata.create(MediaTypes.TEXT_PLAIN, currentBytes.length), currentBytes);
+
+        handler.cacheInMemory(resource, first);
+        CachedHandler firstWrapper = handler.cacheClassPathHandler(resource,
+                                                                   resource,
+                                                                   tempDir.resolve("cached.txt").toUri().toURL(),
+                                                                   first);
+        Optional<CachedHandler> firstLookup = handler.cachedClassPathHandler(resource);
+        assertThat(firstLookup, optionalPresent());
+        assertThat(firstLookup.get(), sameInstance(firstWrapper));
+
+        handler.cacheInMemory(resource, current);
+
+        Optional<CachedHandler> cached = handler.cachedClassPathHandler(resource);
+        assertThat(cached, optionalPresent());
+        assertThat(cached.get(), not(sameInstance(firstWrapper)));
+        assertThat(((ClassPathContentHandler.CachedClassPathHandler) cached.get()).delegate(), sameInstance(current));
+
+        Optional<CachedHandler> repeated = handler.cachedClassPathHandler(resource);
+        assertThat(repeated, optionalPresent());
+        assertThat(repeated.get(), sameInstance(cached.get()));
+    }
+
+    @Test
+    void testClasspathDynamicCacheIsReleasedOnRestart(@TempDir Path tempDir) throws IOException, URISyntaxException {
+        Path resource = Files.writeString(Files.createDirectories(tempDir.resolve("web")).resolve("dynamic.txt"),
+                                          "Initial");
+        FileTime initialLastModified = Files.getLastModifiedTime(resource);
+
+        try (var classLoader = new URLClassLoader(new URL[] {tempDir.toUri().toURL()}, null)) {
+            ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                    classpathHandlerBuilder()
+                            .location("/web")
+                            .classLoader(classLoader)
+                            .build());
+            handler.beforeStart();
+
+            ServerRequest request = mock(ServerRequest.class);
+            when(request.headers()).thenReturn(ServerRequestHeaders.create());
+            HttpPrologue prologue = HttpPrologue.create("http/1.1",
+                                                        "http",
+                                                        "1.1",
+                                                        Method.GET,
+                                                        "/dynamic.txt",
+                                                        false);
+            when(request.prologue()).thenReturn(prologue);
+
+            ByteArrayOutputStream initialOutput = new ByteArrayOutputStream();
+            ServerResponseHeaders initialHeaders = ServerResponseHeaders.create();
+            ServerResponse initialResponse = mock(ServerResponse.class);
+            when(initialResponse.headers()).thenReturn(initialHeaders);
+            when(initialResponse.outputStream()).thenReturn(initialOutput);
+
+            assertThat("Initial classpath resource should be served",
+                       handler.doHandle(Method.GET, "dynamic.txt", request, initialResponse, false),
+                       is(true));
+            assertThat(initialOutput.toString(StandardCharsets.UTF_8), is("Initial"));
+            String initialEtag = initialHeaders.get(HeaderNames.ETAG).get();
+            String initialLastModifiedHeader = initialHeaders.get(HeaderNames.LAST_MODIFIED).get();
+
+            handler.afterStop();
+            byte[] updatedBytes = "Updated content".getBytes(StandardCharsets.UTF_8);
+            Files.write(resource, updatedBytes);
+            Files.setLastModifiedTime(resource, FileTime.from(initialLastModified.toInstant().plusSeconds(2)));
+            assertThat("Updated resource must have a distinct last-modified time",
+                       Files.getLastModifiedTime(resource),
+                       not(is(initialLastModified)));
+            handler.beforeStart();
+
+            ByteArrayOutputStream updatedOutput = new ByteArrayOutputStream();
+            ServerResponseHeaders updatedHeaders = ServerResponseHeaders.create();
+            ServerResponse updatedResponse = mock(ServerResponse.class);
+            when(updatedResponse.headers()).thenReturn(updatedHeaders);
+            when(updatedResponse.outputStream()).thenReturn(updatedOutput);
+
+            assertThat("Updated classpath resource should be served",
+                       handler.doHandle(Method.GET, "dynamic.txt", request, updatedResponse, false),
+                       is(true));
+            assertThat("Updated classpath resource content", updatedOutput.toByteArray(), is(updatedBytes));
+            assertThat(updatedHeaders,
+                       hasHeader(HeaderNames.CONTENT_LENGTH, String.valueOf(updatedBytes.length)));
+            assertThat("Updated resource ETag", updatedHeaders.get(HeaderNames.ETAG).get(), not(is(initialEtag)));
+            assertThat("Updated resource last-modified header",
+                       updatedHeaders.get(HeaderNames.LAST_MODIFIED).get(),
+                       not(is(initialLastModifiedHeader)));
+
+            ServerRequestHeaders rangeRequestHeaders = mock(ServerRequestHeaders.class);
+            when(rangeRequestHeaders.contains(HeaderNames.RANGE)).thenReturn(true);
+            when(rangeRequestHeaders.get(HeaderNames.RANGE))
+                    .thenReturn(HeaderValues.create(HeaderNames.RANGE, "bytes=0-0"));
+            ServerRequest rangeRequest = mock(ServerRequest.class);
+            when(rangeRequest.headers()).thenReturn(rangeRequestHeaders);
+            when(rangeRequest.prologue()).thenReturn(prologue);
+
+            ByteArrayOutputStream rangeOutput = new ByteArrayOutputStream();
+            ServerResponseHeaders rangeHeaders = ServerResponseHeaders.create();
+            ServerResponse rangeResponse = mock(ServerResponse.class);
+            when(rangeResponse.headers()).thenReturn(rangeHeaders);
+            when(rangeResponse.outputStream()).thenReturn(rangeOutput);
+
+            assertThat("Updated classpath resource range should be served",
+                       handler.doHandle(Method.GET, "dynamic.txt", rangeRequest, rangeResponse, false),
+                       is(true));
+            assertThat("Updated classpath resource range", rangeOutput.toString(StandardCharsets.UTF_8), is("U"));
+
+            assertThat(rangeHeaders,
+                       hasHeader(HeaderNames.CONTENT_RANGE, "bytes 0-0/" + updatedBytes.length));
+            assertThat(rangeHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "1"));
+            verify(rangeResponse).status(Status.PARTIAL_CONTENT_206);
+        }
+    }
+
+    @Test
+    void testSingleFileClasspathCachesAreReleasedOnRestart(@TempDir Path tempDir) throws IOException {
+        Path resource = Files.writeString(tempDir.resolve("single.txt"), "Initial");
+
+        try (var classLoader = new URLClassLoader(new URL[] {tempDir.toUri().toURL()}, null)) {
+            SingleFileClassPathContentHandler handler =
+                    (SingleFileClassPathContentHandler) StaticContentFeature.createService(
+                            classpathHandlerBuilder()
+                                    .location("/single.txt")
+                                    .classLoader(classLoader)
+                                    .singleFile(true)
+                                    .cachedFiles(Set.of("."))
+                                    .build());
+            handler.beforeStart();
+
+            assertThat("Single-file classpath resource should be cached in memory",
+                       handler.cacheInMemory("single.txt"),
+                       optionalPresent());
+
+            ServerRequest request = mock(ServerRequest.class);
+            when(request.headers()).thenReturn(ServerRequestHeaders.create());
+
+            ServerResponse initialResponse = mock(ServerResponse.class);
+            when(initialResponse.headers()).thenReturn(ServerResponseHeaders.create());
+
+            assertThat("Initial single-file classpath resource should be served",
+                       handler.doHandle(Method.GET, "", request, initialResponse, false),
+                       is(true));
+            ArgumentCaptor<byte[]> initialOutput = ArgumentCaptor.forClass(byte[].class);
+            verify(initialResponse).send(initialOutput.capture());
+            assertThat("Initial single-file classpath resource content",
+                       initialOutput.getValue(),
+                       is("Initial".getBytes(StandardCharsets.UTF_8)));
+
+            handler.afterStop();
+            Files.delete(resource);
+            handler.beforeStart();
+
+            assertThat("Stopped single-file classpath handler must clear its memory cache",
+                       handler.cacheInMemory("single.txt"),
+                       optionalEmpty());
+            assertThat("Stopped single-file classpath handler must clear its handler cache",
+                       handler.cacheHandler("single.txt"),
+                       optionalEmpty());
+
+            ServerResponse removedResponse = mock(ServerResponse.class);
+            when(removedResponse.headers()).thenReturn(ServerResponseHeaders.create());
+
+            assertThat("Removed single-file classpath resource should not be served",
+                       handler.doHandle(Method.GET, "", request, removedResponse, false),
+                       is(false));
+        }
+    }
+
+    @Test
+    void testSingleFileClasspathEvictsRemovedFileAndRecovers(@TempDir Path tempDir) throws IOException {
+        Path resource = Files.writeString(tempDir.resolve("single.txt"), "Initial");
+
+        try (var classLoader = new URLClassLoader(new URL[] {tempDir.toUri().toURL()}, null)) {
+            SingleFileClassPathContentHandler handler =
+                    (SingleFileClassPathContentHandler) StaticContentFeature.createService(
+                            classpathHandlerBuilder()
+                                    .location("/single.txt")
+                                    .classLoader(classLoader)
+                                    .singleFile(true)
+                                    .build());
+            handler.beforeStart();
+
+            ServerRequest request = mock(ServerRequest.class);
+            when(request.headers()).thenReturn(ServerRequestHeaders.create());
+
+            ByteArrayOutputStream initialOutput = new ByteArrayOutputStream();
+            ServerResponseHeaders initialHeaders = ServerResponseHeaders.create();
+            ServerResponse initialResponse = mock(ServerResponse.class);
+            when(initialResponse.headers()).thenReturn(initialHeaders);
+            when(initialResponse.outputStream()).thenReturn(initialOutput);
+
+            assertThat("Initial single-file classpath resource should be served",
+                       handler.doHandle(Method.GET, "", request, initialResponse, false),
+                       is(true));
+            assertThat(initialOutput.toString(StandardCharsets.UTF_8), is("Initial"));
+            String initialEtag = initialHeaders.get(HeaderNames.ETAG).get();
+
+            Files.delete(resource);
+
+            ServerResponse removedResponse = mock(ServerResponse.class);
+            when(removedResponse.headers()).thenReturn(ServerResponseHeaders.create());
+
+            assertThat("Removed single-file classpath resource should not be served",
+                       handler.doHandle(Method.GET, "", request, removedResponse, false),
+                       is(false));
+            assertThat("Removed single-file classpath resource should be evicted",
+                       handler.cacheHandler("single.txt"),
+                       optionalEmpty());
+
+            byte[] updatedBytes = "Updated content".getBytes(StandardCharsets.UTF_8);
+            Files.write(resource, updatedBytes);
+
+            ByteArrayOutputStream updatedOutput = new ByteArrayOutputStream();
+            ServerResponseHeaders updatedHeaders = ServerResponseHeaders.create();
+            ServerResponse updatedResponse = mock(ServerResponse.class);
+            when(updatedResponse.headers()).thenReturn(updatedHeaders);
+            when(updatedResponse.outputStream()).thenReturn(updatedOutput);
+
+            assertThat("Re-added single-file classpath resource should be served",
+                       handler.doHandle(Method.GET, "", request, updatedResponse, false),
+                       is(true));
+            assertThat("Re-added single-file classpath resource content",
+                       updatedOutput.toByteArray(),
+                       is(updatedBytes));
+            assertThat(updatedHeaders,
+                       hasHeader(HeaderNames.CONTENT_LENGTH, String.valueOf(updatedBytes.length)));
+            assertThat("Re-added single-file classpath resource ETag",
+                       updatedHeaders.get(HeaderNames.ETAG).get(),
+                       not(is(initialEtag)));
+        }
+    }
+
+    @Test
+    void testClasspathHeadSendsMetadataWithoutEntity() throws IOException, URISyntaxException {
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1", "http", "1.1", Method.HEAD,
+                                                            "/resource.txt", false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(responseHeaders);
+
+        boolean result = classpathHandler.doHandle(Method.HEAD, "resource.txt", req, res, false);
+
+        assertThat("Handler should have found resource.txt", result, is(true));
+        assertThat(responseHeaders, hasHeader(HeaderValues.CONTENT_TYPE_TEXT_PLAIN));
+        assertThat(responseHeaders, hasHeader(RESOURCE_CONTENT_LENGTH));
+        verify(res).send();
+        verify(res, never()).send(any(byte[].class));
+        verify(res, never()).outputStream();
+    }
+
+    @Test
+    void testUrlStreamPreconditionsWithoutLastModified() throws IOException {
+        URL url = URL.of(URI.create("test:/resource.txt"), new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) {
+                return new URLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public long getLastModified() {
+                        return 0;
+                    }
+                };
+            }
+        });
+
+        ServerRequestHeaders requestHeaders = mock(ServerRequestHeaders.class);
+        when(requestHeaders.contains(HeaderNames.IF_NONE_MATCH)).thenReturn(true);
+        when(requestHeaders.get(HeaderNames.IF_NONE_MATCH))
+                .thenReturn(HeaderValues.create(HeaderNames.IF_NONE_MATCH, "*"));
+        ServerRequest request = mock(ServerRequest.class);
+        when(request.headers()).thenReturn(requestHeaders);
+
+        ServerResponse response = mock(ServerResponse.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        when(response.headers()).thenReturn(responseHeaders);
+
+        CachedHandlerUrlStream handler = CachedHandlerUrlStream.create(MediaTypes.TEXT_PLAIN, url);
+        HttpException exception = assertThrows(HttpException.class,
+                                               () -> handler.handle(LruCache.create(),
+                                                                    Method.HEAD,
+                                                                    request,
+                                                                    response,
+                                                                    "resource.txt"));
+
+        assertThat(exception.status(), is(Status.NOT_MODIFIED_304));
+        assertThat(responseHeaders.contains(HeaderNames.ETAG), is(false));
+        assertThat(exception.headers().contains(HeaderNames.ETAG), is(false));
+    }
+
+    @Test
+    void testUrlStreamMetadataIsResolvedOnce() throws IOException {
+        AtomicInteger connectionCount = new AtomicInteger();
+        URL url = URL.of(URI.create("test:/resource.txt"), new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) {
+                connectionCount.incrementAndGet();
+                return new URLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public long getLastModified() {
+                        return 1234;
+                    }
+
+                    @Override
+                    public long getContentLengthLong() {
+                        return 7;
+                    }
+                };
+            }
+        });
+
+        ServerRequest request = mock(ServerRequest.class);
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+
+        ServerResponse response = mock(ServerResponse.class);
+        when(response.headers()).thenReturn(ServerResponseHeaders.create());
+
+        CachedHandlerUrlStream handler = CachedHandlerUrlStream.create(MediaTypes.TEXT_PLAIN, url);
+        handler.handle(LruCache.create(), Method.HEAD, request, response, "resource.txt");
+        handler.handle(LruCache.create(), Method.HEAD, request, response, "resource.txt");
+
+        assertThat("URL metadata should be resolved only when the handler is created",
+                   connectionCount.get(),
+                   is(1));
+    }
+
+    @Test
+    void testJarExtractionFailureUsesUrlStream(@TempDir Path tempDir) throws IOException {
+        byte[] content = "Content".getBytes(StandardCharsets.UTF_8);
+        AtomicInteger streamCount = new AtomicInteger();
+        URL url = URL.of(URI.create("test:/resource.txt"), new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) {
+                return new URLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public InputStream getInputStream() {
+                        if (streamCount.getAndIncrement() != 0) {
+                            return new ByteArrayInputStream(content);
+                        }
+                        return new InputStream() {
+                            private boolean firstRead = true;
+
+                            @Override
+                            public int read() throws IOException {
+                                throw new IOException("Extraction failed");
+                            }
+
+                            @Override
+                            public int read(byte[] bytes, int offset, int length) throws IOException {
+                                if (!firstRead) {
+                                    throw new IOException("Extraction failed");
+                                }
+                                firstRead = false;
+                                int copied = Math.min(3, length);
+                                System.arraycopy(content, 0, bytes, offset, copied);
+                                return copied;
+                            }
+                        };
+                    }
+                };
+            }
+        });
+        TemporaryStorage storage = mock(TemporaryStorage.class);
+        when(storage.createFile()).thenReturn(Optional.of(tempDir.resolve("resource.txt")));
+
+        CachedHandlerJar handler = CachedHandlerJar.create(storage, url, null, MediaTypes.TEXT_PLAIN, content.length);
+        ServerRequest request = mock(ServerRequest.class);
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ServerResponse response = mock(ServerResponse.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        when(response.headers()).thenReturn(responseHeaders);
+        when(response.outputStream()).thenReturn(output);
+
+        handler.handle(LruCache.create(), Method.GET, request, response, "resource.txt");
+
+        assertThat("Failed extraction should fall back to the URL stream", output.toByteArray(), is(content));
+        assertThat("The URL should be opened again after extraction fails", streamCount.get(), is(2));
+        assertThat(responseHeaders, hasHeader(RESOURCE_CONTENT_LENGTH));
+    }
+
+    @Test
+    void testJarExtractionResolvesUnknownContentLength(@TempDir Path tempDir) throws IOException {
+        byte[] content = "Content".getBytes(StandardCharsets.UTF_8);
+        URL url = URL.of(URI.create("test:/resource.txt"), new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) {
+                return new URLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public InputStream getInputStream() {
+                        return new ByteArrayInputStream(content);
+                    }
+                };
+            }
+        });
+        TemporaryStorage storage = mock(TemporaryStorage.class);
+        when(storage.createFile()).thenReturn(Optional.of(tempDir.resolve("resource.txt")));
+
+        CachedHandlerJar handler = CachedHandlerJar.create(storage, url, null, MediaTypes.TEXT_PLAIN, -1);
+        ServerRequest request = mock(ServerRequest.class);
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+
+        ServerResponse response = mock(ServerResponse.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        when(response.headers()).thenReturn(responseHeaders);
+
+        handler.handle(LruCache.create(), Method.HEAD, request, response, "resource.txt");
+
+        assertThat(responseHeaders, hasHeader(RESOURCE_CONTENT_LENGTH));
+    }
+
+    @Test
+    void testJarUnknownContentLengthUsesExtractedFileSize() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile();
+        CachedHandlerJar handler = CachedHandlerJar.create(TemporaryStorage.create(builder -> builder
+                                                                      .directory(tempDir)
+                                                                      .deleteOnExit(false)),
+                                                           jarUrl(jarFile, "resource.txt"),
+                                                           null,
+                                                           MediaTypes.TEXT_PLAIN,
+                                                           -1);
+        ServerRequest req = mock(ServerRequest.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse res = mock(ServerResponse.class);
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(res.headers()).thenReturn(responseHeaders);
+        when(res.outputStream()).thenReturn(body);
+
+        assertThat(handler.handle(LruCache.create(), Method.GET, req, res, "resource.txt"), is(true));
+        assertThat(responseHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "7"));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testJarUnknownContentLengthOmitsHeadContentLengthWhenNotExtracted() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile();
+        CachedHandlerJar handler = CachedHandlerJar.create(TemporaryStorage.create(builder -> builder.enabled(false)),
+                                                           jarUrl(jarFile, "resource.txt"),
+                                                           null,
+                                                           MediaTypes.TEXT_PLAIN,
+                                                           -1);
+        ServerRequest req = mock(ServerRequest.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse res = mock(ServerResponse.class);
+
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(res.headers()).thenReturn(responseHeaders);
+
+        assertThat(handler.handle(LruCache.create(), Method.HEAD, req, res, "resource.txt"), is(true));
+        assertThat(responseHeaders, noHeader(HeaderNames.CONTENT_LENGTH));
+    }
+
+    @Test
+    void testUrlHeadUsesMetadataWithoutOpeningBody() throws IOException {
+        AtomicInteger openedStreams = new AtomicInteger();
+        URL url = trackingUrl(openedStreams, 1000);
+        CachedHandler handler = CachedHandlerUrlStream.create(MediaTypes.TEXT_PLAIN, url);
+        ServerRequest request = mock(ServerRequest.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse response = mock(ServerResponse.class);
+
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+        when(response.headers()).thenReturn(responseHeaders);
+
+        assertThat(handler.handle(LruCache.create(), Method.HEAD, request, response, "resource.txt"), is(true));
+
+        assertThat(responseHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "7"));
+        assertThat(openedStreams.get(), is(0));
+        verify(response).send();
+    }
+
+    @Test
+    void testUrlConditionalGetUsesMetadataWithoutOpeningBody() throws IOException {
+        AtomicInteger openedStreams = new AtomicInteger();
+        CachedHandler handler = CachedHandlerUrlStream.create(MediaTypes.TEXT_PLAIN, trackingUrl(openedStreams, 1000));
+        WritableHeaders<?> headers = WritableHeaders.create();
+        headers.set(HeaderValues.create(HeaderNames.IF_NONE_MATCH, "\"1000;length=7\""));
+        ServerRequest request = mock(ServerRequest.class);
+        ServerResponse response = mock(ServerResponse.class);
+
+        when(request.headers()).thenReturn(ServerRequestHeaders.create(headers));
+
+        HttpException actual = assertThrows(HttpException.class,
+                                            () -> handler.handle(LruCache.create(),
+                                                                 Method.GET,
+                                                                 request,
+                                                                 response,
+                                                                 "resource.txt"));
+
+        assertThat(actual.status(), is(Status.NOT_MODIFIED_304));
+        assertThat(openedStreams.get(), is(0));
+    }
+
+    @Test
+    void testUrlGetOpensBodyOnce() throws IOException {
+        AtomicInteger openedStreams = new AtomicInteger();
+        CachedHandler handler = CachedHandlerUrlStream.create(MediaTypes.TEXT_PLAIN, trackingUrl(openedStreams, 1000));
+        ServerRequest request = mock(ServerRequest.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse response = mock(ServerResponse.class);
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+        when(response.headers()).thenReturn(responseHeaders);
+        when(response.outputStream()).thenReturn(body);
+
+        assertThat(handler.handle(LruCache.create(), Method.GET, request, response, "resource.txt"), is(true));
+
+        assertThat(openedStreams.get(), is(1));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testJarExtractedPathUnavailableFallsBackToJarStream() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile();
+        CachedHandlerJar handler = CachedHandlerJar.create(TemporaryStorage.create(builder -> builder
+                                                                      .directory(tempDir)
+                                                                      .deleteOnExit(false)),
+                                                           jarUrl(jarFile, "resource.txt"),
+                                                           null,
+                                                           MediaTypes.TEXT_PLAIN,
+                                                           7);
+        List<Path> extractedFiles;
+        try (Stream<Path> files = Files.list(tempDir)) {
+            extractedFiles = files.toList();
+        }
+        Path extractedFile = extractedFiles.getFirst();
+        Files.delete(extractedFile);
+        Files.createDirectory(extractedFile);
+        ServerRequest req = mock(ServerRequest.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse res = mock(ServerResponse.class);
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(res.headers()).thenReturn(responseHeaders);
+        when(res.outputStream()).thenReturn(body);
+
+        assertThat(handler.handle(LruCache.create(), Method.GET, req, res, "resource.txt"), is(true));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testJarExtractedPathTransferFailureDoesNotRetryJarStream() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile();
+        CachedHandler handler = CachedHandlerJar.create(TemporaryStorage.create(builder -> builder
+                                                                   .directory(tempDir)
+                                                                   .deleteOnExit(false)),
+                                                        jarUrl(jarFile, "resource.txt"),
+                                                        null,
+                                                        MediaTypes.TEXT_PLAIN,
+                                                        7)
+                .withRepresentation(ResponseRepresentation.encoded("br"));
+        IOException failure = new IOException("Sidecar send failed");
+        OutputStream failingOutput = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw failure;
+            }
+        };
+        ServerRequest request = mock(ServerRequest.class);
+        ServerResponse response = mock(ServerResponse.class);
+
+        when(request.headers()).thenReturn(ServerRequestHeaders.create());
+        when(response.headers()).thenReturn(ServerResponseHeaders.create());
+        when(response.outputStream()).thenReturn(failingOutput);
+
+        IOException actual = assertThrows(IOException.class,
+                                          () -> handler.handle(LruCache.create(),
+                                                               Method.GET,
+                                                               request,
+                                                               response,
+                                                               "resource.txt"));
+
+        assertThat(actual, sameInstance(failure));
+        verify(response).outputStream();
+    }
+
+    @Test
+    void testClasspathCacheHitDoesNotResolveIdentityUrlAgain() throws IOException, URISyntaxException {
+        CountingClassLoader classLoader = new CountingClassLoader("web/resource.txt", "web/resource.txt.br");
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(classLoader)
+                        .build());
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(acceptEncodingHeaders("br"));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1", "http", "1.1", Method.GET, "/resource.txt", false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+        when(res.outputStream()).thenReturn(new ByteArrayOutputStream());
+
+        assertThat(handler.doHandle(Method.GET, "resource.txt", req, res, false), is(true));
+        assertThat(classLoader.lookups("web/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/resource.txt.br"), is(1));
+
+        assertThat(handler.doHandle(Method.GET, "resource.txt", req, res, false), is(true));
+        assertThat(classLoader.lookups("web/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/resource.txt.br"), is(1));
+    }
+
+    @Test
+    void testSingleFileClasspathCacheHitDoesNotResolveIdentityUrlAgain() throws IOException, URISyntaxException {
+        CountingClassLoader classLoader = new CountingClassLoader("web/resource.txt", "web/resource.txt.br");
+        SingleFileClassPathContentHandler handler = (SingleFileClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web/resource.txt")
+                        .singleFile(true)
+                        .classLoader(classLoader)
+                        .build());
+        handler.beforeStart();
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(acceptEncodingHeaders("br"));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1", "http", "1.1", Method.GET, "/resource.txt", false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+        when(res.outputStream()).thenReturn(new ByteArrayOutputStream());
+
+        assertThat(classLoader.lookups("web/resource.txt"), is(1));
+        assertThat(handler.doHandle(Method.GET, "resource.txt", req, res, false), is(true));
+        assertThat(classLoader.lookups("web/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/resource.txt.br"), is(1));
+
+        assertThat(handler.doHandle(Method.GET, "resource.txt", req, res, false), is(true));
+        assertThat(classLoader.lookups("web/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/resource.txt.br"), is(1));
+    }
+
+    @Test
+    void testClasspathSidecarMissDoesNotEvictPrimaryRecord() throws IOException, URISyntaxException {
+        CountingClassLoader classLoader = new CountingClassLoader("web/nested/resource.txt", "web/nested/resource.txt.br");
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(classLoader)
+                        .recordCacheCapacity(1)
+                        .build());
+        ServerRequestHeaders requestHeaders = acceptEncodingHeaders("br");
+
+        ByteArrayOutputStream firstBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "nested/resource.txt",
+                                    request("/nested/resource.txt", requestHeaders),
+                                    response(ServerResponseHeaders.create(), firstBody),
+                                    false), is(true));
+        assertThat(firstBody.toString(StandardCharsets.UTF_8), is("Nested content"));
+        assertThat(classLoader.lookups("web/nested/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/nested/resource.txt.br"), is(1));
+
+        ByteArrayOutputStream secondBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "nested/resource.txt",
+                                    request("/nested/resource.txt", requestHeaders),
+                                    response(ServerResponseHeaders.create(), secondBody),
+                                    false), is(true));
+        assertThat(secondBody.toString(StandardCharsets.UTF_8), is("Nested content"));
+        assertThat(classLoader.lookups("web/nested/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/nested/resource.txt.br"), is(2));
+    }
+
+    @Test
+    void testSingleFileClasspathSidecarMissDoesNotEvictPrimaryRecord() throws IOException, URISyntaxException {
+        CountingClassLoader classLoader = new CountingClassLoader("web/nested/resource.txt", "web/nested/resource.txt.br");
+        SingleFileClassPathContentHandler handler = (SingleFileClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web/nested/resource.txt")
+                        .singleFile(true)
+                        .classLoader(classLoader)
+                        .recordCacheCapacity(1)
+                        .build());
+        handler.beforeStart();
+        ServerRequestHeaders requestHeaders = acceptEncodingHeaders("br");
+
+        assertThat(classLoader.lookups("web/nested/resource.txt"), is(1));
+        ByteArrayOutputStream firstBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "nested/resource.txt",
+                                    request("/nested/resource.txt", requestHeaders),
+                                    response(ServerResponseHeaders.create(), firstBody),
+                                    false), is(true));
+        assertThat(firstBody.toString(StandardCharsets.UTF_8), is("Nested content"));
+        assertThat(classLoader.lookups("web/nested/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/nested/resource.txt.br"), is(1));
+
+        ByteArrayOutputStream secondBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "nested/resource.txt",
+                                    request("/nested/resource.txt", requestHeaders),
+                                    response(ServerResponseHeaders.create(), secondBody),
+                                    false), is(true));
+        assertThat(secondBody.toString(StandardCharsets.UTF_8), is("Nested content"));
+        assertThat(classLoader.lookups("web/nested/resource.txt"), is(1));
+        assertThat(classLoader.lookups("web/nested/resource.txt.br"), is(2));
+    }
+
+    @Test
+    void testClasspathSidecarCacheDoesNotPolluteLiteralResource() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile(Map.of("web/resource.txt", "Content",
+                                               "web/resource.txt.br", "Brotli content"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new JarResourceClassLoader(jarFile))
+                        .memoryCache(MemoryCache.create(builder -> builder.enabled(true)))
+                        .build());
+
+        ServerResponseHeaders brHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream brBody = new ByteArrayOutputStream();
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(brHeaders, brBody),
+                                    false), is(true));
+        assertThat(brHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(brBody.toString(StandardCharsets.UTF_8), is("Brotli content"));
+
+        ServerResponseHeaders literalHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream literalBody = new ByteArrayOutputStream();
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt.br",
+                                    request("/resource.txt.br", ServerRequestHeaders.create()),
+                                    response(literalHeaders, literalBody),
+                                    false), is(true));
+        assertThat(literalHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(literalBody.toString(StandardCharsets.UTF_8), is("Brotli content"));
+    }
+
+    @Test
+    void testClasspathSidecarMemoryLoadFailureFallsBackToIdentity() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile(Map.of("web/resource.txt", "Content",
+                                               "web/resource.txt.br", "Brotli content"));
+        URL identityUrl = jarUrl(jarFile, "web/resource.txt");
+        URL regularSidecarUrl = jarUrl(jarFile, "web/resource.txt.br");
+        JarEntry sidecarEntry;
+        try (JarFile sourceJar = new JarFile(jarFile.toFile())) {
+            sidecarEntry = new JarEntry(sourceJar.getJarEntry("web/resource.txt.br"));
+        }
+        AtomicInteger sidecarReads = new AtomicInteger();
+        URL failingSidecarUrl = new URL(null, regularSidecarUrl.toExternalForm(), new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) throws IOException {
+                return new JarURLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public JarFile getJarFile() throws IOException {
+                        return new JarFile(jarFile.toFile());
+                    }
+
+                    @Override
+                    public JarEntry getJarEntry() {
+                        return sidecarEntry;
+                    }
+
+                    @Override
+                    public InputStream getInputStream() throws IOException {
+                        sidecarReads.incrementAndGet();
+                        throw new IOException("Sidecar read failed");
+                    }
+                };
+            }
+        });
+        ClassLoader classLoader = new ClassLoader(Thread.currentThread().getContextClassLoader()) {
+            @Override
+            public URL getResource(String name) {
+                return switch (name) {
+                case "web/resource.txt" -> identityUrl;
+                case "web/resource.txt.br" -> failingSidecarUrl;
+                default -> super.getResource(name);
+                };
+            }
+
+            @Override
+            public Enumeration<URL> getResources(String name) throws IOException {
+                if ("web/resource.txt.br".equals(name)) {
+                    return Collections.enumeration(List.of(failingSidecarUrl));
+                }
+                return super.getResources(name);
+            }
+        };
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(classLoader)
+                        .memoryCache(MemoryCache.create(builder -> builder.enabled(true)))
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(headers, body),
+                                    false), is(true));
+
+        assertThat(sidecarReads.get(), is(1));
+        assertThat(headers, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(headers, hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testClasspathSidecarBytesUseGlobalMemoryCacheCapacity() throws IOException, URISyntaxException {
+        Path jarFile = createTmpJarFile(Map.of("web/resource.txt", "Content larger than memory",
+                                               "web/resource.txt.br", "br-data!"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new JarResourceClassLoader(jarFile))
+                        .memoryCache(MemoryCache.create(builder -> builder.enabled(true)
+                                .capacity(Size.create(12))))
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(headers, body),
+                                    false), is(true));
+
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("br-data!"));
+        assertThat(handler.canCacheInMemory(4), is(true));
+        assertThat(handler.canCacheInMemory(5), is(false));
+    }
+
+    @Test
+    void testClasspathCachedSidecarBytesSurviveRecordCacheEviction() throws IOException, URISyntaxException {
+        Path identityJar = createTmpJarFile(Map.of("web/resource.txt", "Content larger than memory",
+                                                   "web/other.txt", "Other larger than memory"));
+        Path sidecarJar = createTmpJarFile(Map.of("web/resource.txt.br", "br-data!"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new MappedJarResourceClassLoader(
+                                Map.of("web/resource.txt", List.of(identityJar),
+                                       "web/resource.txt.br", List.of(sidecarJar),
+                                       "web/other.txt", List.of(identityJar))))
+                        .memoryCache(MemoryCache.create(builder -> builder.enabled(true)
+                                .capacity(Size.create(8))))
+                        .recordCacheCapacity(1)
+                        .preCompressedCrossOriginSourcingEnabled(true)
+                        .build());
+
+        ServerResponseHeaders firstHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream firstBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(firstHeaders, firstBody),
+                                    false), is(true));
+        assertThat(firstHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(firstBody.toString(StandardCharsets.UTF_8), is("br-data!"));
+        assertThat(handler.canCacheInMemory(1), is(false));
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "other.txt",
+                                    request("/other.txt", ServerRequestHeaders.create()),
+                                    response(ServerResponseHeaders.create(), new ByteArrayOutputStream()),
+                                    false), is(true));
+
+        Files.delete(sidecarJar);
+
+        ServerResponseHeaders secondHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream secondBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(secondHeaders, secondBody),
+                                    false), is(true));
+        assertThat(secondHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(secondBody.toString(StandardCharsets.UTF_8), is("br-data!"));
+    }
+
+    @Test
+    void testClasspathSidecarFromDifferentJarIsIgnored() throws IOException, URISyntaxException {
+        Path identityJar = createTmpJarFile(Map.of("web/resource.txt", "Content"));
+        Path sidecarJar = createTmpJarFile(Map.of("web/resource.txt.br", "Brotli content"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new MappedJarResourceClassLoader(
+                                Map.of("web/resource.txt", List.of(identityJar),
+                                       "web/resource.txt.br", List.of(sidecarJar))))
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(headers, body),
+                                    false), is(true));
+
+        assertThat(headers, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(headers, hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testClasspathJarOriginUsesStructuralUrlComparison() throws IOException, URISyntaxException {
+        URL identityUrl = URI.create("jar:http://localhost/resources.jar!/web/resource.txt").toURL();
+        URL sidecarUrl = URI.create("jar:http://127.0.0.1/resources.jar!/web/resource.txt.br").toURL();
+
+        assertThat(ClassPathContentHandler.sameJarOrigin("web/resource.txt",
+                                                         identityUrl,
+                                                         "web/resource.txt.br",
+                                                         sidecarUrl),
+                   is(false));
+    }
+
+    @Test
+    void testClasspathSidecarSymlinkOutsideOriginIsRejected() throws IOException, URISyntaxException {
+        assertClasspathSidecarSymlinkOutsideOriginIsRejected(false);
+    }
+
+    @Test
+    void testSingleFileClasspathSidecarSymlinkOutsideOriginIsRejected() throws IOException, URISyntaxException {
+        assertClasspathSidecarSymlinkOutsideOriginIsRejected(true);
+    }
+
+    @Test
+    void testClasspathCachedSidecarRetargetedOutsideOriginIsRejected() throws IOException, URISyntaxException {
+        Path classPathRoot = tempDir.resolve("classpath");
+        Path resourceRoot = classPathRoot.resolve("web");
+        Path resource = resourceRoot.resolve("resource.txt");
+        Path gzip = resourceRoot.resolve("resource.txt.gz");
+        Path secret = tempDir.resolve("secret.gz");
+        Files.createDirectories(resourceRoot);
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        Files.writeString(secret, "Secret content");
+
+        try (var classLoader = new URLClassLoader(new URL[] {classPathRoot.toUri().toURL()}, null)) {
+            ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                    classpathHandlerBuilder()
+                            .location("/web")
+                            .classLoader(classLoader)
+                            .build());
+
+            ServerResponseHeaders firstHeaders = ServerResponseHeaders.create();
+            ByteArrayOutputStream firstBody = new ByteArrayOutputStream();
+            assertThat(handler.doHandle(Method.GET,
+                                        "resource.txt",
+                                        request("/resource.txt", acceptEncodingHeaders("gzip, identity;q=0")),
+                                        response(firstHeaders, firstBody),
+                                        false), is(true));
+            assertThat(firstHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+            assertThat(firstBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+            createSymbolicLink(gzip, secret);
+
+            ByteArrayOutputStream rejectedBody = new ByteArrayOutputStream();
+            ServerResponse rejectedResponse = response(ServerResponseHeaders.create(), rejectedBody);
+            HttpException actual = assertThrows(HttpException.class,
+                                                () -> handler.doHandle(
+                                                        Method.GET,
+                                                        "resource.txt",
+                                                        request("/resource.txt",
+                                                                acceptEncodingHeaders("gzip, identity;q=0")),
+                                                        rejectedResponse,
+                                                        false));
+            assertThat(actual.status(), is(Status.NOT_ACCEPTABLE_406));
+            assertThat(actual.headers(), noHeader(HeaderNames.CONTENT_ENCODING));
+            assertThat(actual.headers(), hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+            assertThat(rejectedBody.size(), is(0));
+        }
+    }
+
+    @Test
+    void testClasspathCrossOriginSidecarCanBeEnabled() throws IOException, URISyntaxException {
+        Path identityJar = createTmpJarFile(Map.of("web/resource.txt", "Content"));
+        Path sidecarJar = createTmpJarFile(Map.of("web/resource.txt.br", "Brotli content"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new MappedJarResourceClassLoader(
+                                Map.of("web/resource.txt", List.of(identityJar),
+                                       "web/resource.txt.br", List.of(sidecarJar))))
+                        .preCompressedCrossOriginSourcingEnabled(true)
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(headers, body),
+                                    false), is(true));
+
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(headers, hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Brotli content"));
+    }
+
+    @Test
+    void testClasspathSidecarSkipsCrossOriginAndUsesSameOriginCandidate() throws IOException, URISyntaxException {
+        Path identityJar = createTmpJarFile(Map.of("web/resource.txt", "Content",
+                                                   "web/resource.txt.br", "Same origin Brotli content"));
+        Path crossOriginJar = createTmpJarFile(Map.of("web/resource.txt.br", "Cross origin Brotli content"));
+        ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                classpathHandlerBuilder()
+                        .location("/web")
+                        .classLoader(new MappedJarResourceClassLoader(
+                                Map.of("web/resource.txt", List.of(identityJar),
+                                       "web/resource.txt.br", List.of(crossOriginJar, identityJar))))
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("br")),
+                                    response(headers, body),
+                                    false), is(true));
+
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "br"));
+        assertThat(headers, hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Same origin Brotli content"));
+    }
+
+    @Test
+    void testFileSystemSidecarBecomesAvailableAfterMiss() throws IOException {
+        Path resource = tempDir.resolve("resource.txt");
+        Path gzip = tempDir.resolve("resource.txt.gz");
+        Files.writeString(resource, "Content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .build());
+
+        ServerResponseHeaders missHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream missBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(missHeaders, missBody),
+                                    false), is(true));
+        assertThat(missHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(missBody.toString(StandardCharsets.UTF_8), is("Content"));
+
+        Files.writeString(gzip, "Gzip content");
+
+        ServerResponseHeaders addedHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream addedBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(addedHeaders, addedBody),
+                                    false), is(true));
+        assertThat(addedHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(addedBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        handler.releaseCache();
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+    }
+
+    @Test
+    void testFileSystemInMemoryWelcomeAliasPublishesLogicalPathAtomically() throws IOException {
+        Path directory = tempDir.resolve("directory");
+        Files.createDirectories(directory);
+        Files.writeString(directory.resolve("index.html"), "Welcome content");
+        Files.writeString(directory.resolve("index.html.gz"), "Gzip welcome content");
+        Files.writeString(tempDir.resolve("directory.gz"), "Wrong gzip content");
+
+        CompletableFuture<Void> aliasPublished = new CompletableFuture<>();
+        CompletableFuture<Void> continuePublication = new CompletableFuture<>();
+        FileSystemContentHandler handler = new FileSystemContentHandler(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .cachedFiles(Set.of("directory/index.html"))
+                        .welcome("index.html")
+                        .build()) {
+            @Override
+            void cacheInMemory(String resource, CachedHandlerInMemory cachedHandler) {
+                super.cacheInMemory(resource, cachedHandler);
+                if ("directory/".equals(resource)) {
+                    aliasPublished.complete(null);
+                    continuePublication.join();
+                }
+            }
+        };
+        handler.beforeStart();
+
+        CompletableFuture<Boolean> firstRequest = new CompletableFuture<>();
+        Thread.startVirtualThread(() -> {
+            try {
+                firstRequest.complete(handler.doHandle(Method.GET,
+                                                       "directory",
+                                                       request("/directory/",
+                                                               acceptEncodingHeaders("gzip, identity;q=0")),
+                                                       response(ServerResponseHeaders.create(),
+                                                                new ByteArrayOutputStream()),
+                                                       false));
+            } catch (Throwable e) {
+                firstRequest.completeExceptionally(e);
+            }
+        });
+
+        CompletableFuture.anyOf(aliasPublished, firstRequest).join();
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        try {
+            assertThat(handler.doHandle(Method.GET,
+                                        "directory",
+                                        request("/directory/", acceptEncodingHeaders("gzip, identity;q=0")),
+                                        response(headers, body),
+                                        false), is(true));
+        } finally {
+            continuePublication.complete(null);
+        }
+
+        assertThat(firstRequest.join(), is(true));
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Gzip welcome content"));
+    }
+
+    @Test
+    void testFileSystemCachedSidecarDeletionFallsBackToIdentity() throws IOException {
+        Path resource = tempDir.resolve("resource.txt");
+        Path gzip = tempDir.resolve("resource.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .build());
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        Files.delete(gzip);
+
+        ServerResponseHeaders staleHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream staleBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(staleHeaders, staleBody),
+                                    false), is(true));
+        assertThat(staleHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(staleBody.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testFileSystemCachedShorterSidecarReplacementInvalidatesConditionalHead() throws IOException {
+        Path resource = tempDir.resolve("shorter.txt");
+        Path gzip = tempDir.resolve("shorter.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Original gzip content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .build());
+
+        ServerResponseHeaders initialHeaders = ServerResponseHeaders.create();
+        assertThat(handler.doHandle(Method.GET,
+                                    "shorter.txt",
+                                    request("/shorter.txt", acceptEncodingHeaders("gzip")),
+                                    response(initialHeaders, new ByteArrayOutputStream()),
+                                    false), is(true));
+        String originalEtag = initialHeaders.get(HeaderNames.ETAG).get();
+
+        replaceFile(gzip, "New gzip");
+
+        WritableHeaders<?> conditionalHeaders = WritableHeaders.create();
+        conditionalHeaders.add(HeaderNames.ACCEPT_ENCODING, "gzip");
+        conditionalHeaders.add(HeaderNames.IF_NONE_MATCH, originalEtag);
+        ServerResponseHeaders fallbackHeaders = ServerResponseHeaders.create();
+        assertThat(handler.doHandle(Method.HEAD,
+                                    "shorter.txt",
+                                    request(Method.HEAD,
+                                            "/shorter.txt",
+                                            ServerRequestHeaders.create(conditionalHeaders)),
+                                    response(fallbackHeaders, new ByteArrayOutputStream()),
+                                    false), is(true));
+        assertThat(fallbackHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(fallbackHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "7"));
+
+        ServerResponseHeaders refreshedHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream refreshedBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "shorter.txt",
+                                    request("/shorter.txt", acceptEncodingHeaders("gzip")),
+                                    response(refreshedHeaders, refreshedBody),
+                                    false), is(true));
+        assertThat(refreshedHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(refreshedHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "8"));
+        assertThat(refreshedBody.toString(StandardCharsets.UTF_8), is("New gzip"));
+    }
+
+    @Test
+    void testFileSystemCachedLongerSidecarReplacementInvalidatesRange() throws IOException {
+        Path resource = tempDir.resolve("longer.txt");
+        Path gzip = tempDir.resolve("longer.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Old gzip");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .build());
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "longer.txt",
+                                    request("/longer.txt", acceptEncodingHeaders("gzip")),
+                                    response(ServerResponseHeaders.create(), new ByteArrayOutputStream()),
+                                    false), is(true));
+
+        String replacement = "New gzip content is longer";
+        replaceFile(gzip, replacement);
+
+        WritableHeaders<?> rangeHeaders = WritableHeaders.create();
+        rangeHeaders.add(HeaderNames.ACCEPT_ENCODING, "gzip");
+        rangeHeaders.add(HeaderNames.RANGE, "bytes=0-2");
+        ServerResponseHeaders fallbackHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream fallbackBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "longer.txt",
+                                    request("/longer.txt", ServerRequestHeaders.create(rangeHeaders)),
+                                    response(fallbackHeaders, fallbackBody),
+                                    false), is(true));
+        assertThat(fallbackHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(fallbackHeaders, hasHeader(HeaderNames.CONTENT_RANGE, "bytes 0-2/7"));
+        assertThat(fallbackBody.toString(StandardCharsets.UTF_8), is("Con"));
+
+        ServerResponseHeaders refreshedHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream refreshedBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "longer.txt",
+                                    request("/longer.txt", ServerRequestHeaders.create(rangeHeaders)),
+                                    response(refreshedHeaders, refreshedBody),
+                                    false), is(true));
+        assertThat(refreshedHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(refreshedHeaders,
+                   hasHeader(HeaderNames.CONTENT_RANGE, "bytes 0-2/" + replacement.length()));
+        assertThat(refreshedBody.toString(StandardCharsets.UTF_8), is("New"));
+    }
+
+    @Test
+    void testFileSystemSidecarSymlinkOutsideRootFallsBackToIdentity() throws IOException {
+        Path root = tempDir.resolve("root");
+        Path resource = root.resolve("resource.txt");
+        Path gzip = root.resolve("resource.txt.gz");
+        Path secret = tempDir.resolve("secret.gz");
+        Files.createDirectories(root);
+        Files.writeString(resource, "Content");
+        Files.writeString(secret, "Secret content");
+        createSymbolicLink(gzip, secret);
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(headers, body),
+                                    false), is(true));
+        assertThat(headers, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testFileSystemCachedSidecarRetargetedOutsideRootFallsBackToRangedIdentity() throws IOException {
+        Path root = tempDir.resolve("root");
+        Path resource = root.resolve("resource.txt");
+        Path gzip = root.resolve("resource.txt.gz");
+        Path secret = tempDir.resolve("secret.gz");
+        Files.createDirectories(root);
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        Files.writeString(secret, "Secret content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .build());
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        createSymbolicLink(gzip, secret);
+
+        WritableHeaders<?> requestHeaders = WritableHeaders.create();
+        requestHeaders.add(HeaderNames.ACCEPT_ENCODING, "gzip");
+        requestHeaders.add(HeaderNames.RANGE, "bytes=0-2");
+        ServerResponseHeaders staleHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream staleBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", ServerRequestHeaders.create(requestHeaders)),
+                                    response(staleHeaders, staleBody),
+                                    false), is(true));
+        assertThat(staleHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(staleBody.toString(StandardCharsets.UTF_8), is("Con"));
+    }
+
+    @Test
+    void testFileSystemIdentityRemovalEvictsCachedSidecarSelection() throws IOException {
+        Path resource = tempDir.resolve("resource.txt");
+        Path gzip = tempDir.resolve("resource.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(tempDir)
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(headers, body),
+                                    false), is(true));
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+
+        Files.delete(resource);
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "resource.txt",
+                                    request("/resource.txt", acceptEncodingHeaders("gzip")),
+                                    response(ServerResponseHeaders.create(), new ByteArrayOutputStream()),
+                                    false),
+                   is(false));
+        assertThat(handler.cacheHandler("resource.txt"), optionalEmpty());
+    }
+
+    @Test
+    void testSingleFileSystemSidecarBecomesAvailableAfterMiss() throws IOException {
+        Path resource = tempDir.resolve("single.txt");
+        Path gzip = tempDir.resolve("single.txt.gz");
+        Files.writeString(resource, "Content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ServerResponseHeaders missHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream missBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(missHeaders, missBody),
+                                    false), is(true));
+        assertThat(missHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(missBody.toString(StandardCharsets.UTF_8), is("Content"));
+
+        Files.writeString(gzip, "Gzip content");
+
+        ServerResponseHeaders addedHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream addedBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(addedHeaders, addedBody),
+                                    false), is(true));
+        assertThat(addedHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(addedBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        handler.releaseCache();
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+    }
+
+    @Test
+    void testSingleFileSystemCachedSidecarDeletionFallsBackToIdentity() throws IOException {
+        Path resource = tempDir.resolve("single.txt");
+        Path gzip = tempDir.resolve("single.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        Files.delete(gzip);
+
+        ServerResponseHeaders staleHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream staleBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(staleHeaders, staleBody),
+                                    false), is(true));
+        assertThat(staleHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(staleBody.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testSingleFileSystemSidecarSymlinkOutsideParentFallsBackToIdentity() throws IOException {
+        Path root = tempDir.resolve("root");
+        Path resource = root.resolve("single.txt");
+        Path gzip = root.resolve("single.txt.gz");
+        Path secret = tempDir.resolve("secret.gz");
+        Files.createDirectories(root);
+        Files.writeString(resource, "Content");
+        Files.writeString(secret, "Secret content");
+        createSymbolicLink(gzip, secret);
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(headers, body),
+                                    false), is(true));
+        assertThat(headers, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(body.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testSingleFileSystemSidecarSymlinkToSiblingIsRejected() throws IOException {
+        Path root = tempDir.resolve("root");
+        Path resource = root.resolve("single.txt");
+        Path gzip = root.resolve("single.txt.gz");
+        Path secret = root.resolve("secret.gz");
+        Files.createDirectories(root);
+        Files.writeString(resource, "Content");
+        Files.writeString(secret, "Secret content");
+        createSymbolicLink(gzip, secret);
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        ServerResponse response = response(ServerResponseHeaders.create(), body);
+        HttpException actual = assertThrows(HttpException.class,
+                                            () -> handler.doHandle(
+                                                    Method.GET,
+                                                    "",
+                                                    request("/single", acceptEncodingHeaders("gzip, identity;q=0")),
+                                                    response,
+                                                    false));
+        assertThat(actual.status(), is(Status.NOT_ACCEPTABLE_406));
+        assertThat(actual.headers(), noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(actual.headers(), hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+        assertThat(body.size(), is(0));
+    }
+
+    @Test
+    void testSingleFileSystemCachedSidecarRetargetedOutsideParentFallsBackToIdentity() throws IOException {
+        Path root = tempDir.resolve("root");
+        Path resource = root.resolve("single.txt");
+        Path gzip = root.resolve("single.txt.gz");
+        Path secret = tempDir.resolve("secret.gz");
+        Files.createDirectories(root);
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        Files.writeString(secret, "Secret content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ServerResponseHeaders hitHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream hitBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(hitHeaders, hitBody),
+                                    false), is(true));
+        assertThat(hitHeaders, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+        assertThat(hitBody.toString(StandardCharsets.UTF_8), is("Gzip content"));
+
+        createSymbolicLink(gzip, secret);
+
+        ServerResponseHeaders staleHeaders = ServerResponseHeaders.create();
+        ByteArrayOutputStream staleBody = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(staleHeaders, staleBody),
+                                    false), is(true));
+        assertThat(staleHeaders, noHeader(HeaderNames.CONTENT_ENCODING));
+        assertThat(staleBody.toString(StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testSingleFileSystemIdentityRemovalEvictsCachedSidecarSelection() throws IOException {
+        Path resource = tempDir.resolve("single.txt");
+        Path gzip = tempDir.resolve("single.txt.gz");
+        Files.writeString(resource, "Content");
+        Files.writeString(gzip, "Gzip content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(resource)
+                        .preCompressedEnabled(true)
+                        .build());
+
+        ServerResponseHeaders headers = ServerResponseHeaders.create();
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(headers, body),
+                                    false), is(true));
+        assertThat(headers, hasHeader(HeaderNames.CONTENT_ENCODING, "gzip"));
+
+        Files.delete(resource);
+
+        assertThat(handler.doHandle(Method.GET,
+                                    "",
+                                    request("/single", acceptEncodingHeaders("gzip")),
+                                    response(ServerResponseHeaders.create(), new ByteArrayOutputStream()),
+                                    false),
+                   is(false));
+        assertThat(handler.cacheHandler("."), optionalEmpty());
     }
 
     @Test
@@ -192,8 +1880,738 @@ class CachedHandlerTest {
         assertThat("Cached bytes must not be empty", cached.bytes(), not(BufferData.EMPTY_BYTES));
         // content is: "Nested content"
         assertThat("Content length", cached.contentLength(), is(14));
-        assertThat("Last modified", cached.lastModified(), notNullValue());
-        assertThat("Media type", cached.mediaType(), is(MediaTypes.TEXT_PLAIN));
+    }
+
+    @Test
+    void testFsInMemoryRangePastFileLength(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.builder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        var headers = WritableHeaders.create();
+        headers.add(HeaderValues.create(HeaderNames.RANGE, "bytes=1-9223372036854775807"));
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create(headers));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.GET,
+                                                            "/resource.txt",
+                                                            false));
+
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(responseHeaders);
+
+        assertThat("Handler should serve the cached resource",
+                   handler.doHandle(Method.GET, "resource.txt", req, res, false),
+                   is(true));
+
+        ArgumentCaptor<byte[]> bytesCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(res).status(Status.PARTIAL_CONTENT_206);
+        verify(res).send(bytesCaptor.capture());
+
+        assertThat(responseHeaders, hasHeader(HeaderNames.CONTENT_RANGE, "bytes 1-6/7"));
+        assertThat(responseHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "6"));
+        assertThat("Response body", new String(bytesCaptor.getValue(), StandardCharsets.UTF_8), is("ontent"));
+    }
+
+    @Test
+    void testFsInMemoryStaleIfRangeSendsFullRepresentation(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.builder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        var headers = WritableHeaders.create();
+        headers.add(HeaderValues.create(HeaderNames.RANGE, "bytes=0-0"));
+        headers.add(HeaderValues.create(HeaderNames.IF_RANGE, "\"old-etag\""));
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create(headers));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.GET,
+                                                            "/resource.txt",
+                                                            false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Handler should serve the cached resource",
+                   handler.doHandle(Method.GET, "resource.txt", req, res, false),
+                   is(true));
+
+        ArgumentCaptor<byte[]> bytesCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(res, never()).status(Status.PARTIAL_CONTENT_206);
+        verify(res).send(bytesCaptor.capture());
+        assertThat("Response body", new String(bytesCaptor.getValue(), StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testFsInMemoryDateIfRangeSendsFullRepresentation(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.builder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        var headers = WritableHeaders.create();
+        headers.add(HeaderValues.create(HeaderNames.RANGE, "bytes=0-0"));
+        headers.add(HeaderValues.create(HeaderNames.IF_RANGE, "Wed, 21 Oct 2015 07:28:00 GMT"));
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create(headers));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.GET,
+                                                            "/resource.txt",
+                                                            false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Handler should serve the cached resource",
+                   handler.doHandle(Method.GET, "resource.txt", req, res, false),
+                   is(true));
+
+        ArgumentCaptor<byte[]> bytesCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(res, never()).status(Status.PARTIAL_CONTENT_206);
+        verify(res).send(bytesCaptor.capture());
+        assertThat("Response body", new String(bytesCaptor.getValue(), StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testFsInMemoryUnsupportedRangeUnitSendsFullRepresentation(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.builder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        var headers = WritableHeaders.create();
+        headers.add(HeaderValues.create(HeaderNames.RANGE, "items=0-0"));
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create(headers));
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.GET,
+                                                            "/resource.txt",
+                                                            false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Handler should serve the cached resource",
+                   handler.doHandle(Method.GET, "resource.txt", req, res, false),
+                   is(true));
+
+        ArgumentCaptor<byte[]> bytesCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(res, never()).status(Status.PARTIAL_CONTENT_206);
+        verify(res).send(bytesCaptor.capture());
+        assertThat("Response body", new String(bytesCaptor.getValue(), StandardCharsets.UTF_8), is("Content"));
+    }
+
+    @Test
+    void testFsInMemoryCacheSkipsSymlinkOutsideRoot(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path externalDir = tempDir.resolve("external");
+        Files.createDirectories(root);
+        Files.createDirectories(externalDir);
+        Files.writeString(externalDir.resolve("resource.txt"), "External content");
+
+        Path link = root.resolve("resource.txt");
+        createSymbolicLink(link, externalDir.resolve("resource.txt"));
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Out-of-root symlink should not be cached in memory",
+                   handler.cacheInMemory("resource.txt"),
+                   optionalEmpty());
+    }
+
+    @Test
+    void testFsInMemoryCacheSkipsSymlinkInsideRoot(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("target.txt"), "Content");
+
+        Path link = root.resolve("resource.txt");
+        createSymbolicLink(link, root.resolve("target.txt"));
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("In-root symlink should not be cached in memory",
+                   handler.cacheInMemory("resource.txt"),
+                   optionalEmpty());
+    }
+
+    @Test
+    void testFsInMemoryCacheSkipsSymlinkRoot(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path linkRoot = tempDir.resolve("link-root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        createSymbolicLink(linkRoot, root);
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(linkRoot)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Resource under symlink root should not be cached in memory",
+                   handler.cacheInMemory("resource.txt"),
+                   optionalEmpty());
+    }
+
+    @Test
+    void testNioFallbackServesNestedPathWithoutSecureDirectoryStream(@TempDir Path tempDir) throws IOException {
+        URI zipUri = URI.create("jar:" + tempDir.resolve("content.zip").toUri());
+        try (FileSystem fileSystem = FileSystems.newFileSystem(zipUri, Map.of("create", "true"))) {
+            Path root = fileSystem.getPath("/root");
+            Path nested = root.resolve("nested");
+            Files.createDirectories(nested);
+            Path nestedResource = nested.resolve("resource.txt");
+            Files.writeString(nestedResource, "Nested content");
+
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
+                assertThat(stream, not(instanceOf(SecureDirectoryStream.class)));
+            }
+
+            BasicFileAttributes attributes = FileBasedContentHandler.attributes(nestedResource, false, root);
+            assertThat(attributes.isRegularFile(), is(true));
+            byte[] bytes = FileBasedContentHandler.readAllBytes(nestedResource, false, root);
+            assertThat(new String(bytes, StandardCharsets.UTF_8), is("Nested content"));
+        }
+    }
+
+    @Test
+    void testFileSystemSymlinkRoot(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path linkRoot = tempDir.resolve("link-root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        createSymbolicLink(linkRoot, root);
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(linkRoot)
+                        .build());
+        handler.beforeStart();
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.HEAD,
+                                                            "/resource.txt",
+                                                            false));
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Symlink root should serve its resource tree",
+                   handler.doHandle(Method.HEAD, "resource.txt", req, res, false),
+                   is(true));
+    }
+
+    @Test
+    void testFsInMemoryCacheSkipsSymlinkInCachedDirectory(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path dir = root.resolve("dir");
+        Path externalDir = tempDir.resolve("external");
+        Files.createDirectories(dir);
+        Files.createDirectories(externalDir);
+        Files.writeString(dir.resolve("resource.txt"), "Content");
+        Files.writeString(externalDir.resolve("resource.txt"), "External content");
+        createSymbolicLink(dir.resolve("link.txt"), externalDir.resolve("resource.txt"));
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .cachedFiles(Set.of("dir"))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Plain file in cached directory should be cached in memory",
+                   handler.cacheInMemory("dir/resource.txt"),
+                   optionalPresent());
+        assertThat("Symlink child in cached directory should not be cached in memory",
+                   handler.cacheInMemory("dir/link.txt"),
+                   optionalEmpty());
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1", "http", "1.1", Method.HEAD, "/dir/link.txt", false));
+
+        ServerResponse res = mock(ServerResponse.class);
+
+        assertThat("Out-of-root symlink child should not be served",
+                   handler.doHandle(Method.HEAD, "dir/link.txt", req, res, false),
+                   is(false));
+        assertThat("Out-of-root symlink child should not remain cached",
+                   handler.cacheHandler("dir/link.txt"),
+                   optionalEmpty());
+    }
+
+    @Test
+    void testFsInMemoryCacheEvictsStaleEntryOnRestart(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path externalDir = tempDir.resolve("external");
+        Files.createDirectories(root);
+        Files.createDirectories(externalDir);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        Files.writeString(externalDir.resolve("resource.txt"), "External content");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Initial resource should be cached in memory",
+                   handler.cacheInMemory("resource.txt"),
+                   optionalPresent());
+
+        handler.afterStop();
+        createSymbolicLink(root.resolve("resource.txt"), externalDir.resolve("resource.txt"));
+        handler.beforeStart();
+
+        assertThat("Stale in-memory resource should be evicted after restart",
+                   handler.cacheInMemory("resource.txt"),
+                   optionalEmpty());
+    }
+
+    @Test
+    void testMemoryCacheClearReleasesCapacity(@TempDir Path tempDir) throws IOException {
+        Path firstRoot = tempDir.resolve("first-root");
+        Path secondRoot = tempDir.resolve("second-root");
+        Files.createDirectories(firstRoot);
+        Files.createDirectories(secondRoot);
+        Files.writeString(firstRoot.resolve("resource.txt"), "Content");
+        Files.writeString(secondRoot.resolve("resource.txt"), "Content");
+
+        MemoryCache memoryCache = MemoryCache.create(it -> it.capacity(Size.create(14)));
+        FileSystemContentHandler firstHandler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(firstRoot)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .memoryCache(memoryCache)
+                        .build());
+        FileSystemContentHandler secondHandler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(secondRoot)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .memoryCache(memoryCache)
+                        .build());
+        firstHandler.beforeStart();
+        secondHandler.beforeStart();
+
+        assertThat("Both configured files should consume the shared memory cache capacity",
+                   memoryCache.available(1),
+                   is(false));
+
+        firstHandler.afterStop();
+
+        assertThat("Clearing one handler memory cache should release only that handler capacity",
+                   memoryCache.available(7),
+                   is(true));
+        assertThat("Clearing one handler memory cache should remove that handler entry",
+                   firstHandler.cacheInMemory("resource.txt"),
+                   optionalEmpty());
+        assertThat("Clearing one handler memory cache should preserve the other handler entry",
+                   secondHandler.cacheInMemory("resource.txt"),
+                   optionalPresent());
+        assertThat("The second handler should still consume its shared capacity",
+                   memoryCache.available(8),
+                   is(false));
+
+        secondHandler.afterStop();
+
+        assertThat("Clearing both handlers should release all shared capacity",
+                   memoryCache.available(14),
+                   is(true));
+    }
+
+    @Test
+    void testMemoryCacheReplaceKeepsCapacity(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+
+        MemoryCache memoryCache = MemoryCache.create(it -> it.capacity(Size.create(8)));
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .memoryCache(memoryCache)
+                        .build());
+
+        handler.cacheInMemory("resource.txt",
+                              MediaTypes.TEXT_PLAIN,
+                              "Content".getBytes(StandardCharsets.UTF_8));
+        handler.cacheInMemory("resource.txt",
+                              MediaTypes.TEXT_PLAIN,
+                              "Content".getBytes(StandardCharsets.UTF_8));
+        handler.cacheInMemory("resource.txt",
+                              MediaTypes.TEXT_PLAIN,
+                              "X".getBytes(StandardCharsets.UTF_8));
+
+        assertThat("Replacing a cached resource with a smaller payload should release capacity",
+                   memoryCache.available(7),
+                   is(true));
+
+        handler.cacheInMemory("resource.txt",
+                              MediaTypes.TEXT_PLAIN,
+                              "Content".getBytes(StandardCharsets.UTF_8));
+
+        assertThat("Replacing a cached resource should not double-count its size",
+                   memoryCache.available(1),
+                   is(true));
+        assertThat("Replacing a cached resource with a larger payload should consume capacity",
+                   memoryCache.available(2),
+                   is(false));
+    }
+
+    @Test
+    void testMemoryCacheCountsAliasedHandlerOnce(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+
+        MemoryCache memoryCache = MemoryCache.create(it -> it.capacity(Size.create(10)));
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .memoryCache(memoryCache)
+                        .build());
+        handler.cacheInMemory("resource.txt",
+                              MediaTypes.TEXT_PLAIN,
+                              "12345".getBytes(StandardCharsets.UTF_8));
+        CachedHandlerInMemory cached = handler.cacheInMemory("resource.txt").orElseThrow();
+
+        handler.cacheInMemory("alias.txt", cached);
+
+        assertThat("Aliased cache keys should share the payload capacity",
+                   memoryCache.available(5),
+                   is(true));
+        assertThat("The shared payload should still consume its capacity",
+                   memoryCache.available(6),
+                   is(false));
+
+        byte[] replacementBytes = "1".getBytes(StandardCharsets.UTF_8);
+        CachedHandlerInMemory replacement = new CachedHandlerInMemory(StaticContentMetadata.create(MediaTypes.TEXT_PLAIN,
+                                                                                                    replacementBytes.length),
+                                                                       replacementBytes);
+        handler.cacheInMemory("alias.txt", replacement);
+
+        assertThat("Replacing one alias should retain both distinct payloads",
+                   memoryCache.available(4),
+                   is(true));
+        assertThat("Both distinct payloads should consume capacity",
+                   memoryCache.available(5),
+                   is(false));
+
+        handler.cacheInMemory("resource.txt", replacement);
+
+        assertThat("Replacing the last original alias should release its payload",
+                   memoryCache.available(9),
+                   is(true));
+
+        handler.releaseCache();
+
+        assertThat("Clearing aliases should release their shared capacity",
+                   memoryCache.available(10),
+                   is(true));
+    }
+
+    @Test
+    void testSingleFileSymlink(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path externalDir = tempDir.resolve("external");
+        Files.createDirectories(root);
+        Files.createDirectories(externalDir);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        Files.writeString(externalDir.resolve("resource.txt"), "External content");
+
+        Path link = root.resolve("link.txt");
+        createSymbolicLink(link, root.resolve("resource.txt"));
+
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(link)
+                        .build());
+        handler.beforeStart();
+        ServerRequest req = request(Method.HEAD, "/link.txt", ServerRequestHeaders.create());
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Initial single-file symlink target should be served",
+                   handler.doHandle(Method.HEAD, "", req, res, false),
+                   is(true));
+    }
+
+    @Test
+    void testSingleFileAdditionAfterMiss(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("added-after-miss.txt");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.create(file));
+        handler.beforeStart();
+
+        ServerRequest req = request(Method.HEAD, "/added-after-miss.txt", ServerRequestHeaders.create());
+
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(responseHeaders);
+
+        assertThat("Missing single file should not be cached",
+                   handler.doHandle(Method.HEAD, "", req, res, false),
+                   is(false));
+
+        Files.writeString(file, "Content");
+
+        assertThat("New single file should be discovered after an earlier miss",
+                   handler.doHandle(Method.HEAD, "", req, res, false),
+                   is(true));
+        assertThat(responseHeaders, hasHeader(RESOURCE_CONTENT_LENGTH));
+        assertThat(responseHeaders, hasHeader(HeaderNames.ETAG));
+        assertThat(responseHeaders, hasHeader(HeaderNames.LAST_MODIFIED));
+    }
+
+    @Test
+    void testSingleFileRemovalAndReaddition(@TempDir Path tempDir) throws IOException {
+        Path file = Files.writeString(tempDir.resolve("removed-and-readded.txt"), "Initial content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.create(file));
+        handler.beforeStart();
+
+        ServerRequest req = request(Method.HEAD, "/removed-and-readded.txt", ServerRequestHeaders.create());
+
+        ServerResponse initialResponse = mock(ServerResponse.class);
+        ServerResponseHeaders initialHeaders = ServerResponseHeaders.create();
+        when(initialResponse.headers()).thenReturn(initialHeaders);
+
+        assertThat("Initial single file should be served",
+                   handler.doHandle(Method.HEAD, "", req, initialResponse, false),
+                   is(true));
+        assertThat(initialHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "15"));
+
+        Files.delete(file);
+
+        ServerResponse removedResponse = mock(ServerResponse.class);
+        ServerResponseHeaders removedHeaders = ServerResponseHeaders.create();
+        when(removedResponse.headers()).thenReturn(removedHeaders);
+
+        assertThat("Removed single file should not be served",
+                   handler.doHandle(Method.HEAD, "", req, removedResponse, false),
+                   is(false));
+        assertThat("Removed single file handler should be evicted", handler.cacheHandler("."), optionalEmpty());
+        assertThat(removedHeaders.contains(HeaderNames.CONTENT_LENGTH), is(false));
+
+        Files.writeString(file, "Re-added content");
+
+        ServerResponse readdedResponse = mock(ServerResponse.class);
+        ServerResponseHeaders readdedHeaders = ServerResponseHeaders.create();
+        when(readdedResponse.headers()).thenReturn(readdedHeaders);
+
+        assertThat("Re-added single file should be served",
+                   handler.doHandle(Method.HEAD, "", req, readdedResponse, false),
+                   is(true));
+        assertThat(readdedHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "16"));
+    }
+
+    @Test
+    void testCachedSingleFileGetEvictsUnopenablePathAndRecovers(@TempDir Path tempDir) throws IOException {
+        assertCachedSingleFileEvictsUnopenablePathAndRecovers(tempDir, Method.GET);
+    }
+
+    @Test
+    void testCachedSingleFileHeadEvictsUnopenablePathAndRecovers(@TempDir Path tempDir) throws IOException {
+        assertCachedSingleFileEvictsUnopenablePathAndRecovers(tempDir, Method.HEAD);
+    }
+
+    @Test
+    void testCachedSingleFileGetEvictsUnreadablePath(@TempDir Path tempDir) throws IOException {
+        assertCachedSingleFileEvictsUnreadablePath(tempDir, Method.GET);
+    }
+
+    @Test
+    void testCachedSingleFileHeadEvictsUnreadablePath(@TempDir Path tempDir) throws IOException {
+        assertCachedSingleFileEvictsUnreadablePath(tempDir, Method.HEAD);
+    }
+
+    @Test
+    void testInMemoryFileRemainsAfterSourceRemoval(@TempDir Path tempDir) throws IOException {
+        Path root = Files.createDirectory(tempDir.resolve("root"));
+        Path file = Files.writeString(root.resolve("resource.txt"), "Content");
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .cachedFiles(Set.of("resource.txt"))
+                        .build());
+        handler.beforeStart();
+
+        Files.delete(file);
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                            "http",
+                                                            "1.1",
+                                                            Method.HEAD,
+                                                            "/resource.txt",
+                                                            false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        ServerResponseHeaders responseHeaders = ServerResponseHeaders.create();
+        when(res.headers()).thenReturn(responseHeaders);
+
+        assertThat("In-memory snapshot should remain available after source removal",
+                   handler.doHandle(Method.HEAD, "resource.txt", req, res, false),
+                   is(true));
+        assertThat(responseHeaders, hasHeader(RESOURCE_CONTENT_LENGTH));
+    }
+
+    @Test
+    void testSingleHiddenFileIsRequestScopedForbidden(@TempDir Path tempDir) throws IOException {
+        Path file = Files.writeString(tempDir.resolve(".hidden.txt"), "Content");
+        assumeTrue(Files.isHidden(file), "Hidden files are not supported on this file system");
+
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.create(file));
+
+        handler.beforeStart();
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThrows(ForbiddenException.class, () -> handler.doHandle(Method.HEAD, "", req, res, false));
+        assertThat("Forbidden single file should not be cached", handler.cacheHandler("."), optionalEmpty());
+    }
+
+    @Test
+    void testSingleFileInMemoryCacheSkipsSymlink(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path externalDir = tempDir.resolve("external");
+        Files.createDirectories(root);
+        Files.createDirectories(externalDir);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        Files.writeString(externalDir.resolve("resource.txt"), "External content");
+
+        Path link = root.resolve("link.txt");
+        createSymbolicLink(link, root.resolve("resource.txt"));
+
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(link)
+                        .cachedFiles(Set.of("."))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Single-file symlink should not be cached in memory",
+                   handler.cacheInMemory("."),
+                   optionalEmpty());
+
+        ServerRequest req = request(Method.HEAD, "/link.txt", ServerRequestHeaders.create());
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThat("Initial symlink target should be served", handler.doHandle(Method.HEAD, "", req, res, false), is(true));
+
+    }
+
+    @Test
+    void testSingleFileInMemoryCacheSkipsSymlinkParent(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Path linkRoot = tempDir.resolve("link-root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+        createSymbolicLink(linkRoot, root);
+
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(linkRoot.resolve("resource.txt"))
+                        .cachedFiles(Set.of("."))
+                        .build());
+        handler.beforeStart();
+
+        assertThat("Resource under symlink parent should not be cached in memory",
+                   handler.cacheInMemory("."),
+                   optionalEmpty());
+        assertThat("Resource under symlink parent should fall back to a path handler",
+                   handler.cacheHandler(".").orElse(null),
+                   instanceOf(CachedHandlerPath.class));
+    }
+
+    @Test
+    void testFsHiddenSymlinkIsForbidden(@TempDir Path tempDir) throws IOException {
+        Path root = tempDir.resolve("root");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("resource.txt"), "Content");
+
+        Path link = root.resolve(".link");
+        createSymbolicLink(link, root.resolve("resource.txt"));
+        assumeTrue(Files.isHidden(link), "Hidden symbolic links are not supported on this file system");
+
+        FileSystemContentHandler handler = (FileSystemContentHandler) StaticContentFeature.createService(
+                fileSystemHandlerBuilder()
+                        .location(root)
+                        .build());
+
+        ServerRequest req = mock(ServerRequest.class);
+        when(req.headers()).thenReturn(ServerRequestHeaders.create());
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.1", "http", "1.1", Method.GET, "/.link", false));
+
+        ServerResponse res = mock(ServerResponse.class);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+
+        assertThrows(ForbiddenException.class, () -> handler.doHandle(Method.GET, ".link", req, res, false));
+        assertThat("Hidden symlink should not remain cached",
+                   handler.cacheHandler(".link"),
+                   optionalEmpty());
     }
 
     @Test
@@ -247,9 +2665,8 @@ class CachedHandlerTest {
         assertThat("During tests, fs should be loaded from file system", cached, instanceOf(CachedHandlerPath.class));
         CachedHandlerPath pathHandler = (CachedHandlerPath) cached;
         assertThat("Path", pathHandler.path(), notNullValue());
-        assertThat("Last modified function", pathHandler.lastModified(), notNullValue());
-        assertThat("Last modified", pathHandler.lastModified().apply(pathHandler.path()), notNullValue());
-        assertThat("Media type", pathHandler.mediaType(), is(MediaTypes.TEXT_PLAIN));
+        assertThat("Last modified", pathHandler.metadata().lastModified(), notNullValue());
+        assertThat("Content length", pathHandler.metadata().contentLength(), is(7L));
     }
 
     @Test
@@ -270,13 +2687,9 @@ class CachedHandlerTest {
         assertThat("Handler should have redirected", result, is(true));
         assertThat(responseHeaders, hasHeader(HeaderNames.LOCATION, "/nested/"));
 
-        // now make sure it is cached
+        // Filesystem redirects depend on mutable path state, so they must not be cached.
         Optional<CachedHandler> cachedHandler = fsHandler.cacheHandler("nested");
-        assertThat("Handler should be cached", cachedHandler, optionalPresent());
-        CachedHandler cached = cachedHandler.get();
-        assertThat("This should be a cached redirect handler", cached, instanceOf(CachedHandlerRedirect.class));
-        CachedHandlerRedirect redirectHandler = (CachedHandlerRedirect) cached;
-        assertThat(redirectHandler.location(), is("/nested/"));
+        assertThat("Handler should not be cached", cachedHandler, optionalEmpty());
     }
 
     @Test
@@ -319,6 +2732,272 @@ class CachedHandlerTest {
                 .toList();
     }
 
+    private static void assertCachedSingleFileEvictsUnopenablePathAndRecovers(Path tempDir, Method method)
+            throws IOException {
+        Path file = Files.writeString(tempDir.resolve("resource.txt"), "Initial content");
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.create(file));
+        handler.beforeStart();
+
+        ServerRequest request = request(method, "/resource.txt", ServerRequestHeaders.create());
+
+        ByteArrayOutputStream initialOutput = new ByteArrayOutputStream();
+        ServerResponse initialResponse = mock(ServerResponse.class);
+        when(initialResponse.headers()).thenReturn(ServerResponseHeaders.create());
+        when(initialResponse.outputStream()).thenReturn(initialOutput);
+
+        assertThat("Initial single file should be served for " + method,
+                   handler.doHandle(method, "", request, initialResponse, false),
+                   is(true));
+        assertThat("Initial single file should be cached for " + method, handler.cacheHandler("."), optionalPresent());
+
+        Files.delete(file);
+        Files.createDirectory(file);
+
+        ByteArrayOutputStream unavailableOutput = new ByteArrayOutputStream();
+        ServerResponseHeaders unavailableHeaders = ServerResponseHeaders.create();
+        ServerResponse unavailableResponse = mock(ServerResponse.class);
+        when(unavailableResponse.headers()).thenReturn(unavailableHeaders);
+        when(unavailableResponse.outputStream()).thenReturn(unavailableOutput);
+
+        assertThrows(ForbiddenException.class,
+                     () -> handler.doHandle(method, "", request, unavailableResponse, false),
+                     method + " should reject a cached path that is no longer an openable file");
+        assertThat("Unopenable single file handler should be evicted for " + method,
+                   handler.cacheHandler("."),
+                   optionalEmpty());
+        assertThat("Unopenable single file should not publish stale content length for " + method,
+                   unavailableHeaders.contains(HeaderNames.CONTENT_LENGTH),
+                   is(false));
+
+        Files.delete(file);
+        Files.writeString(file, "Re-added content");
+
+        ByteArrayOutputStream readdedOutput = new ByteArrayOutputStream();
+        ServerResponseHeaders readdedHeaders = ServerResponseHeaders.create();
+        ServerResponse readdedResponse = mock(ServerResponse.class);
+        when(readdedResponse.headers()).thenReturn(readdedHeaders);
+        when(readdedResponse.outputStream()).thenReturn(readdedOutput);
+
+        assertThat("Re-added single file should be served for " + method,
+                   handler.doHandle(method, "", request, readdedResponse, false),
+                   is(true));
+        assertThat(readdedHeaders, hasHeader(HeaderNames.CONTENT_LENGTH, "16"));
+        if (method == Method.GET) {
+            assertThat("Re-added single file content",
+                       readdedOutput.toByteArray(),
+                       is("Re-added content".getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    private static void assertCachedSingleFileEvictsUnreadablePath(Path tempDir, Method method) throws IOException {
+        Path file = Files.writeString(tempDir.resolve("resource.txt"), "Content");
+        assumeTrue(Files.getFileStore(file).supportsFileAttributeView("posix"),
+                   "POSIX file permissions are not supported");
+
+        SingleFileContentHandler handler = (SingleFileContentHandler) StaticContentFeature.createService(
+                FileSystemHandlerConfig.create(file));
+        handler.beforeStart();
+
+        ServerRequest request = request(method, "/resource.txt", ServerRequestHeaders.create());
+
+        ServerResponse initialResponse = mock(ServerResponse.class);
+        when(initialResponse.headers()).thenReturn(ServerResponseHeaders.create());
+        when(initialResponse.outputStream()).thenReturn(new ByteArrayOutputStream());
+
+        assertThat("Initial single file should be served for " + method,
+                   handler.doHandle(method, "", request, initialResponse, false),
+                   is(true));
+        assertThat("Initial single file should be cached for " + method, handler.cacheHandler("."), optionalPresent());
+
+        Set<PosixFilePermission> originalPermissions = Files.getPosixFilePermissions(file);
+        Set<PosixFilePermission> unreadablePermissions = EnumSet.copyOf(originalPermissions);
+        unreadablePermissions.remove(PosixFilePermission.OWNER_READ);
+        unreadablePermissions.remove(PosixFilePermission.GROUP_READ);
+        unreadablePermissions.remove(PosixFilePermission.OTHERS_READ);
+
+        try {
+            Files.setPosixFilePermissions(file, unreadablePermissions);
+            assumeTrue(!Files.isReadable(file), "Read access cannot be revoked for this test process");
+
+            ServerResponseHeaders unavailableHeaders = ServerResponseHeaders.create();
+            ServerResponse unavailableResponse = mock(ServerResponse.class);
+            when(unavailableResponse.headers()).thenReturn(unavailableHeaders);
+            when(unavailableResponse.outputStream()).thenReturn(new ByteArrayOutputStream());
+
+            assertThrows(ForbiddenException.class,
+                         () -> handler.doHandle(method, "", request, unavailableResponse, false),
+                         method + " should reject a cached file after read access is revoked");
+            assertThat("Unreadable single file handler should be evicted for " + method,
+                       handler.cacheHandler("."),
+                       optionalEmpty());
+            assertThat("Unreadable single file should not publish stale content length for " + method,
+                       unavailableHeaders.contains(HeaderNames.CONTENT_LENGTH),
+                       is(false));
+        } finally {
+            Files.setPosixFilePermissions(file, originalPermissions);
+        }
+    }
+
+    private static ClasspathHandlerConfig.Builder classpathHandlerBuilder() {
+        return ClasspathHandlerConfig.builder()
+                .preCompressedEnabled(true);
+    }
+
+    private static FileSystemHandlerConfig.Builder fileSystemHandlerBuilder() {
+        return FileSystemHandlerConfig.builder()
+                .preCompressedEnabled(true);
+    }
+
+    private static ServerRequestHeaders acceptEncodingHeaders(String acceptEncoding) {
+        WritableHeaders<?> headers = WritableHeaders.create();
+        headers.add(HeaderNames.ACCEPT_ENCODING, acceptEncoding);
+        return ServerRequestHeaders.create(headers);
+    }
+
+    private static ServerRequest request(String rawPath, ServerRequestHeaders headers) {
+        return request(Method.GET, rawPath, headers);
+    }
+
+    private static ServerRequest request(Method method, String rawPath, ServerRequestHeaders headers) {
+        ServerRequest request = mock(ServerRequest.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.prologue()).thenReturn(HttpPrologue.create("http/1.1",
+                                                                "http",
+                                                                "1.1",
+                                                                method,
+                                                                rawPath,
+                                                                false));
+        return request;
+    }
+
+    private static void replaceFile(Path target, String content) throws IOException {
+        Path replacement = target.resolveSibling(target.getFileName() + ".replacement");
+        Files.writeString(replacement, content);
+        try {
+            Files.move(replacement,
+                       target,
+                       StandardCopyOption.ATOMIC_MOVE,
+                       StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static ServerResponse response(ServerResponseHeaders headers, ByteArrayOutputStream outputStream)
+            throws IOException {
+        ServerResponse response = mock(ServerResponse.class);
+        when(response.headers()).thenReturn(headers);
+        when(response.outputStream()).thenReturn(outputStream);
+        Mockito.doAnswer(invocation -> {
+            outputStream.writeBytes(invocation.getArgument(0));
+            return null;
+        }).when(response).send(ArgumentMatchers.any(byte[].class));
+        return response;
+    }
+
+    private static URL trackingUrl(AtomicInteger openedStreams, long lastModified) throws MalformedURLException {
+        return new URL(null, "memory:/resource.txt", new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) {
+                return new URLConnection(url) {
+                    @Override
+                    public void connect() {
+                    }
+
+                    @Override
+                    public long getLastModified() {
+                        return lastModified;
+                    }
+
+                    @Override
+                    public long getContentLengthLong() {
+                        return 7;
+                    }
+
+                    @Override
+                    public InputStream getInputStream() {
+                        openedStreams.incrementAndGet();
+                        return new ByteArrayInputStream("Content".getBytes(StandardCharsets.UTF_8));
+                    }
+                };
+            }
+        });
+    }
+
+    private static Path createTmpJarFile() throws IOException {
+        return createTmpJarFile(Map.of("resource.txt", "Content"));
+    }
+
+    private static Path createTmpJarFile(Map<String, String> entries) throws IOException {
+        Path jarFile = Files.createTempFile("helidon-closed-zip-test-", "jar");
+        try (var fos = Files.newOutputStream(jarFile);
+                var zipOut = new ZipOutputStream(fos)) {
+            for (Map.Entry<String, String> entry : entries.entrySet()) {
+                var zipEntry = new ZipEntry(entry.getKey());
+                zipOut.putNextEntry(zipEntry);
+                var bytes = entry.getValue().getBytes(StandardCharsets.UTF_8);
+                zipOut.write(bytes, 0, bytes.length);
+            }
+        }
+        return jarFile;
+    }
+
+    private static URL jarUrl(Path jarFile, String name) throws MalformedURLException, URISyntaxException {
+        return new URI("jar:file", null, jarFile.toUri().getPath() + "!/" + name, null).toURL();
+    }
+
+    private static void createSymbolicLink(Path link, Path target) throws IOException {
+        try {
+            Files.deleteIfExists(link);
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | SecurityException e) {
+            assumeTrue(false, "Symbolic links are not supported");
+        } catch (IOException e) {
+            assumeTrue(false, "Symbolic links cannot be created: " + e.getMessage());
+        }
+    }
+
+    private void assertClasspathSidecarSymlinkOutsideOriginIsRejected(boolean singleFile)
+            throws IOException, URISyntaxException {
+        Path classPathRoot = tempDir.resolve(singleFile ? "single-classpath" : "classpath");
+        Path resourceRoot = classPathRoot.resolve("web");
+        Path resource = resourceRoot.resolve("resource.txt");
+        Path gzip = resourceRoot.resolve("resource.txt.gz");
+        Path secret = tempDir.resolve(singleFile ? "single-secret.gz" : "secret.gz");
+        Files.createDirectories(resourceRoot);
+        Files.writeString(resource, "Content");
+        Files.writeString(secret, "Secret content");
+        createSymbolicLink(gzip, secret);
+
+        try (var classLoader = new URLClassLoader(new URL[] {classPathRoot.toUri().toURL()}, null)) {
+            ClassPathContentHandler handler = (ClassPathContentHandler) StaticContentFeature.createService(
+                    classpathHandlerBuilder()
+                            .location(singleFile ? "/web/resource.txt" : "/web")
+                            .singleFile(singleFile)
+                            .classLoader(classLoader)
+                            .build());
+            if (singleFile) {
+                handler.beforeStart();
+            }
+
+            ByteArrayOutputStream rejectedBody = new ByteArrayOutputStream();
+            ServerResponse rejectedResponse = response(ServerResponseHeaders.create(), rejectedBody);
+            HttpException actual = assertThrows(HttpException.class,
+                                                () -> handler.doHandle(
+                                                        Method.GET,
+                                                        singleFile ? "" : "resource.txt",
+                                                        request("/resource.txt",
+                                                                acceptEncodingHeaders("gzip, identity;q=0")),
+                                                        rejectedResponse,
+                                                        false));
+            assertThat(actual.status(), is(Status.NOT_ACCEPTABLE_406));
+            assertThat(actual.headers(), noHeader(HeaderNames.CONTENT_ENCODING));
+            assertThat(actual.headers(), hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+            assertThat(rejectedBody.size(), is(0));
+        }
+    }
+
     private static class TestClassLoader extends ClassLoader {
         private final Path tmpJarFile;
 
@@ -343,15 +3022,101 @@ class CachedHandlerTest {
         }
     }
 
-    private static Path createTmpJarFile() throws IOException {
-        Path jarFile = Files.createTempFile("helidon-closed-zip-test-", "jar");
-        try (var fos = Files.newOutputStream(jarFile);
-                var zipOut = new ZipOutputStream(fos)) {
-            var zipEntry = new ZipEntry("resource.txt");
-            zipOut.putNextEntry(zipEntry);
-            var bytes = "Content".getBytes(StandardCharsets.UTF_8);
-            zipOut.write(bytes, 0, bytes.length);
+    private static class JarResourceClassLoader extends ClassLoader {
+        private final Path jarFile;
+
+        JarResourceClassLoader(Path jarFile) {
+            super(Thread.currentThread().getContextClassLoader());
+            this.jarFile = jarFile;
         }
-        return jarFile;
+
+        @Override
+        public URL getResource(String name) {
+            return jarUrl(name);
+        }
+
+        @Override
+        public Enumeration<URL> getResources(String name) {
+            return Collections.enumeration(List.of(jarUrl(name)));
+        }
+
+        private URL jarUrl(String name) {
+            try {
+                return new URI("jar:file", null, jarFile.toUri().getPath() + "!/" + name, null).toURL();
+            } catch (MalformedURLException | URISyntaxException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private static class MappedJarResourceClassLoader extends ClassLoader {
+        private final Map<String, List<Path>> jarFiles;
+
+        MappedJarResourceClassLoader(Map<String, List<Path>> jarFiles) {
+            super(Thread.currentThread().getContextClassLoader());
+            this.jarFiles = jarFiles;
+        }
+
+        @Override
+        public URL getResource(String name) {
+            List<Path> jars = jarFiles.get(name);
+            if (jars == null || jars.isEmpty()) {
+                return super.getResource(name);
+            }
+            return jarUrl(jars.get(0), name);
+        }
+
+        @Override
+        public Enumeration<URL> getResources(String name) throws IOException {
+            List<Path> jars = jarFiles.get(name);
+            if (jars == null || jars.isEmpty()) {
+                return super.getResources(name);
+            }
+            return Collections.enumeration(jars.stream()
+                                                   .map(jar -> jarUrl(jar, name))
+                                                   .toList());
+        }
+
+        private static URL jarUrl(Path jarFile, String name) {
+            try {
+                return new URI("jar:file", null, jarFile.toUri().getPath() + "!/" + name, null).toURL();
+            } catch (MalformedURLException | URISyntaxException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private static class CountingClassLoader extends ClassLoader {
+        private final Map<String, AtomicInteger> lookups = new HashMap<>();
+
+        CountingClassLoader(String... countedResources) {
+            super(Thread.currentThread().getContextClassLoader());
+            for (String countedResource : countedResources) {
+                lookups.put(countedResource, new AtomicInteger());
+            }
+        }
+
+        @Override
+        public URL getResource(String name) {
+            AtomicInteger counter = lookups.get(name);
+            if (counter != null) {
+                counter.incrementAndGet();
+            }
+            return super.getResource(name);
+        }
+
+        @Override
+        public Enumeration<URL> getResources(String name) throws IOException {
+            AtomicInteger counter = lookups.get(name);
+            if (counter != null) {
+                counter.incrementAndGet();
+            }
+            return super.getResources(name);
+        }
+
+        int lookups(String name) {
+            AtomicInteger counter = lookups.get(name);
+            return counter == null ? 0 : counter.get();
+        }
     }
 }

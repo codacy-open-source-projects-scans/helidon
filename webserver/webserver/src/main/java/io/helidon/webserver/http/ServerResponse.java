@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,12 @@ package io.helidon.webserver.http;
 
 import java.io.OutputStream;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
+import io.helidon.common.Api;
 import io.helidon.common.GenericType;
 import io.helidon.common.uri.UriQuery;
 import io.helidon.http.Header;
@@ -32,6 +34,7 @@ import io.helidon.http.NotFoundException;
 import io.helidon.http.ServerResponseHeaders;
 import io.helidon.http.ServerResponseTrailers;
 import io.helidon.http.Status;
+import io.helidon.http.encoding.ContentEncoder;
 import io.helidon.service.registry.Service;
 import io.helidon.webserver.http.spi.Sink;
 
@@ -42,6 +45,13 @@ import io.helidon.webserver.http.spi.Sink;
 public interface ServerResponse {
     /**
      * Status of the response.
+     * <p>
+     * The status is mutable response metadata. Once configured, it remains on this response unless later application
+     * code or error handling changes it. Calling {@link #next()}, calling {@link #reroute(String)}, or throwing an
+     * exception does not clear the configured status automatically.
+     * <p>
+     * Configure the status before calling {@link #send()} or {@link #outputStream()} when it should apply to the
+     * response emitted by this route.
      *
      * @param status HTTP status
      * @return this instance
@@ -94,6 +104,12 @@ public interface ServerResponse {
 
     /**
      * Set header with a value.
+     * <p>
+     * Headers are mutable response metadata. Once configured, they remain on this response unless later application
+     * code or error handling changes them. Calling {@link #next()} or {@link #reroute(String)} does not clear configured
+     * headers automatically. If error handling replaces an unsent response entity, it removes entity-specific headers
+     * while preserving response metadata unrelated to the entity.
+     * <p>
      * Headers cannot be set after {@link #outputStream()} method is called, or after the response was sent.
      *
      * @param header header value
@@ -106,6 +122,8 @@ public interface ServerResponse {
 
     /**
      * Send a response with no entity.
+     * Use this method for a {@link io.helidon.http.Method#HEAD HEAD} response after configuring the representation
+     * metadata in the response headers.
      */
     void send();
 
@@ -113,6 +131,7 @@ public interface ServerResponse {
      * Send a byte array response.
      *
      * @param bytes bytes to send
+     * @throws IllegalStateException if non-empty bytes are sent for a {@link io.helidon.http.Method#HEAD HEAD} request
      */
     void send(byte[] bytes);
 
@@ -122,15 +141,18 @@ public interface ServerResponse {
      * @param bytes bytes to send
      * @param position starting position
      * @param length number of bytes send
+     * @throws IllegalStateException if a positive length is sent for a {@link io.helidon.http.Method#HEAD HEAD} request
      */
     default void send(byte[] bytes, int position, int length) {
-        send(Arrays.copyOfRange(bytes, position, length));
+        send(Arrays.copyOfRange(bytes, position, position + length));
     }
 
     /**
      * Send an entity, a {@link io.helidon.http.media.MediaContext} will be used to serialize the entity.
      *
      * @param entity entity object
+     * @throws IllegalStateException if serialization writes a non-empty entity for a
+     *                               {@link io.helidon.http.Method#HEAD HEAD} request
      */
     void send(Object entity);
 
@@ -138,6 +160,8 @@ public interface ServerResponse {
      * Send an entity if present, throw {@link io.helidon.http.NotFoundException} if empty.
      *
      * @param entity entity as an optional
+     * @throws IllegalStateException if serialization writes a non-empty entity for a
+     *                               {@link io.helidon.http.Method#HEAD HEAD} request
      */
     default void send(Optional<?> entity) {
         send(entity.orElseThrow(() -> new NotFoundException("")));
@@ -151,8 +175,28 @@ public interface ServerResponse {
     boolean isSent();
 
     /**
+     * Whether this response has already been handled by the application.
+     * <p>
+     * This method is intended for generated or framework code that may send a default response only when user code has
+     * not already sent an entity, obtained an output stream, or selected another routing action.
+     * Header and status changes alone do not handle the response.
+     * <p>
+     * The default implementation returns {@link #isSent()}.
+     *
+     * @return whether response handling was already selected
+     */
+    default boolean isResponseHandled() {
+        return isSent();
+    }
+
+    /**
      * Alternative way to send an entity, using an output stream. This should be used for entities that are big
      * and that should not be materialized into memory.
+     * <p>
+     * Configure response status and headers before requesting the output stream. The returned stream completes the
+     * response when it is closed, so it must be closed before the handler method returns.
+     * Writing non-empty data to the stream for a {@link io.helidon.http.Method#HEAD HEAD} request throws an
+     * {@link IllegalStateException}.
      *
      * @return output stream
      */
@@ -166,9 +210,47 @@ public interface ServerResponse {
     long bytesWritten();
 
     /**
+     * Configure whether the WebServer response layer may automatically encode the response entity using the listener
+     * content encoding context. This does not remove or rewrite any explicitly configured {@code Content-Encoding} header.
+     * Repeated calls replace the previous setting until response content encoding is selected. Content encoding is selected
+     * when an entity is sent or the response output stream is obtained.
+     *
+     * @param enabled whether automatic response content encoding is enabled
+     * @return this instance
+     * @throws IllegalStateException if response content encoding was already selected, or the response was sent
+     */
+    @Api.Incubating
+    default ServerResponse automaticContentEncoding(boolean enabled) {
+        return this;
+    }
+
+    /**
+     * Configure an explicit response content encoder.
+     * <p>
+     * The explicit encoder takes precedence over automatic content encoding. Response stream filters process the plain
+     * entity before this encoder. Repeated calls replace the previous encoder until response content encoding is selected.
+     * The selected encoder's headers are applied once during selection, so a {@code HEAD} response exposes the same
+     * representation metadata as {@code GET} without sending the encoded entity.
+     *
+     * @param encoder content encoder
+     * @return this instance
+     * @throws NullPointerException if {@code encoder} is {@code null}
+     * @throws IllegalStateException if response content encoding was already selected, or the response was sent
+     */
+    @Api.Incubating
+    default ServerResponse contentEncoder(ContentEncoder encoder) {
+        Objects.requireNonNull(encoder);
+        return this;
+    }
+
+    /**
      * Executed right before the first byte is written to the socket (including response status and headers).
      * Response can be modified (i.e. headers, status) at this point, though modifying the entity may not be done, as
      * this method is most likely called from within one of the {@link #send()} methods.
+     * Changing the response status is supported only if the new status has the same response entity semantics.
+     * For example, changing between an entity-bearing status and a status without an entity may leave response framing
+     * inconsistent and break the response.
+     * The listener remains registered if error handling replaces the unsent response entity.
      * <p>
      * Note: this method is implemented as a default method that does nothing, for backward compatibility.
      *
@@ -190,6 +272,7 @@ public interface ServerResponse {
 
     /**
      * Re-route using a different path.
+     * Configured response status and headers remain on this response unless later handling changes them.
      *
      * @param newPath new path to use
      * @return this instance
@@ -198,6 +281,7 @@ public interface ServerResponse {
 
     /**
      * Re-route using a different path and query.
+     * Configured response status and headers remain on this response unless later handling changes them.
      *
      * @param path  new path
      * @param query new query
@@ -211,6 +295,7 @@ public interface ServerResponse {
     /**
      * Continue processing with the next route (and if none found, return a {@link io.helidon.http.Status#NOT_FOUND_404}).
      * If any entity method was called, this method will throw an exception.
+     * Configured response status and headers remain on this response unless later handling changes them.
      *
      * @return this instance
      * @throws IllegalStateException in case the entity was already configured
@@ -219,6 +304,8 @@ public interface ServerResponse {
 
     /**
      * Response headers (mutable).
+     * <p>
+     * Changes to these headers have the same lifecycle as headers configured through {@link #header(Header)}.
      *
      * @return headers
      */
@@ -226,6 +313,9 @@ public interface ServerResponse {
 
     /**
      * Response trailers (mutable).
+     * Trailer state is associated with the current response entity and is cleared if error handling replaces that entity
+     * before it is sent.
+     *
      * @return trailers
      * @throws java.lang.IllegalStateException if client didn't ask for trailers with {@code TE: trailers} header in request
      * or response doesn't contain trailer declaration headers {@code Trailer: <trailer-name>}
@@ -235,6 +325,9 @@ public interface ServerResponse {
     /**
      * Callback to update any last minute trailers before they are written to the
      * output stream.
+     * The callback is associated with the current response entity and is cleared if error handling replaces that entity
+     * before it is sent.
+     * A response-scoped policy should use {@link #beforeSend(Runnable)} to register a fresh callback for each entity.
      *
      * @param beforeTrailers consumer of mutable trailers
      * @return this instance
@@ -248,6 +341,8 @@ public interface ServerResponse {
      * In case an output stream was used, calling this method will immediately close the stream and return this
      * message as the reason for closing the response.
      * In HTTP/1 this would be in a trailer header
+     * The result is associated with the current response entity and is cleared if error handling replaces that entity
+     * before it is sent.
      *
      * @param result result description
      */
@@ -263,11 +358,13 @@ public interface ServerResponse {
     }
 
     /**
-     * Returns a sink from this response based on the sink type, if available.
+     * Returns a sink from this response based on the sink type.
      *
      * @param sinkType type of sink
-     * @return sink or {@code null} if not available
      * @param <T> type of sink returned
+     * @return sink
+     * @throws UnsupportedOperationException if sinks are not supported by this implementation
+     * @throws io.helidon.http.HttpException if no sink provider is available for the requested type
      */
     default <T extends Sink<?>> T sink(GenericType<T> sinkType) {
         throw new UnsupportedOperationException("No sink available for type " + sinkType);
@@ -275,6 +372,9 @@ public interface ServerResponse {
 
     /**
      * Configure a custom output stream to wrap the output stream of the response.
+     * The filter remains registered if error handling replaces the unsent response entity.
+     * A filter that changes representation metadata, such as {@code Content-Encoding}, must use
+     * {@link #beforeSend(Runnable)} to configure the matching headers for each entity that is sent.
      *
      * @param filterFunction the function to replace output stream of this response with a user provided one
      */

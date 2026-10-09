@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,21 @@
  */
 package io.helidon.metrics.api;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
+
+import io.helidon.metrics.spi.MeterBuilderCustomizer;
 
 /**
  * No-op implementation of the {@link io.helidon.metrics.api.MetricsFactory} interface.
  */
 class NoOpMetricsFactory implements MetricsFactory {
 
-    private static final Clock SYSTEM_CLOCK = new Clock() {
+    private final Clock systemClock = new Clock() {
         @Override
         public <R> R unwrap(Class<? extends R> c) {
             return c.cast(this);
@@ -41,11 +45,28 @@ class NoOpMetricsFactory implements MetricsFactory {
             return System.nanoTime();
         }
     };
-    private final MeterRegistry meterRegistry = new NoOpMeterRegistry();
-    private final MetricsConfig metricsConfig = MetricsConfig.create();
 
-    static NoOpMetricsFactory create() {
-        return new NoOpMetricsFactory();
+    private final MeterRegistry meterRegistry;
+    private final MetricsConfig metricsConfig;
+    private final List<MeterBuilderCustomizer> meterBuilderCustomizers;
+
+    NoOpMetricsFactory() {
+        this(MetricsConfig.create(), List.of());
+    }
+
+    private NoOpMetricsFactory(MetricsConfig metricsConfig, Collection<MeterBuilderCustomizer> meterBuilderCustomizers) {
+        this.metricsConfig = metricsConfig;
+        this.meterBuilderCustomizers = List.copyOf(meterBuilderCustomizers);
+        this.meterRegistry = new NoOpMeterRegistry(this, this.meterBuilderCustomizers);
+    }
+
+    static NoOpMetricsFactory create(MetricsConfig metricsConfig) {
+        return new NoOpMetricsFactory(metricsConfig, List.of());
+    }
+
+    static NoOpMetricsFactory create(MetricsConfig metricsConfig,
+                                     Collection<MeterBuilderCustomizer> meterBuilderCustomizers) {
+        return new NoOpMetricsFactory(metricsConfig, meterBuilderCustomizers);
     }
 
     @Override
@@ -58,28 +79,18 @@ class NoOpMetricsFactory implements MetricsFactory {
     }
 
     @Override
-    public MeterRegistry globalRegistry(MetricsConfig metricsConfig) {
-        return meterRegistry;
-    }
-
-    @Override
-    public MeterRegistry globalRegistry(Consumer<Meter> onAddListener, Consumer<Meter> onRemoveListener, boolean backfill) {
-        return meterRegistry;
-    }
-
-    @Override
     public MetricsConfig metricsConfig() {
         return metricsConfig;
     }
 
     @Override
     public NoOpMeterRegistry.Builder meterRegistryBuilder() {
-        return NoOpMeterRegistry.builder();
+        return NoOpMeterRegistry.builder(this, meterBuilderCustomizers);
     }
 
     @Override
     public MeterRegistry createMeterRegistry(MetricsConfig metricsConfig) {
-        return new NoOpMeterRegistry();
+        return new NoOpMeterRegistry(this, meterBuilderCustomizers);
     }
 
     @Override
@@ -108,7 +119,7 @@ class NoOpMetricsFactory implements MetricsFactory {
 
     @Override
     public Clock clockSystem() {
-        return SYSTEM_CLOCK;
+        return systemClock;
     }
 
     @Override

@@ -53,6 +53,10 @@ import static java.util.function.Predicate.not;
  */
 @SuppressWarnings("checkstyle:VisibilityModifier") // as long as all are inner classes, this is OK
 final class Activators {
+    private static final ActivationRequest ACTIVE_REQUEST = ActivationRequest.builder()
+            .targetPhase(ActivationPhase.ACTIVE)
+            .build();
+
     private Activators() {
     }
 
@@ -70,6 +74,12 @@ final class Activators {
             case INJECTION_POINT -> new Activators.FixedIpFactoryActivator<>(provider, (InjectionPointFactory<T>) instance);
             case QUALIFIED -> new Activators.FixedQualifiedFactoryActivator<>(provider, (QualifiedFactory<T, ?>) instance);
         };
+    }
+
+    static <T> Activator<T> createActive(ServiceProvider<T> provider, T instance) {
+        Activator<T> activator = create(provider, instance);
+        activator.activate(ACTIVE_REQUEST);
+        return activator;
     }
 
     static <T> Supplier<Activator<T>> create(CoreServiceRegistry registry, ServiceProvider<T> provider) {
@@ -154,12 +164,21 @@ final class Activators {
         final DependencyContext dependencyContext;
 
         private final ReadWriteLock instanceLock = new ReentrantReadWriteLock();
+        private final ReentrantLock phaseLock = new ReentrantLock();
 
         volatile ActivationPhase currentPhase = ActivationPhase.INIT;
+        private boolean deactivationRequested;
+        private boolean postConstructCompleted;
+        private boolean activationCleanupPending;
+        private ScopedRegistryImpl scopedRegistry;
 
         BaseActivator(ServiceProvider<T> provider, DependencyContext dependencyContext) {
             this.provider = provider;
             this.dependencyContext = dependencyContext;
+        }
+
+        void scopedRegistry(ScopedRegistryImpl scopedRegistry) {
+            this.scopedRegistry = scopedRegistry;
         }
 
         // three states
@@ -238,25 +257,32 @@ final class Activators {
 
         @Override
         public ActivationResult deactivate() {
-            if (currentPhase == ActivationPhase.CONSTRUCTING
-                    || currentPhase == ActivationPhase.INJECTING
-                    || currentPhase == ActivationPhase.POST_CONSTRUCTING) {
-                // shutdown/deactivation was called as part of (while) activating this instance
-                // we must resolve this gracefully (as the next lock would end up in a deadlock)
+            phaseLock.lock();
+            try {
+                ActivationPhase phase = currentPhase;
+                if (phase.ordinal() < ActivationPhase.ACTIVATION_FINISHING.ordinal()) {
+                    deactivationRequested = true;
+                }
+                if (!activationCleanupPending && (phase == ActivationPhase.CONSTRUCTING
+                        || phase == ActivationPhase.INJECTING
+                        || phase == ActivationPhase.POST_CONSTRUCTING)) {
+                    // A JVM shutdown hook can run while the activating thread waits for shutdown to complete. Taking the
+                    // instance lock here would deadlock, so interrupt activation and let the activating thread terminate.
+                    var response = ActivationResult.builder()
+                            .success(false)
+                            .startingActivationPhase(phase)
+                            .finishingActivationPhase(ActivationPhase.DESTROYED)
+                            .targetActivationPhase(ActivationPhase.DESTROYED)
+                            .error(new IllegalStateException("Deactivation request received while constructing an instance"))
+                            .build();
 
-                var response = ActivationResult.builder()
-                        .success(false)
-                        .startingActivationPhase(currentPhase)
-                        .finishingActivationPhase(ActivationPhase.DESTROYED)
-                        .targetActivationPhase(ActivationPhase.DESTROYED)
-                        .error(new IllegalStateException("Deactivation request received while constructing an instance"))
-                        .build();
+                    currentPhase = ActivationPhase.DESTROYED;
 
-                currentPhase = ActivationPhase.DESTROYED;
-
-                return response;
+                    return response;
+                }
+            } finally {
+                phaseLock.unlock();
             }
-            // probably re-entering the same lock
             instanceLock.writeLock().lock();
             try {
                 ActivationResult.Builder response = ActivationResult.builder()
@@ -273,7 +299,11 @@ final class Activators {
 
                 response.startingActivationPhase(this.currentPhase);
                 stateTransitionStart(response, ActivationPhase.PRE_DESTROYING);
-                preDestroy(response);
+                if (scopedRegistry == null) {
+                    preDestroy(response);
+                } else {
+                    scopedRegistry.preDestroy(() -> preDestroy(response));
+                }
                 stateTransitionStart(response, ActivationPhase.DESTROYED);
 
                 return response.build();
@@ -285,6 +315,25 @@ final class Activators {
         @Override
         public ActivationPhase phase() {
             return currentPhase;
+        }
+
+        boolean activeInstancesAvailable(Lookup lookup) {
+            return true;
+        }
+
+        Optional<List<QualifiedInstance<T>>> cachedInstances(Lookup lookup) {
+            // An ACTIVE factory can still be producing its first value under the write lock. Cleanup must not wait for it.
+            if (!instanceLock.readLock().tryLock()) {
+                return Optional.empty();
+            }
+            try {
+                if (currentPhase != ActivationPhase.ACTIVE || !activeInstancesAvailable(lookup)) {
+                    return Optional.empty();
+                }
+                return targetInstances(lookup);
+            } finally {
+                instanceLock.readLock().unlock();
+            }
         }
 
         @Override
@@ -331,27 +380,8 @@ final class Activators {
          * @param providerType type of provider this type implements
          * @return whether the provider itself should be returned
          */
-        boolean requestedProvider(Lookup lookup, FactoryType providerType) {
-            if (lookup.factoryTypes().contains(providerType)) {
-                return true;
-            }
-            if (lookup.contracts().size() == 1) {
-                ResolvedType requestedContract = lookup.contracts().iterator().next();
-                if (requestedContract.equals(ResolvedType.create(descriptor().serviceType()))) {
-                    // requested actual service
-                    return true;
-                }
-                if (descriptor().factoryContracts().contains(requestedContract)
-                        && !descriptor().contracts().contains(requestedContract)) {
-                    // requested a contract satisfied by the factory only
-                    return true;
-                }
-            }
-            if (lookup.serviceType().isPresent() && lookup.serviceType().get().equals(descriptor().serviceType())) {
-                return true;
-            }
-
-            return false;
+        protected boolean requestedProvider(Lookup lookup, FactoryType providerType) {
+            return Contracts.requestedProvider(lookup, descriptor(), providerType);
         }
 
         private void stateTransitionStart(ActivationResult.Builder res, ActivationPhase phase) {
@@ -359,11 +389,52 @@ final class Activators {
             this.currentPhase = phase;
         }
 
+        private boolean activationStateTransitionStart(ActivationResult.Builder response, ActivationPhase phase) {
+            phaseLock.lock();
+            try {
+                if (activationInterruptedLocked(response)) {
+                    return false;
+                }
+                stateTransitionStart(response, phase);
+                return true;
+            } finally {
+                phaseLock.unlock();
+            }
+        }
+
+        private boolean activationInterrupted(ActivationResult.Builder response) {
+            phaseLock.lock();
+            try {
+                return activationInterruptedLocked(response);
+            } finally {
+                phaseLock.unlock();
+            }
+        }
+
+        private boolean activationInterruptedLocked(ActivationResult.Builder response) {
+            if (currentPhase == ActivationPhase.ACTIVE) {
+                return false;
+            }
+            if (!deactivationRequested && (scopedRegistry == null || scopedRegistry.activationAllowed())) {
+                return false;
+            }
+            if (postConstructCompleted && currentPhase.eligibleForDeactivation()) {
+                // Preserve queued cleanup only after post construct returned normally. Earlier cancellation must not
+                // invoke pre destroy on an instance whose lifecycle initialization is incomplete.
+                activationCleanupPending = true;
+            } else {
+                currentPhase = ActivationPhase.DESTROYED;
+            }
+            response.finishingActivationPhase(currentPhase)
+                    .success(false)
+                    .error(new IllegalStateException("Activation interrupted by deactivation request"));
+            return true;
+        }
+
         private ActivationResult doActivate(ActivationRequest request) {
             ActivationPhase initialPhase = this.currentPhase;
             ActivationPhase startingPhase = request.startingPhase().orElse(initialPhase);
             ActivationPhase targetPhase = request.targetPhase();
-            this.currentPhase = startingPhase;
             ActivationPhase finishingPhase = startingPhase;
 
             ActivationResult.Builder response = ActivationResult.builder()
@@ -372,46 +443,75 @@ final class Activators {
                     .targetActivationPhase(targetPhase)
                     .success(true);
 
+            if (!activationStateTransitionStart(response, startingPhase)) {
+                return response.build();
+            }
+
             if (targetPhase.ordinal() > ActivationPhase.ACTIVATION_STARTING.ordinal()
                     && initialPhase == ActivationPhase.INIT) {
                 if (ActivationPhase.INIT == startingPhase
                         || ActivationPhase.ACTIVATION_STARTING == startingPhase
                         || ActivationPhase.DESTROYED == startingPhase) {
-                    stateTransitionStart(response, ActivationPhase.ACTIVATION_STARTING);
+                    if (!activationStateTransitionStart(response, ActivationPhase.ACTIVATION_STARTING)) {
+                        return response.build();
+                    }
                 }
             }
 
             finishingPhase = response.finishingActivationPhase().orElse(finishingPhase);
             if (response.targetActivationPhase().ordinal() >= ActivationPhase.CONSTRUCTING.ordinal()) {
-                stateTransitionStart(response, ActivationPhase.CONSTRUCTING);
+                if (!activationStateTransitionStart(response, ActivationPhase.CONSTRUCTING)) {
+                    return response.build();
+                }
                 construct(response);
+                if (activationInterrupted(response)) {
+                    return response.build();
+                }
             }
 
             finishingPhase = response.finishingActivationPhase().orElse(finishingPhase);
             if (response.targetActivationPhase().ordinal() >= ActivationPhase.INJECTING.ordinal()
                     && (ActivationPhase.CONSTRUCTING == finishingPhase)) {
-                stateTransitionStart(response, ActivationPhase.INJECTING);
+                if (!activationStateTransitionStart(response, ActivationPhase.INJECTING)) {
+                    return response.build();
+                }
                 inject(response);
+                if (activationInterrupted(response)) {
+                    return response.build();
+                }
             }
 
             finishingPhase = response.finishingActivationPhase().orElse(finishingPhase);
             if (response.targetActivationPhase().ordinal() >= ActivationPhase.POST_CONSTRUCTING.ordinal()
                     && (ActivationPhase.INJECTING == finishingPhase)) {
-                stateTransitionStart(response, ActivationPhase.POST_CONSTRUCTING);
+                if (!activationStateTransitionStart(response, ActivationPhase.POST_CONSTRUCTING)) {
+                    return response.build();
+                }
                 postConstruct(response);
+                postConstructCompleted = true;
+                if (activationInterrupted(response)) {
+                    return response.build();
+                }
             }
             finishingPhase = response.finishingActivationPhase().orElse(finishingPhase);
             if (response.targetActivationPhase().ordinal() >= ActivationPhase.ACTIVATION_FINISHING.ordinal()
                     && (ActivationPhase.POST_CONSTRUCTING == finishingPhase)) {
-                stateTransitionStart(response, ActivationPhase.ACTIVATION_FINISHING);
+                if (!activationStateTransitionStart(response, ActivationPhase.ACTIVATION_FINISHING)) {
+                    return response.build();
+                }
                 finishActivation(response);
             }
             finishingPhase = response.finishingActivationPhase().orElse(finishingPhase);
             if (response.targetActivationPhase().ordinal() >= ActivationPhase.ACTIVE.ordinal()
                     && (ActivationPhase.ACTIVATION_FINISHING == finishingPhase)) {
-                stateTransitionStart(response, ActivationPhase.ACTIVE);
+                if (!activationStateTransitionStart(response, ActivationPhase.ACTIVE)) {
+                    return response.build();
+                }
             }
 
+            if (activationInterrupted(response)) {
+                return response.build();
+            }
             if (startingPhase.ordinal() < ActivationPhase.CONSTRUCTING.ordinal()
                     && currentPhase.ordinal() >= ActivationPhase.CONSTRUCTING.ordinal()) {
                 setTargetInstances();
@@ -438,16 +538,33 @@ final class Activators {
     }
 
     static class FixedSupplierActivator<T> extends BaseActivator<T> {
-        private final Supplier<Optional<List<QualifiedInstance<T>>>> instances;
+        private final Supplier<T> instanceSupplier;
+        private final LazyValue<Optional<List<QualifiedInstance<T>>>> instances;
 
         FixedSupplierActivator(ServiceProvider<T> provider, Supplier<T> instanceSupplier) {
             super(provider, null);
 
+            this.instanceSupplier = instanceSupplier;
             instances = LazyValue.create(() -> {
                 List<QualifiedInstance<T>> values = List.of(QualifiedInstance.create(instanceSupplier.get(),
                                                                                      provider.descriptor().qualifiers()));
                 return Optional.of(values);
             });
+        }
+
+        @Override
+        boolean activeInstancesAvailable(Lookup lookup) {
+            return requestedProvider(lookup, FactoryType.SUPPLIER) || instances.isLoaded();
+        }
+
+        @SuppressWarnings("unchecked")
+        @Override
+        Optional<List<QualifiedInstance<T>>> targetInstances(Lookup lookup) {
+            if (requestedProvider(lookup, FactoryType.SUPPLIER)) {
+                return Optional.of(List.of(QualifiedInstance.create((T) instanceSupplier,
+                                                                    provider.descriptor().qualifiers())));
+            }
+            return targetInstances();
         }
 
         @Override
@@ -467,10 +584,36 @@ final class Activators {
     }
 
     static class FixedServicesFactoryActivator<T> extends ServicesFactoryActivator<T> {
+        private volatile LazyValue<Optional<List<QualifiedInstance<T>>>> instances;
+
         FixedServicesFactoryActivator(ServiceProvider<T> provider,
                                       Service.ServicesFactory<T> factory) {
             super(provider, null);
             serviceInstance = InstanceHolder.create(factory);
+            instances = LazyValue.create(() -> Optional.ofNullable(factory.services()));
+        }
+
+        @Override
+        boolean activeInstancesAvailable(Lookup lookup) {
+            return requestedProvider(lookup, FactoryType.SERVICES) || instances.isLoaded();
+        }
+
+        @Override
+        void setTargetInstances() {
+        }
+
+        @Override
+        Optional<List<QualifiedInstance<T>>> targetInstances(Lookup lookup) {
+            if (requestedProvider(lookup, FactoryType.SERVICES)) {
+                return super.targetInstances(lookup);
+            }
+            return instances.get().flatMap(it -> matchingInstances(lookup, it));
+        }
+
+        @Override
+        void preDestroy(ActivationResult.Builder response) {
+            super.preDestroy(response);
+            instances = LazyValue.create(Optional.empty());
         }
     }
 
@@ -616,6 +759,11 @@ final class Activators {
         }
 
         @Override
+        boolean activeInstancesAvailable(Lookup lookup) {
+            return requestedProvider(lookup, FactoryType.QUALIFIED);
+        }
+
+        @Override
         void setTargetInstances() {
             // target instances cannot be created, they are resolved on each lookup
         }
@@ -624,6 +772,11 @@ final class Activators {
         Optional<List<QualifiedInstance<T>>> targetInstances(Lookup lookup) {
             if (serviceInstance == null) {
                 return Optional.empty();
+            }
+
+            if (requestedProvider(lookup, FactoryType.QUALIFIED)) {
+                T instance = serviceInstance.get();
+                return Optional.of(List.of(QualifiedInstance.create(instance, provider.descriptor().qualifiers())));
             }
 
             return lookup.qualifiers()
@@ -663,6 +816,11 @@ final class Activators {
     static class IpFactoryActivator<T> extends SingleServiceActivator<T> {
         IpFactoryActivator(ServiceProvider<T> provider, DependencyContext dependencyContext) {
             super(provider, dependencyContext);
+        }
+
+        @Override
+        boolean activeInstancesAvailable(Lookup lookup) {
+            return requestedProvider(lookup, FactoryType.INJECTION_POINT);
         }
 
         @Override
@@ -723,12 +881,17 @@ final class Activators {
                 return Optional.of(List.of(QualifiedInstance.create(serviceInstance.get(), descriptor().qualifiers())));
             }
 
-            if (targetInstances == null) {
+            return matchingInstances(lookup, targetInstances);
+        }
+
+        Optional<List<QualifiedInstance<T>>> matchingInstances(Lookup lookup,
+                                                                List<QualifiedInstance<T>> instances) {
+            if (instances == null) {
                 return Optional.empty();
             }
 
             List<QualifiedInstance<T>> response = new ArrayList<>();
-            for (QualifiedInstance<T> instance : targetInstances) {
+            for (QualifiedInstance<T> instance : instances) {
                 if (lookup.matchesQualifiers(instance.qualifiers())) {
                     response.add(instance);
                 }

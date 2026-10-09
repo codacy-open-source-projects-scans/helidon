@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,8 @@ package io.helidon.common.features.metadata;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.Properties;
 
+import io.helidon.common.Api;
 import io.helidon.metadata.MetadataConstants;
 import io.helidon.metadata.hson.Hson;
 
@@ -41,11 +40,8 @@ import static io.helidon.common.features.metadata.FeatureMetadataSupport.HSON_VE
 /**
  * Feature descriptor utilities.
  */
+@Api.Internal
 public class FeatureRegistry {
-    /**
-     * Location of version 1 feature metadata.
-     */
-    public static final String FEATURE_REGISTRY_LOCATION_V1 = "META-INF/helidon/feature-metadata.properties";
     /**
      * Location of version 2 feature registry.
      */
@@ -55,75 +51,6 @@ public class FeatureRegistry {
     private static final int DEFAULT_REGISTRY_VERSION = 2;
 
     private FeatureRegistry() {
-    }
-
-    /**
-     * Get all feature metadata from the provided root.
-     *
-     * @param location where was this metadata obtained
-     * @param properties feature properties (version 1)
-     * @return feature metadata
-     * @throws java.lang.IllegalStateException in case the format is not as expected
-     */
-    public static FeatureMetadata metadata(String location, Properties properties) {
-        String moduleName = properties.getProperty("m");
-        String featureName = properties.getProperty("n");
-
-        if (moduleName == null || featureName == null) {
-            throw new IllegalStateException("Invalid feature metadata on " + location + ", missing feature name"
-                                                    + " or module name.");
-        }
-
-        FeatureMetadata.Builder builder = FeatureMetadata.builder()
-                .module(moduleName)
-                .name(featureName);
-
-        Optional.ofNullable(properties.getProperty("d"))
-                .ifPresent(builder::description);
-        Optional.ofNullable(properties.getProperty("s"))
-                .ifPresent(builder::since);
-        Optional.ofNullable(properties.getProperty("p"))
-                .map(it -> it.split(","))
-                .map(List::of)
-                .ifPresent(builder::path);
-        Optional.ofNullable(properties.getProperty("in"))
-                .map(it -> it.split(","))
-                .map(List::of)
-                .stream()
-                .flatMap(List::stream)
-                .map(Flavor::valueOf)
-                .forEach(builder::addFlavor);
-        Optional.ofNullable(properties.getProperty("not"))
-                .map(it -> it.split(","))
-                .map(List::of)
-                .stream()
-                .flatMap(List::stream)
-                .map(Flavor::valueOf)
-                .forEach(builder::addInvalidFlavor);
-        String aot = properties.getProperty("aot");
-        String aotd = properties.getProperty("aotd");
-        if (aot != null || aotd != null) {
-            Aot.Builder aotBuilder = Aot.builder();
-            if (aot != null) {
-                aotBuilder.supported(Boolean.parseBoolean(aot));
-            }
-            if (aotd != null) {
-                aotBuilder.description(aotd);
-            }
-            builder.aot(aotBuilder.build());
-        }
-        String dep =  properties.getProperty("dep");
-        if (dep != null) {
-            Deprecation.Builder depBuilder = Deprecation.builder();
-
-            depBuilder.isDeprecated(Boolean.parseBoolean(dep));
-            Optional.ofNullable(properties.getProperty("deps"))
-                    .ifPresent(depBuilder::since);
-
-            builder.deprecation(depBuilder.build());
-        }
-
-        return builder.build();
     }
 
     /**

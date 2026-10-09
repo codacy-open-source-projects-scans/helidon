@@ -17,13 +17,19 @@ package io.helidon.builder.codegen;
 
 import java.lang.System.Logger.Level;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 
+import io.helidon.builder.api.Option;
 import io.helidon.codegen.CodegenContext;
 import io.helidon.codegen.CodegenException;
 import io.helidon.codegen.CodegenLogger;
 import io.helidon.codegen.JavadocReader;
 import io.helidon.codegen.JavadocWriter;
+import io.helidon.codegen.RoundContext;
+import io.helidon.common.types.Annotated;
 import io.helidon.common.types.Annotation;
 import io.helidon.common.types.ElementKind;
 import io.helidon.common.types.EnumValue;
@@ -37,11 +43,13 @@ import static java.util.function.Predicate.not;
 class SchemaGenerator {
 
     private final CodegenContext ctx;
+    private final RoundContext roundContext;
     private final TypeResolver resolver;
     private final CodegenLogger logger;
 
-    SchemaGenerator(CodegenContext ctx) {
+    SchemaGenerator(CodegenContext ctx, RoundContext roundContext) {
         this.ctx = ctx;
+        this.roundContext = roundContext;
         this.logger = ctx.logger();
         this.resolver = new TypeResolver(ctx);
     }
@@ -65,11 +73,55 @@ class SchemaGenerator {
             builder.property("provides", provides);
         }
 
+        var inherits = inheritedTypes(prototypeInfo);
+        if (!inherits.isEmpty()) {
+            builder.property("inherits", inherits);
+        }
+
         var options = options(prototypeInfo, handlers);
         if (!options.isEmpty()) {
             builder.property("options", options);
         }
         return builder.build();
+    }
+
+    private boolean metadataEnabled(Annotated annotated, TypeName annotationType) {
+        return annotated.findAnnotation(annotationType)
+                .flatMap(it -> it.booleanValue("metadata"))
+                .orElse(true);
+    }
+
+    private List<TypeName> inheritedTypes(PrototypeInfo prototypeInfo) {
+        var inherits = new LinkedHashSet<TypeName>();
+        for (var superType : prototypeInfo.superTypes()) {
+            if (superType.equals(Types.PROTOTYPE_API) || superType.className().endsWith("Blueprint")) {
+                continue;
+            }
+            var superTypeInfo = ctx.typeInfo(superType.genericTypeName());
+            if (superTypeInfo.map(this::inheritedMetadataEnabled)
+                    .orElse(true)) {
+                inherits.add(superTypeInfo.map(TypeInfo::typeName).orElse(superType));
+            }
+        }
+        return new ArrayList<>(inherits);
+    }
+
+    private boolean inheritedMetadataEnabled(TypeInfo typeInfo) {
+        return ownConfiguredMetadataEnabled(typeInfo)
+                .orElseGet(() -> typeInfo.hasAnnotation(Types.CONFIGURED)
+                        || resolver.typeHierarchy(typeInfo)
+                                .stream()
+                                .anyMatch(ancestor -> ancestor.hasAnnotation(Types.PROTOTYPE_CONFIGURED)
+                                        && metadataEnabled(ancestor, Types.PROTOTYPE_CONFIGURED)));
+    }
+
+    private Optional<Boolean> ownConfiguredMetadataEnabled(TypeInfo typeInfo) {
+        var blueprintType = TypeName.builder(typeInfo.typeName().genericTypeName())
+                .className(typeInfo.typeName().className() + "Blueprint")
+                .build();
+        return ctx.typeInfo(blueprintType)
+                .flatMap(it -> it.findAnnotation(Types.PROTOTYPE_CONFIGURED))
+                .map(it -> it.booleanValue("metadata").orElse(true));
     }
 
     private List<TypeName> providedTypes(PrototypeInfo prototypeInfo) {
@@ -124,7 +176,10 @@ class SchemaGenerator {
         var options = new ArrayList<Annotation>();
         for (var handler : handlers) {
             var optionInfo = handler.option();
-            if (optionInfo.configured().isPresent()) {
+            if (optionInfo.configured().isPresent()
+                    && optionInfo.interfaceMethod()
+                            .map(it -> metadataEnabled(it, Types.OPTION_CONFIGURED))
+                            .orElse(true)) {
                 options.add(option(prototypeInfo, optionInfo));
             }
         }
@@ -162,7 +217,7 @@ class SchemaGenerator {
             builder.property("kind", enumValue);
         }
 
-        var defaultValue = defaultValue(optionInfo);
+        var defaultValue = defaultValue(typeInfo, optionInfo);
         if (defaultValue != null) {
             builder.property("value", defaultValue);
         }
@@ -186,7 +241,7 @@ class SchemaGenerator {
         return builder.build();
     }
 
-    private String defaultValue(OptionInfo optionInfo) {
+    private String defaultValue(TypeInfo typeInfo, OptionInfo optionInfo) {
         var key = optionInfo.configured().orElseThrow().configKey();
         if (key.endsWith("-discover-services")) {
             return optionInfo.interfaceMethod()
@@ -202,9 +257,31 @@ class SchemaGenerator {
                             .or(() -> it.findAnnotation(Types.OPTION_DEFAULT_LONG))
                             .or(() -> it.findAnnotation(Types.OPTION_DEFAULT_DOUBLE))
                             .flatMap(Annotation::stringValues))
+                    .map(defaultValues -> enumDefaultValues(typeInfo, optionInfo, defaultValues))
                     .map(it -> String.join(", ", it))
                     .orElse(null);
         }
+    }
+
+    private List<String> enumDefaultValues(TypeInfo typeInfo,
+                                           OptionInfo optionInfo,
+                                           List<String> defaultValues) {
+        if (typeInfo == null || typeInfo.kind() != ElementKind.ENUM) {
+            return defaultValues;
+        }
+        var allowedValues = optionInfo.allowedValues()
+                .stream()
+                .map(OptionAllowedValue::value)
+                .toList();
+        return defaultValues.stream()
+                .map(defaultValue -> allowedValues.contains(defaultValue)
+                        ? defaultValue
+                        : allowedValues.stream()
+                                .filter(value -> value.equals(value.toLowerCase(Locale.ROOT)))
+                                .filter(value -> value.equals(defaultValue.toLowerCase(Locale.ROOT)))
+                                .findFirst()
+                                .orElse(defaultValue))
+                .toList();
     }
 
     private List<Annotation> allowedValues(TypeInfo typeInfo, OptionInfo optionInfo) {
@@ -330,7 +407,11 @@ class SchemaGenerator {
                 .or(() -> {
                     var className = lookup.classNameWithEnclosingNames();
                     var blueprintName = className.replace(".Builder", "") + "Blueprint";
-                    return ctx.typeInfo(TypeName.builder(typeInfo.typeName())
+                    var packageName = lookup.packageName().isBlank()
+                            ? typeInfo.typeName().packageName()
+                            : lookup.packageName();
+                    return ctx.typeInfo(TypeName.builder()
+                            .packageName(packageName)
                             .className(blueprintName)
                             .build());
                 })
@@ -338,10 +419,37 @@ class SchemaGenerator {
                         "Unable to resolve: " + lookupName, methodInfo, typeInfo));
     }
 
-    private boolean isPrototyped(TypeName typeName) {
-        return ctx.typeInfo(typeName)
-                .map(it -> resolver.isSubtype(it, Types.RUNTIME_API))
+    private boolean isConfiguredPrototype(TypeName typeName) {
+        var lookup = typeName.genericTypeName().boxed();
+        var typeInfo = roundContext.typeInfo(lookup).orElse(null);
+        if (typeInfo != null) {
+            if (!resolver.isSubtype(typeInfo, Types.PROTOTYPE_API)) {
+                return false;
+            }
+            var blueprint = typeInfo.findAnnotation(Types.GENERATED)
+                    .filter(it -> it.stringValue()
+                            .filter(BuilderCodegen.class.getName()::equals)
+                            .isPresent())
+                    .flatMap(it -> it.stringValue("trigger"))
+                    .map(TypeName::create)
+                    .flatMap(roundContext::typeInfo)
+                    .orElse(null);
+            if (blueprint != null) {
+                return isConfiguredBlueprint(blueprint);
+            }
+        }
+        return roundContext.annotatedTypes(Types.PROTOTYPE_BLUEPRINT)
+                .stream()
+                .filter(it -> it.hasAnnotation(Types.PROTOTYPE_BLUEPRINT))
+                .filter(it -> FactoryPrototypeInfo.generatedTypeName(it).genericTypeName().equals(lookup))
+                .findFirst()
+                .map(this::isConfiguredBlueprint)
                 .orElse(false);
+    }
+
+    private boolean isConfiguredBlueprint(TypeInfo typeInfo) {
+        return typeInfo.hasAnnotation(Types.PROTOTYPE_BLUEPRINT)
+                && typeInfo.hasAnnotation(Types.PROTOTYPE_CONFIGURED);
     }
 
     private TypeName optionTypeName(OptionInfo optionInfo) {
@@ -361,14 +469,19 @@ class SchemaGenerator {
         if (optionInfo.prototypedBy().isPresent()) {
             return optionInfo.prototypedBy().get();
         }
+        if (!optionInfo.allowedValues().isEmpty()) {
+            return typeName.boxed();
+        }
 
         // check configured factory method
-        var configuredDeclaredTypeName = optionInfo.configured()
+        var configuredFactoryMethod = optionInfo.configured()
                 .flatMap(OptionConfigured::factoryMethod)
-                .map(FactoryMethod::declaringType)
                 .orElse(null);
-        if (configuredDeclaredTypeName != null) {
-            return configuredDeclaredTypeName;
+        if (configuredFactoryMethod != null) {
+            if (isConfiguredPrototype(typeName)) {
+                return typeName.boxed();
+            }
+            return configuredFactoryMethod.declaringType();
         }
 
         // check runtime factory method
@@ -384,6 +497,25 @@ class SchemaGenerator {
     }
 
     private String optionKind(OptionInfo optionInfo) {
+        var provider = optionInfo.provider().orElse(null);
+        if (provider != null) {
+            Option.Provider.ConfigForm configForm = provider.configForm();
+            if (configForm == Option.Provider.ConfigForm.AUTO) {
+                configForm = provider.providerIdentity() == Option.Provider.Identity.TYPE_ONLY
+                        ? Option.Provider.ConfigForm.OBJECT
+                        : Option.Provider.ConfigForm.OBJECT_OR_LIST;
+            }
+            if (configForm == Option.Provider.ConfigForm.OBJECT) {
+                return "MAP";
+            }
+            if (configForm == Option.Provider.ConfigForm.LIST) {
+                return "LIST";
+            }
+            if (configForm == Option.Provider.ConfigForm.OBJECT_OR_LIST) {
+                return "MAP_OR_LIST";
+            }
+        }
+
         var typeName = optionInfo.declaredType();
         if (typeName.isOptional()) {
             typeName = typeName.typeArguments().getFirst();

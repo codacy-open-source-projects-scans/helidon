@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package io.helidon.service.tests.inject;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import io.helidon.common.Weighted;
 import io.helidon.service.registry.GlobalServiceRegistry;
@@ -31,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.collection.IsIterableContainingInAnyOrder.containsInAnyOrder;
 import static org.hamcrest.collection.IsCollectionWithSize.hasSize;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -182,6 +185,49 @@ public class LateBindingTest {
     }
 
     @Test
+    void testLateBindingContractEqualWeights() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry registry = manager.registry();
+        GlobalServiceRegistry.registry(registry);
+        try {
+            Services.add(LateBindingTypes.Contract.class,
+                         Weighted.DEFAULT_WEIGHT,
+                         new LateBindingTypes.ServiceProvider("first"));
+            Services.add(LateBindingTypes.Contract.class,
+                         Weighted.DEFAULT_WEIGHT,
+                         new LateBindingTypes.ServiceProvider("second"));
+
+            List<String> messages = registry.all(LateBindingTypes.Contract.class)
+                    .stream()
+                    .map(LateBindingTypes.Contract::message)
+                    .toList();
+            assertThat(messages, containsInAnyOrder("injected", "first", "second"));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    void testLateBindingNamedContractEqualWeights() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry registry = manager.registry();
+        GlobalServiceRegistry.registry(registry);
+        try {
+            var first = new LateBindingTypes.ServiceProvider("first");
+            var shared = new LateBindingTypes.ServiceProvider("shared");
+            Services.setNamed(LateBindingTypes.Contract.class, first, "first");
+            Services.addNamed(LateBindingTypes.Contract.class, Weighted.DEFAULT_WEIGHT, shared, "second");
+            Services.addNamed(LateBindingTypes.Contract.class, Weighted.DEFAULT_WEIGHT, shared, "third");
+
+            List<LateBindingTypes.Contract> contracts = registry.all(LateBindingTypes.Contract.class,
+                                                                      Qualifier.createNamed("*"));
+            assertThat(contracts, containsInAnyOrder(first, shared, shared));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
     void testLateBindingServiceSingleAdd() {
         ServiceRegistryManager manager = ServiceRegistryManager.create();
         GlobalServiceRegistry.registry(manager.registry());
@@ -206,6 +252,30 @@ public class LateBindingTest {
             LateBindingTypes.Contract contract = registry.getNamed(LateBindingTypes.Contract.class, "named");
             assertThat(contract.message(), is("named"));
             contract = Services.getNamed(LateBindingTypes.Contract.class, "named");
+            assertThat(contract.message(), is("named"));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    void testLateBindingContractNamedReleasesWriteLock() throws Exception {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry registry = manager.registry();
+        GlobalServiceRegistry.registry(registry);
+        try {
+            Services.setNamed(LateBindingTypes.Contract.class, new LateBindingTypes.ServiceProvider("named"), "named");
+
+            CompletableFuture<LateBindingTypes.Contract> lookup = new CompletableFuture<>();
+            Thread.startVirtualThread(() -> {
+                try {
+                    lookup.complete(registry.getNamed(LateBindingTypes.Contract.class, "named"));
+                } catch (Throwable e) {
+                    lookup.completeExceptionally(e);
+                }
+            });
+
+            LateBindingTypes.Contract contract = lookup.get(5, TimeUnit.SECONDS);
             assertThat(contract.message(), is("named"));
         } finally {
             manager.shutdown();

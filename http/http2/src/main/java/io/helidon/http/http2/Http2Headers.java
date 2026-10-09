@@ -16,21 +16,31 @@
 
 package io.helidon.http.http2;
 
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
+import io.helidon.common.Api;
+import io.helidon.common.buffers.Ascii;
 import io.helidon.common.buffers.BufferData;
+import io.helidon.common.uri.UriAuthority;
+import io.helidon.common.uri.UriValidator;
 import io.helidon.http.Header;
 import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.Headers;
+import io.helidon.http.HttpToken;
+import io.helidon.http.LogFormatter;
 import io.helidon.http.Method;
 import io.helidon.http.ServerRequestHeaders;
 import io.helidon.http.Status;
@@ -76,11 +86,17 @@ public class Http2Headers {
     public static final HeaderName STATUS_NAME = HeaderNames.create(STATUS);
     static final DynamicHeader EMPTY_HEADER_RECORD = new DynamicHeader(null, null, 0);
     private static final System.Logger LOGGER = System.getLogger(Http2Headers.class.getName());
+    private static final Set<HeaderName> NO_IGNORED_HEADERS = Set.of();
+    private static final LongConsumer NO_HEADER_SIZE_CONSUMER = it -> {
+    };
     private static final String TRAILERS = "trailers";
     private static final String HTTP = "http";
     private static final String HTTPS = "https";
     private static final String PATH_SLASH = "/";
     private static final String PATH_INDEX = "/index.html";
+    private static final int SHOULD_INDEX = 1;
+    private static final int NEVER_INDEX = 1 << 1;
+    private static final int VALIDATE_NAME = 1 << 2;
 
     private final Headers headers;
     private final PseudoHeaders pseudoHeaders;
@@ -110,6 +126,58 @@ public class Http2Headers {
                                       Http2HuffmanDecoder huffman,
                                       Http2Headers headers,
                                       Http2FrameData... frames) {
+        return create(stream, table, huffman, headers, NO_IGNORED_HEADERS, frames);
+    }
+
+    /**
+     * Create headers from HTTP request.
+     *
+     * @param stream         stream that owns these headers
+     * @param table          dynamic table for this connection
+     * @param huffman        huffman decoder
+     * @param headers        http2 headers
+     * @param ignoredHeaders decoded header names that must not be added to the result
+     * @param frames         frames of the headers
+     * @return new headers parsed from the frames
+     * @throws Http2Exception in case of protocol errors
+     */
+    public static Http2Headers create(Http2Stream stream,
+                                      DynamicTable table,
+                                      Http2HuffmanDecoder huffman,
+                                      Http2Headers headers,
+                                      Set<HeaderName> ignoredHeaders,
+                                      Http2FrameData... frames) {
+        return create(stream, table, huffman, headers, ignoredHeaders, NO_HEADER_SIZE_CONSUMER, frames);
+    }
+
+    /**
+     * Create headers from HTTP request.
+     *
+     * @param stream                    stream that owns these headers
+     * @param table                     dynamic table for this connection
+     * @param huffman                   huffman decoder
+     * @param headers                   http2 headers
+     * @param ignoredHeaders            decoded header names that must not be added to the result
+     * @param decodedHeaderSizeConsumer consumer of each decoded header field size before ignored-header filtering
+     * @param frames                    frames of the headers
+     * @return new headers parsed from the frames
+     * @throws Http2Exception in case of protocol errors
+     */
+    @Api.Internal
+    public static Http2Headers create(Http2Stream stream,
+                                      DynamicTable table,
+                                      Http2HuffmanDecoder huffman,
+                                      Http2Headers headers,
+                                      Set<HeaderName> ignoredHeaders,
+                                      LongConsumer decodedHeaderSizeConsumer,
+                                      Http2FrameData... frames) {
+
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(huffman, "huffman");
+        Objects.requireNonNull(headers, "headers");
+        Objects.requireNonNull(ignoredHeaders, "ignoredHeaders");
+        Objects.requireNonNull(decodedHeaderSizeConsumer, "decodedHeaderSizeConsumer");
+        Objects.requireNonNull(frames, "frames");
 
         if (frames.length == 0) {
             return create(ServerRequestHeaders.create(WritableHeaders.create()),
@@ -154,7 +222,14 @@ public class Http2Headers {
                 throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Expecting more header bytes");
             }
 
-            lastIsPseudoHeader = readHeader(writableHeaders, pseudoHeaders, table, huffman, data, lastIsPseudoHeader);
+            lastIsPseudoHeader = readHeader(writableHeaders,
+                                            pseudoHeaders,
+                                            table,
+                                            huffman,
+                                            data,
+                                            lastIsPseudoHeader,
+                                            ignoredHeaders,
+                                            decodedHeaderSizeConsumer);
         }
     }
 
@@ -322,6 +397,22 @@ public class Http2Headers {
     }
 
     /**
+     * Validate that request or response trailers do not contain pseudo-headers.
+     *
+     * @throws Http2Exception if the trailers contain a pseudo-header
+     */
+    public void validateTrailers() throws Http2Exception {
+        if (pseudoHeaders.size() != 0) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Pseudo header in trailers");
+        }
+        for (Header header : headers) {
+            if (header.headerName().isPseudoHeader()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Pseudo header in trailers");
+            }
+        }
+    }
+
+    /**
      * Validate client or server request.
      *
      * @throws Http2Exception in case the request is invalid
@@ -333,21 +424,59 @@ public class Http2Headers {
         if (headers.contains(HeaderNames.CONNECTION)) {
             throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Connection in request headers");
         }
-        if (headers.contains(HeaderNames.TE)) {
+        if (headers.contains(HeaderNames.TRANSFER_ENCODING)) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Transfer-Encoding in request headers");
+        }
+        try {
+            headers.contentLength();
+        } catch (NumberFormatException e) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Content-Length header must be a number.", e);
+        } catch (IllegalArgumentException e) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, e.getMessage(), e);
+        }
+            if (headers.contains(HeaderNames.TE)) {
             List<String> values = headers.all(HeaderNames.TE, List::of);
             if (!values.equals(List.of(TRAILERS))) {
-                throw new Http2Exception(Http2ErrorCode.PROTOCOL, "te in headers with other value than trailers: \n"
-                        + BufferData.create(values.toString()).debugDataHex());
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, "te in headers with other value than trailers");
             }
-        }
-        if (!pseudoHeaders.hasScheme()) {
-            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :scheme pseudo header");
-        }
-        if (!pseudoHeaders.hasPath()) {
-            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :path pseudo header");
         }
         if (!pseudoHeaders.hasMethod()) {
             throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :method pseudo header");
+        }
+        boolean connect = Method.CONNECT.equals(pseudoHeaders.method());
+        if (connect) {
+            if (pseudoHeaders.hasScheme()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, ":scheme in CONNECT request headers");
+            }
+            if (pseudoHeaders.hasPath()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, ":path in CONNECT request headers");
+            }
+        } else {
+            if (!pseudoHeaders.hasScheme()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :scheme pseudo header");
+            }
+            if (!pseudoHeaders.hasPath()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :path pseudo header", true);
+            }
+            if (pseudoHeaders.path().isEmpty()) {
+                throw new Http2Exception(Http2ErrorCode.PROTOCOL, ":path pseudo header has empty value", true);
+            }
+        }
+        List<String> hostValues = headers.all(HeaderNames.HOST, List::of);
+        if (hostValues.size() > 1) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Repeated Host header");
+        }
+        boolean hasHost = hostValues.size() == 1 && !hostValues.get(0).isEmpty();
+        boolean hasAuthority = pseudoHeaders.hasAuthority() && !pseudoHeaders.authority().isEmpty();
+        if (connect && !hasAuthority) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :authority pseudo header in CONNECT request");
+        }
+        if (!connect && !hasAuthority && !hasHost) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Missing :authority pseudo header or Host header");
+        }
+        if (pseudoHeaders.hasAuthority() && !hostValues.isEmpty()
+                && !authoritiesMatch(pseudoHeaders.scheme(), pseudoHeaders.authority(), hostValues.get(0))) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Host header does not match :authority pseudo header");
         }
     }
 
@@ -375,91 +504,15 @@ public class Http2Headers {
      * @param growingBuffer buffer to write to
      */
     public void write(DynamicTable table, Http2HuffmanEncoder huffman, BufferData growingBuffer) {
-        // first write pseudoheaders
-        if (pseudoHeaders.hasStatus()) {
-            StaticHeader indexed = null;
-            Status status = pseudoHeaders.status();
-            if (status == Status.OK_200) {
-                indexed = StaticHeader.STATUS_200;
-            } else if (status == Status.NO_CONTENT_204) {
-                indexed = StaticHeader.STATUS_204;
-            } else if (status == Status.PARTIAL_CONTENT_206) {
-                indexed = StaticHeader.STATUS_206;
-            } else if (status == Status.NOT_MODIFIED_304) {
-                indexed = StaticHeader.STATUS_304;
-            } else if (status == Status.BAD_REQUEST_400) {
-                indexed = StaticHeader.STATUS_400;
-            } else if (status == Status.NOT_FOUND_404) {
-                indexed = StaticHeader.STATUS_404;
-            } else if (status == Status.INTERNAL_SERVER_ERROR_500) {
-                indexed = StaticHeader.STATUS_500;
-            }
-            if (indexed == null) {
-                writeHeader(huffman,
-                            table,
-                            growingBuffer,
-                            STATUS_NAME,
-                            status().codeText(),
-                            true,
-                            false);
-            } else {
-                writeHeader(growingBuffer, indexed);
-            }
-        }
-        if (pseudoHeaders.hasMethod()) {
-            Method method = pseudoHeaders.method();
-            StaticHeader indexed = null;
-            if (method == Method.GET) {
-                indexed = StaticHeader.METHOD_GET;
-            } else if (method == Method.POST) {
-                indexed = StaticHeader.METHOD_POST;
-            }
-            if (indexed == null) {
-                writeHeader(huffman, table, growingBuffer, METHOD_NAME, method.text(), true, false);
-            } else {
-                writeHeader(growingBuffer, indexed);
-            }
-        }
-        if (pseudoHeaders.hasScheme()) {
-            String scheme = pseudoHeaders.scheme();
-            if (scheme.equals(HTTP)) {
-                writeHeader(growingBuffer, StaticHeader.SCHEME_HTTP);
-            } else if (scheme.equals(HTTPS)) {
-                writeHeader(growingBuffer, StaticHeader.SCHEME_HTTPS);
-            } else {
-                writeHeader(huffman, table, growingBuffer, SCHEME_NAME, scheme, true, false);
-            }
-        }
-        if (pseudoHeaders.hasPath()) {
-            String path = pseudoHeaders.path();
-            if (path.equals(PATH_SLASH)) {
-                writeHeader(growingBuffer, StaticHeader.PATH_ROOT);
-            } else if (path.equals(PATH_INDEX)) {
-                writeHeader(growingBuffer, StaticHeader.PATH_INDEX);
-            } else {
-                writeHeader(huffman, table, growingBuffer, PATH_NAME, path, true, false);
-            }
-        }
-        if (pseudoHeaders.hasAuthority()) {
-            writeHeader(huffman, table, growingBuffer, AUTHORITY_NAME, pseudoHeaders.authority, true, false);
-        }
-
-        for (Header header : headers) {
-            HeaderName headerName = header.headerName();
-            boolean shouldIndex = !header.changing();
-            boolean neverIndex = header.sensitive();
-
-            // check count to call header.get() instead of header.allValues()
-            if (header.valueCount() == 1) {
-                writeHeader(huffman, table, growingBuffer, headerName, header.get(), shouldIndex, neverIndex);
-            } else if (headerName == HeaderNames.SET_COOKIE) {      // cannot combine, commas allowed
-                for (String value : header.allValues()) {
-                    writeHeader(huffman, table, growingBuffer, headerName, value, shouldIndex, neverIndex);
-                }
-            } else {
-                String value = header.values();         // send all combined values in single header
-                writeHeader(huffman, table, growingBuffer, headerName, value, shouldIndex, neverIndex);
-            }
+        int initialBufferSize = growingBuffer.available();
+        table.beginEncoding();
+        try {
+            writeHeaders(table, huffman, growingBuffer);
+            table.commitEncoding();
+        } catch (RuntimeException | Error e) {
+            table.rollbackEncoding();
+            growingBuffer.trim(growingBuffer.available() - initialBufferSize);
+            throw e;
         }
     }
 
@@ -488,18 +541,135 @@ public class Http2Headers {
         return new Http2Headers(httpHeaders, pseudoHeaders);
     }
 
+    private static boolean authoritiesMatch(String scheme, String authority, String host) {
+        try {
+            if (scheme == null) {
+                String lowerAuthority = Ascii.toLowerCase(authority);
+                String lowerHost = Ascii.toLowerCase(host);
+                if (lowerAuthority.equals(lowerHost)
+                        || normalizeSchemeLessAuthority(lowerAuthority).equals(normalizeSchemeLessAuthority(lowerHost))) {
+                    return true;
+                }
+            }
+            int defaultPort = scheme == null ? UriAuthority.UNDEFINED_PORT : defaultPort(scheme);
+            UriAuthority authorityValue = UriAuthority.create(authority);
+            UriAuthority hostValue = UriAuthority.create(host);
+            return authorityValue.host().equals(hostValue.host())
+                    && authorityValue.portOrDefault(defaultPort) == hostValue.portOrDefault(defaultPort);
+        } catch (IllegalArgumentException e) {
+            throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Invalid Host or :authority header", e);
+        }
+    }
+
+    private static String normalizeSchemeLessAuthority(String authority) {
+        if (authority.isEmpty() || authority.charAt(0) == '[') {
+            return authority;
+        }
+
+        int colon = authority.indexOf(':');
+        if (colon != authority.lastIndexOf(':')) {
+            return authority;
+        }
+
+        int hostEnd = colon == -1 ? authority.length() : colon;
+        String host = authority.substring(0, hostEnd);
+        UriValidator.validateHost(host);
+        String normalizedHost = decodeUnreserved(host);
+        if (colon == -1) {
+            return normalizedHost;
+        }
+        return normalizedHost + ":" + parsePort(authority, colon + 1);
+    }
+
+    private static String decodeUnreserved(String host) {
+        int percent = host.indexOf('%');
+        if (percent == -1) {
+            return host;
+        }
+
+        StringBuilder result = new StringBuilder(host.length());
+        result.append(host, 0, percent);
+        for (int i = percent; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (c != '%') {
+                result.append(c);
+                continue;
+            }
+            char high = host.charAt(++i);
+            char low = host.charAt(++i);
+            char decoded = (char) ((hexDigit(high) << 4) | hexDigit(low));
+            if (isUnreserved(decoded)) {
+                result.append(Ascii.toLowerCase(decoded));
+            } else {
+                result.append('%')
+                        .append(Ascii.toUpperCase(high))
+                        .append(Ascii.toUpperCase(low));
+            }
+        }
+        return result.toString();
+    }
+
+    private static int parsePort(String authority, int offset) {
+        if (offset == authority.length()) {
+            throw new IllegalArgumentException("Authority port cannot be blank");
+        }
+        int result = 0;
+        for (int i = offset; i < authority.length(); i++) {
+            char c = authority.charAt(i);
+            if (c < '0' || c > '9') {
+                throw new IllegalArgumentException("Authority port must contain only digits");
+            }
+            result = result * 10 + c - '0';
+            if (result > 65535) {
+                throw new IllegalArgumentException("Authority port must be between 0 and 65535");
+            }
+        }
+        return result;
+    }
+
+    private static int hexDigit(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        return c - 'A' + 10;
+    }
+
+    private static boolean isUnreserved(char c) {
+        return c >= 'a' && c <= 'z'
+                || c >= 'A' && c <= 'Z'
+                || c >= '0' && c <= '9'
+                || c == '-'
+                || c == '.'
+                || c == '_'
+                || c == '~';
+    }
+
+    private static int defaultPort(String scheme) {
+        return switch (scheme.toLowerCase(Locale.ROOT)) {
+        case HTTP -> 80;
+        case HTTPS -> 443;
+        default -> -1;
+        };
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber") // keep the decoder hot path allocation-free
     private static boolean readHeader(WritableHeaders<?> headers,
                                       PseudoHeaders pseudoHeaders,
                                       DynamicTable table,
                                       Http2HuffmanDecoder huffman,
                                       BufferData data,
-                                      boolean lastIsPseudoHeader) {
+                                      boolean lastIsPseudoHeader,
+                                      Set<HeaderName> ignoredHeaders,
+                                      LongConsumer decodedHeaderSizeConsumer) {
         // find out what kind of header we have
         HeaderApproach approach = HeaderApproach.resolve(data);
 
         if (approach.tableSizeUpdate) {
             table.maxTableSize(approach.number);
-            if (headers.size() > 0 || pseudoHeaders.size() > 0) {
+            if (!lastIsPseudoHeader || pseudoHeaders.size() > 0) {
                 throw new Http2Exception(Http2ErrorCode.COMPRESSION, "Table size update is after headers");
             }
             return lastIsPseudoHeader;
@@ -516,20 +686,29 @@ public class Http2Headers {
                 // read from bytes
                 String name;
                 try {
-                    name = readString(huffman, data);
+                    name = readString(huffman, data, StandardCharsets.US_ASCII);
                 } catch (IllegalArgumentException e) {
-                    throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Received a header with"
-                            + " non ASCII character(s)\n" + data.debugDataHex(true));
+                    throw new Http2Exception(Http2ErrorCode.PROTOCOL,
+                                             "Received a header with non ASCII character(s)");
+                }
+                if (name.isEmpty()) {
+                    throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Received an empty header name");
                 }
                 if (!(name.toLowerCase(Locale.ROOT).equals(name))) {
                     throw new Http2Exception(Http2ErrorCode.PROTOCOL,
-                                             "Received a header with uppercase letters\n"
-                                                     + BufferData.create(name).debugDataHex());
+                                             "Received a header with uppercase letters: "
+                                                     + LogFormatter.escape(name));
                 }
                 if (name.charAt(0) == ':') {
                     throw new Http2Exception(Http2ErrorCode.PROTOCOL,
-                                             "Received invalid pseudo-header field (or explicit value instead of indexed)\n"
-                                                     + BufferData.create(name).debugDataHex());
+                                             "Received invalid pseudo-header field "
+                                                     + "(or explicit value instead of indexed): "
+                                                     + LogFormatter.escape(name));
+                }
+                try {
+                    HttpToken.validate(name);
+                } catch (IllegalArgumentException e) {
+                    throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Received an invalid header name", e);
                 }
                 headerName = HeaderNames.create(name);
             } else {
@@ -548,7 +727,7 @@ public class Http2Headers {
 
             if (approach.hasValue) {
                 // read from bytes
-                value = readString(huffman, data);
+                value = readString(huffman, data, StandardCharsets.ISO_8859_1);
             } else {
                 value = record.value();
                 if (value == null) {
@@ -559,9 +738,6 @@ public class Http2Headers {
             if (isPseudoHeader) {
                 if (value == null) {
                     throw new Http2Exception(Http2ErrorCode.PROTOCOL, "Value of a pseudo header must not be null");
-                }
-                if (headerName.equals(PATH_NAME) && value.length() == 0) {
-                    throw new Http2Exception(Http2ErrorCode.PROTOCOL, ":path pseudo header has empty value");
                 }
                 if (headerName.equals(PATH_NAME)) {
                     validateAndSetPseudoHeader(headerName, pseudoHeaders::hasPath, pseudoHeaders::path, value);
@@ -576,25 +752,18 @@ public class Http2Headers {
                 }
             } else {
                 if (headerName == null || value == null) {
-                    String tHeaderName = headerName == null ? "null" : headerName.lowerCase();
-                    String tValue = value == null
-                            ? "null"
-                            : BufferData.create(value.getBytes(StandardCharsets.US_ASCII))
-                                    .debugDataHex();
-
                     throw new Http2Exception(Http2ErrorCode.COMPRESSION,
-                                             "Failed to get name or value. Name: "
-                                                     + tHeaderName
-                                                     + ", value "
-                                                     + tValue);
+                                             "Failed to get header name or value");
                 }
             }
 
+            if (decodedHeaderSizeConsumer != NO_HEADER_SIZE_CONSUMER) {
+                decodedHeaderSizeConsumer.accept(Http2Util.headerSize(headerName, value));
+            }
             if (approach.addToIndex) {
                 table.add(headerName, value);
             }
-
-            if (!isPseudoHeader) {
+            if (!isPseudoHeader && !ignoredHeaders.contains(headerName)) {
                 headers.add(HeaderValues.create(headerName,
                                                 !approach.addToIndex,
                                                 approach.neverIndex,
@@ -604,7 +773,7 @@ public class Http2Headers {
         }
     }
 
-    private static String readString(Http2HuffmanDecoder huffman, BufferData data) {
+    private static String readString(Http2HuffmanDecoder huffman, BufferData data, Charset charset) {
         if (data.available() < 1) {
             throw new Http2Exception(Http2ErrorCode.COMPRESSION, "No data available to read header");
         }
@@ -621,12 +790,42 @@ public class Http2Headers {
         // +---+---------------------------+
         // | Value String (Length octets)  |
         // +-------------------------------+
-        int length = data.readHpackInt(first, 7);
+        int length = first & 0b01111111;
+        if (length == 0b01111111) {
+            long longLength = length;
+            int shiftBy = 0;
+            while (true) {
+                if (data.available() == 0) {
+                    throw new Http2Exception(Http2ErrorCode.COMPRESSION,
+                                             "HPACK string length exceeds available header block bytes");
+                }
+                int next = data.read();
+                int nextValue = next & 0b01111111;
+                if (nextValue != 0 && shiftBy > 30) {
+                    throw new Http2Exception(Http2ErrorCode.COMPRESSION,
+                                             "HPACK string length exceeds available header block bytes");
+                }
+                longLength += (long) nextValue << shiftBy;
+                if (longLength > data.available()) {
+                    throw new Http2Exception(Http2ErrorCode.COMPRESSION,
+                                             "HPACK string length exceeds available header block bytes");
+                }
+                if ((next & 0b10000000) == 0) {
+                    length = (int) longLength;
+                    break;
+                }
+                shiftBy += 7;
+            }
+        }
+        if (length > data.available()) {
+            throw new Http2Exception(Http2ErrorCode.COMPRESSION,
+                                     "HPACK string length exceeds available header block bytes");
+        }
 
         if (isHuffman) {
-            return huffman.decodeString(data, length);
+            return huffman.decodeString(data, length, charset);
         } else {
-            return data.readString(length);
+            return data.readString(length, charset);
         }
     }
 
@@ -694,55 +893,137 @@ public class Http2Headers {
         headers.remove(pseudoHeader, it -> valueConsumer.accept(it.get()));
     }
 
+    private void writeHeaders(DynamicTable table, Http2HuffmanEncoder huffman, BufferData growingBuffer) {
+        // first write pseudoheaders
+        if (pseudoHeaders.hasStatus()) {
+            StaticHeader indexed = null;
+            Status status = pseudoHeaders.status();
+            if (status == Status.OK_200) {
+                indexed = StaticHeader.STATUS_200;
+            } else if (status == Status.NO_CONTENT_204) {
+                indexed = StaticHeader.STATUS_204;
+            } else if (status == Status.PARTIAL_CONTENT_206) {
+                indexed = StaticHeader.STATUS_206;
+            } else if (status == Status.NOT_MODIFIED_304) {
+                indexed = StaticHeader.STATUS_304;
+            } else if (status == Status.BAD_REQUEST_400) {
+                indexed = StaticHeader.STATUS_400;
+            } else if (status == Status.NOT_FOUND_404) {
+                indexed = StaticHeader.STATUS_404;
+            } else if (status == Status.INTERNAL_SERVER_ERROR_500) {
+                indexed = StaticHeader.STATUS_500;
+            }
+            if (indexed == null) {
+                writeHeader(huffman,
+                            table,
+                            growingBuffer,
+                            STATUS_NAME,
+                            status().codeText(),
+                            SHOULD_INDEX);
+            } else {
+                writeHeader(growingBuffer, indexed);
+            }
+        }
+        if (pseudoHeaders.hasMethod()) {
+            Method method = pseudoHeaders.method();
+            StaticHeader indexed = null;
+            if (method == Method.GET) {
+                indexed = StaticHeader.METHOD_GET;
+            } else if (method == Method.POST) {
+                indexed = StaticHeader.METHOD_POST;
+            }
+            if (indexed == null) {
+                writeHeader(huffman, table, growingBuffer, METHOD_NAME, method.text(), SHOULD_INDEX);
+            } else {
+                writeHeader(growingBuffer, indexed);
+            }
+        }
+        if (pseudoHeaders.hasScheme()) {
+            String scheme = pseudoHeaders.scheme();
+            if (scheme.equals(HTTP)) {
+                writeHeader(growingBuffer, StaticHeader.SCHEME_HTTP);
+            } else if (scheme.equals(HTTPS)) {
+                writeHeader(growingBuffer, StaticHeader.SCHEME_HTTPS);
+            } else {
+                writeHeader(huffman, table, growingBuffer, SCHEME_NAME, scheme, SHOULD_INDEX);
+            }
+        }
+        if (pseudoHeaders.hasPath()) {
+            String path = pseudoHeaders.path();
+            if (path.equals(PATH_SLASH)) {
+                writeHeader(growingBuffer, StaticHeader.PATH_ROOT);
+            } else if (path.equals(PATH_INDEX)) {
+                writeHeader(growingBuffer, StaticHeader.PATH_INDEX);
+            } else {
+                writeHeader(huffman, table, growingBuffer, PATH_NAME, path, SHOULD_INDEX);
+            }
+        }
+        if (pseudoHeaders.hasAuthority()) {
+            writeHeader(huffman, table, growingBuffer, AUTHORITY_NAME, pseudoHeaders.authority, SHOULD_INDEX);
+        }
+
+        for (Header header : headers) {
+            HeaderName headerName = header.headerName();
+            int flags = VALIDATE_NAME;
+            if (!header.changing()) {
+                flags |= SHOULD_INDEX;
+            }
+            if (header.sensitive()) {
+                flags |= NEVER_INDEX;
+            }
+
+            // check count to call header.get() instead of header.allValues()
+            if (header.valueCount() == 1) {
+                writeHeader(huffman, table, growingBuffer, headerName, header.get(), flags);
+            } else if (headerName == HeaderNames.SET_COOKIE) {      // cannot combine, commas allowed
+                for (String value : header.allValues()) {
+                    writeHeader(huffman, table, growingBuffer, headerName, value, flags);
+                }
+            } else {
+                String value = header.values();         // send all combined values in single header
+                writeHeader(huffman, table, growingBuffer, headerName, value, flags);
+            }
+        }
+    }
+
     private void writeHeader(Http2HuffmanEncoder huffman, DynamicTable table,
                              BufferData buffer,
                              HeaderName name,
                              String value,
-                             boolean shouldIndex,
-                             boolean neverIndex) {
-        IndexedHeaderRecord record = table.find(name, value);
+                             int flags) {
+        int index = table.findIndex(name, value);
         HeaderApproach approach;
 
-        if (record == null) {
-            // neither name nor value exists in an index
-            if (shouldIndex) {
-                table.add(name, value);
-            }
-            approach = new HeaderApproach(shouldIndex,
-                                          neverIndex,
-                                          true,
-                                          true,
-                                          0);
-        } else {
-            // at least name is available in index, maybe even value
-            if (value.equals(record.value())) {
-                // this is the exact same name and value
-                approach = new HeaderApproach(false,
-                                              neverIndex,
-                                              false,
-                                              false,
-                                              record.index());
-            } else {
-                // same name
-                if (shouldIndex) {
-                    table.add(name, value);
-                }
-                // in both cases, we use index to record name
-                approach = new HeaderApproach(shouldIndex,
-                                              neverIndex,
-                                              false,
-                                              true,
-                                              record.index());
+        if ((flags & VALIDATE_NAME) != 0) {
+            String lowerCaseName = name.lowerCase();
+            if (name.index() < 0 || lowerCaseName.isEmpty() || lowerCaseName.charAt(0) == ':') {
+                HttpToken.validate(lowerCaseName);
             }
         }
 
+        boolean shouldIndex = (flags & SHOULD_INDEX) != 0;
+        boolean neverIndex = (flags & NEVER_INDEX) != 0;
+        if (index == 0) {
+            // neither name nor value exists in an index
+            approach = new HeaderApproach(shouldIndex, neverIndex, true, true, 0);
+        } else if (index > 0) {
+            // this is the exact same name and value
+            approach = new HeaderApproach(false, neverIndex, false, false, index);
+        } else {
+            // same name
+            // in both cases, we use index to record name
+            approach = new HeaderApproach(shouldIndex, neverIndex, false, true, -index);
+        }
+
         approach.write(huffman, buffer, name, value);
+        if (shouldIndex && index <= 0) {
+            table.add(name, value);
+        }
     }
 
     private void writeHeader(BufferData buffer,
                              StaticHeader header) {
-        new HeaderApproach(false, false, false, false, header.index)
-                .write(buffer);
+        buffer.writeHpackInt(header.index, 0b10000000, 7);
     }
 
     enum StaticHeader implements IndexedHeaderRecord {
@@ -795,7 +1076,7 @@ public class Http2Headers {
         MAX_FORWARDS(47, HeaderNames.MAX_FORWARDS),
         PROXY_AUTHENTICATE(48, HeaderNames.PROXY_AUTHENTICATE),
         PROXY_AUTHORIZATION(49, HeaderNames.PROXY_AUTHORIZATION),
-        RANGE(50, HeaderNames.CONTENT_LOCATION),
+        RANGE(50, HeaderNames.RANGE),
         REFERER(51, HeaderNames.REFERER),
         REFRESH(52, HeaderNames.REFRESH),
         RETRY_AFTER(53, HeaderNames.RETRY_AFTER),
@@ -978,31 +1259,35 @@ public class Http2Headers {
                 return new HeaderApproach(false, true, true, true, 0);
             }
 
-            // name and value from index - 0b1xxxxxxx
-            if ((value & 0b10000000) != 0) {
-                int indexPart = data.readHpackInt(value, 7);
-                return new HeaderApproach(false, false, false, false, indexPart);
-            }
+            try {
+                // name and value from index - 0b1xxxxxxx
+                if ((value & 0b10000000) != 0) {
+                    int indexPart = data.readHpackInt(value, 7);
+                    return new HeaderApproach(false, false, false, false, indexPart);
+                }
 
-            // name from index, literal value, index - 0b01xxxxxx
-            if ((value & 0b11000000) == 0b01000000) {
-                int indexPart = data.readHpackInt(value, 6);
-                return new HeaderApproach(true, false, false, true, indexPart);
-            }
+                // name from index, literal value, index - 0b01xxxxxx
+                if ((value & 0b11000000) == 0b01000000) {
+                    int indexPart = data.readHpackInt(value, 6);
+                    return new HeaderApproach(true, false, false, true, indexPart);
+                }
 
-            // dynamic table size update
-            if ((value & 0b11100000) == 0b00100000) {
-                int size = data.readHpackInt(value, 5);
-                return new HeaderApproach(size);
-            }
+                // dynamic table size update
+                if ((value & 0b11100000) == 0b00100000) {
+                    int size = data.readHpackInt(value, 5);
+                    return new HeaderApproach(size);
+                }
 
-            if ((value & 0b11110000) == 0) {
-                int indexPart = data.readHpackInt(value, 4);
-                return new HeaderApproach(false, false, false, true, indexPart);
-            }
-            if ((value & 0b11110000) == 0b00010000) {
-                int indexPart = data.readHpackInt(value, 4);
-                return new HeaderApproach(false, true, false, true, indexPart);
+                if ((value & 0b11110000) == 0) {
+                    int indexPart = data.readHpackInt(value, 4);
+                    return new HeaderApproach(false, false, false, true, indexPart);
+                }
+                if ((value & 0b11110000) == 0b00010000) {
+                    int indexPart = data.readHpackInt(value, 4);
+                    return new HeaderApproach(false, true, false, true, indexPart);
+                }
+            } catch (IllegalArgumentException e) {
+                throw new Http2Exception(Http2ErrorCode.COMPRESSION, "Invalid HPACK integer", e);
             }
 
             throw new Http2Exception(Http2ErrorCode.COMPRESSION,
@@ -1022,10 +1307,6 @@ public class Http2Headers {
             }
         }
 
-        public boolean nameFromIndex() {
-            return !hasName;
-        }
-
         public void write(Http2HuffmanEncoder huffman, BufferData buffer, HeaderName headerName, String value) {
             /*
              0   1   2   3   4   5   6   7
@@ -1038,35 +1319,36 @@ public class Http2Headers {
            +-------------------------------+
              */
             // write flags + index beginning
-            boolean hasValue = hasValue();
-
-            if (neverIndex()) {
-                if (hasName()) {
+            boolean writeValue = hasValue;
+            if (neverIndex) {
+                if (hasName) {
                     // never indexed, custom name and value
                     buffer.writeInt8(0b00010000);
                 } else {
                     // indexed name
-                    if (!hasValue) {
+                    if (!writeValue) {
                         // this is garbage, cannot "never index" a header that is already indexed
                         if (LOGGER.isLoggable(DEBUG)) {
-                            LOGGER.log(DEBUG, "Never index on field with indexed value: " + headerName + ": " + value);
+                            LOGGER.log(DEBUG, "Never index on field with indexed value: "
+                                    + LogFormatter.escape(headerName.defaultCase()));
                         }
 
-                        hasValue = true;
+                        writeValue = true;
                     }
                     buffer.writeHpackInt(number, 0b00010000, 4);
                 }
-            } else if (addToIndex()) {
+            } else if (addToIndex) {
                 if (hasName) {
                     // index, custom name and value
                     buffer.writeInt8(0b01000000);
                 } else {
                     // index and name from index
-                    if (!hasValue) {
+                    if (!writeValue) {
                         if (LOGGER.isLoggable(DEBUG)) {
-                            LOGGER.log(DEBUG, "Index on field with indexed value: " + headerName + ": " + value);
+                            LOGGER.log(DEBUG, "Index on field with indexed value: "
+                                    + LogFormatter.escape(headerName.defaultCase()));
                         }
-                        hasValue = true;
+                        writeValue = true;
                     }
                     buffer.writeHpackInt(number, 0b01000000, 6);
                 }
@@ -1077,7 +1359,7 @@ public class Http2Headers {
                     buffer.write(0);
                 } else {
                     // indexed name
-                    if (hasValue) {
+                    if (writeValue) {
                         // indexed name, custom value
                         buffer.writeHpackInt(number, 0, 4);
                     } else {
@@ -1098,11 +1380,11 @@ public class Http2Headers {
                 }
 
             }
-            if (hasValue) {
+            if (writeValue) {
                 if (value.length() > 3) {
                     huffman.encode(buffer, value);
                 } else {
-                    byte[] valueBytes = value.getBytes(StandardCharsets.US_ASCII);
+                    byte[] valueBytes = Http2HuffmanEncoder.encodeLatin1(value);
                     buffer.writeHpackInt(valueBytes.length, 0, 7);
                     buffer.write(valueBytes);
                 }
@@ -1110,26 +1392,6 @@ public class Http2Headers {
             }
         }
 
-        public boolean hasValue() {
-            return hasValue;
-        }
-
-        public boolean neverIndex() {
-            return neverIndex;
-        }
-
-        public boolean hasName() {
-            return hasName;
-        }
-
-        public boolean addToIndex() {
-            return addToIndex;
-        }
-
-        // write fully indexed value
-        void write(BufferData buffer) {
-            buffer.writeHpackInt(number, 0b10000000, 7);
-        }
     }
 
     /**
@@ -1142,6 +1404,9 @@ public class Http2Headers {
         private volatile long protocolMaxTableSize;
         private long maxTableSize;
         private int currentTableSize;
+        private List<DynamicHeader> encodingSnapshot;
+        private int encodingSnapshotSize;
+        private boolean encoding;
 
         private DynamicTable(long protocolMaxTableSize) {
             this.protocolMaxTableSize = protocolMaxTableSize;
@@ -1194,12 +1459,21 @@ public class Http2Headers {
         }
 
         int add(HeaderName headerName, String headerValue) {
+            checkpointEncoding();
             String name = headerName.lowerCase();
-            int size = name.length() + headerValue.getBytes(StandardCharsets.US_ASCII).length + 32;
+            int size = name.length() + headerValue.length() + 32;
 
             if (currentTableSize + size <= maxTableSize) {
                 // fast path
                 return add(headerName, headerValue, size);
+            }
+
+            // RFC 7541, Section 4.4: an entry larger than the maximum empties the table
+            // and is not inserted.
+            if (size > maxTableSize) {
+                headers.clear();
+                currentTableSize = 0;
+                return -1;
             }
 
             while ((currentTableSize + size) > maxTableSize) {
@@ -1228,31 +1502,61 @@ public class Http2Headers {
             return currentTableSize;
         }
 
-        private IndexedHeaderRecord find(HeaderName headerName, String headerValue) {
+        private void beginEncoding() {
+            if (encoding) {
+                throw new IllegalStateException("An HPACK header block is already being encoded");
+            }
+            encoding = true;
+        }
+
+        private void commitEncoding() {
+            encoding = false;
+            encodingSnapshot = null;
+        }
+
+        private void rollbackEncoding() {
+            if (encodingSnapshot != null) {
+                headers.clear();
+                headers.addAll(encodingSnapshot);
+                currentTableSize = encodingSnapshotSize;
+            }
+            encoding = false;
+            encodingSnapshot = null;
+        }
+
+        private void checkpointEncoding() {
+            if (encoding && encodingSnapshot == null) {
+                encodingSnapshot = new ArrayList<>(headers);
+                encodingSnapshotSize = currentTableSize;
+            }
+        }
+
+        private int findIndex(HeaderName headerName, String headerValue) {
             StaticHeader staticHeader = StaticHeader.find(headerName, headerValue);
-            IndexedHeaderRecord candidate = null;
+            int candidate = 0;
 
             if (staticHeader != null) {
                 if (staticHeader.name.equals(headerName)
                         && staticHeader.hasValue
                         && staticHeader.value().equals(headerValue)) {
-                    return staticHeader;
+                    return staticHeader.index();
                 }
-                candidate = staticHeader;
+                candidate = staticHeader.index();
             }
             for (int i = 0; i < headers.size(); i++) {
                 DynamicHeader header = headers.get(i);
                 if (header.headerName.equals(headerName)) {
+                    int index = StaticHeader.MAX_INDEX + i + 1;
                     if (header.value().equals(headerValue)) {
-                        return new IndexedHeader(header, StaticHeader.MAX_INDEX + i + 1);
+                        return index;
                     }
-                    if (candidate == null) {
-                        candidate = new IndexedHeader(header, StaticHeader.MAX_INDEX + i + 1);
+                    if (candidate == 0) {
+                        candidate = index;
                     }
                 }
             }
 
-            return candidate;
+            return -candidate;
         }
 
         private void evict() {
@@ -1285,18 +1589,6 @@ public class Http2Headers {
     }
 
     private record DynamicHeader(HeaderName headerName, String value, int size) implements HeaderRecord {
-    }
-
-    private record IndexedHeader(HeaderRecord delegate, int index) implements IndexedHeaderRecord {
-        @Override
-        public HeaderName headerName() {
-            return delegate().headerName();
-        }
-
-        @Override
-        public String value() {
-            return delegate.value();
-        }
     }
 
     private static class PseudoHeaders {

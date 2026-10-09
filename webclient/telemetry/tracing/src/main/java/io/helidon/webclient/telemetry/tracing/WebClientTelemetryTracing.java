@@ -17,8 +17,10 @@
 package io.helidon.webclient.telemetry.tracing;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import io.helidon.common.context.Context;
 import io.helidon.config.Config;
@@ -43,18 +45,26 @@ import io.helidon.webclient.spi.WebClientService;
  */
 public class WebClientTelemetryTracing implements WebClientService {
 
-    static final String HTTP_REQUEST_METHOD = "http.client.request.method";
+    static final String HTTP_REQUEST_METHOD = "http.request.method";
+    static final String HTTP_REQUEST_METHOD_ORIGINAL = "http.request.method_original";
     static final String SERVER_ADDRESS = "server.address";
     static final String SERVER_PORT = "server.port";
     static final String URL_FULL =  "url.full";
     static final String ERROR_TYPE = "error.type";
     static final String HTTP_RESPONSE_STATUS_CODE = "http.response.status.code";
 
+    private static final String OTHER_METHOD = "_OTHER";
+    private static final String UNKNOWN_METHOD_SPAN_NAME = "HTTP";
+
     private final Function<Context, Tracer> tracerFunction;
 
     private WebClientTelemetryTracing() {
+        this(() -> Services.get(Tracer.class));
+    }
+
+    private WebClientTelemetryTracing(Supplier<Tracer> tracer) {
         tracerFunction = ctx -> ctx.get(Tracer.class)
-                .orElseGet(() -> Services.get(Tracer.class));
+                .orElseGet(tracer);
     }
 
     /**
@@ -78,19 +88,52 @@ public class WebClientTelemetryTracing implements WebClientService {
         return create();
     }
 
+    /**
+     * Creates a new service instance to emit tracing spans compliant with OpenTelemetry semantic conventions
+     * for clients using the provided configuration and tracer.
+     *
+     * @param config telemetry tracing config
+     * @param tracer fallback tracer when the request context does not contain one
+     * @return new tracing semantic conventions implementation
+     */
+    public static WebClientTelemetryTracing create(Config config, Tracer tracer) {
+        Tracer fallbackTracer = Objects.requireNonNull(tracer);
+        return create(config, () -> fallbackTracer);
+    }
+
+    /**
+     * Creates a new service instance to emit tracing spans compliant with OpenTelemetry semantic conventions
+     * for clients using the provided configuration and tracer supplier.
+     *
+     * @param config telemetry tracing config
+     * @param tracer supplier of the fallback tracer when the request context does not contain one
+     * @return new tracing semantic conventions implementation
+     */
+    public static WebClientTelemetryTracing create(Config config, Supplier<Tracer> tracer) {
+        Objects.requireNonNull(config);
+        return new WebClientTelemetryTracing(Objects.requireNonNull(tracer));
+    }
+
     @Override
     public WebClientServiceResponse handle(Chain chain, WebClientServiceRequest clientRequest) {
 
         var tracer = tracerFunction.apply(clientRequest.context());
+        String originalMethod = clientRequest.method().text();
+        String knownMethod = knownMethod(originalMethod);
+        String spanName = knownMethod == null ? UNKNOWN_METHOD_SPAN_NAME : knownMethod;
+        String methodAttribute = knownMethod == null ? OTHER_METHOD : knownMethod;
 
-        var spanBuilder = tracer.spanBuilder(spanName(clientRequest));
+        var spanBuilder = tracer.spanBuilder(spanName);
         clientRequest.context().get(SpanContext.class).ifPresent(spanBuilder::parent);
 
         spanBuilder.kind(Span.Kind.CLIENT)
-                .tag(HTTP_REQUEST_METHOD, clientRequest.method().text())
+                .tag(HTTP_REQUEST_METHOD, methodAttribute)
                 .tag(SERVER_ADDRESS, clientRequest.uri().host())
                 .tag(SERVER_PORT, clientRequest.uri().port())
                 .tag(URL_FULL, clientRequest.uri().toString());
+        if (knownMethod == null) {
+            spanBuilder.tag(HTTP_REQUEST_METHOD_ORIGINAL, originalMethod);
+        }
 
         var span = spanBuilder.start();
         clientRequest.context().register(span.context());
@@ -113,12 +156,11 @@ public class WebClientTelemetryTracing implements WebClientService {
         }
     }
 
-    private String spanName(WebClientServiceRequest clientRequest) {
-        /*
-        If we could, we would retrieve the URI template from the request and combine the HTTP method with
-        it. Given that we cannot, just use the method because the semantic conventions prohibit using the path in the span name.
-         */
-        return clientRequest.method().text();
+    private static String knownMethod(String method) {
+        return switch (method) {
+        case "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY", "TRACE" -> method;
+        default -> null;
+        };
     }
 
     private static class ClientHeaderConsumer implements HeaderConsumer {

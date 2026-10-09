@@ -24,8 +24,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import io.helidon.metrics.api.Counter;
+import io.helidon.metrics.api.MeterRegistry;
 import io.helidon.metrics.api.Tag;
 import io.helidon.service.registry.Service;
+import io.helidon.service.registry.ServiceRegistry;
 
 @Service.PerInstance(CircuitBreakerConfigBlueprint.class)
 class CircuitBreakerImpl implements CircuitBreaker {
@@ -49,6 +51,7 @@ class CircuitBreakerImpl implements CircuitBreaker {
     private final AtomicBoolean halfOpenInProgress = new AtomicBoolean();
     private final AtomicReference<Future<Boolean>> schedule = new AtomicReference<>();
     private final ErrorChecker errorChecker;
+    private final boolean applyOnConfigured;
     private final String name;
     private final CircuitBreakerConfig config;
     private final boolean metricsEnabled;
@@ -56,21 +59,37 @@ class CircuitBreakerImpl implements CircuitBreaker {
     private Counter callsCounterMetric;
     private Counter openedCounterMetric;
 
+    CircuitBreakerImpl(CircuitBreakerConfig config,
+                       Supplier<MeterRegistry> meterRegistry) {
+        this(config, meterRegistry, MetricsUtils.defaultEnabled());
+    }
+
     @Service.Inject
-    CircuitBreakerImpl(CircuitBreakerConfig config) {
+    CircuitBreakerImpl(CircuitBreakerConfig config,
+                       Supplier<MeterRegistry> meterRegistry,
+                       ServiceRegistry serviceRegistry) {
+        this(config, meterRegistry, MetricsUtils.defaultEnabled(serviceRegistry));
+    }
+
+    private CircuitBreakerImpl(CircuitBreakerConfig config,
+                               Supplier<MeterRegistry> meterRegistry,
+                               boolean metricsDefaultEnabled) {
         this.delayMillis = config.delay().toMillis();
         this.successThreshold = config.successThreshold();
         this.results = new ResultWindow(config.volume(), config.errorRatio());
         this.executor = config.executor().orElseGet(FaultTolerance.executor());
         this.errorChecker = ErrorChecker.create(config.skipOn(), config.applyOn());
+        this.applyOnConfigured = !config.applyOn().isEmpty();
         this.name = config.name().orElseGet(() -> "circuit-breaker-" + System.identityHashCode(config));
         this.config = config;
 
-        this.metricsEnabled = config.enableMetrics() || MetricsUtils.defaultEnabled();
+        this.metricsEnabled = config.enableMetrics() || metricsDefaultEnabled;
         if (metricsEnabled) {
-            Tag nameTag = Tag.create("name", name);
-            callsCounterMetric = MetricsUtils.counterBuilder(FT_CIRCUITBREAKER_CALLS_TOTAL, nameTag);
-            openedCounterMetric = MetricsUtils.counterBuilder(FT_CIRCUITBREAKER_OPENED_TOTAL, nameTag);
+            var mr = meterRegistry.get();
+            var mf = mr.metricsFactory();
+            Tag nameTag = MetricsUtils.tag(mf, "name", name);
+            callsCounterMetric = MetricsUtils.counterBuilder(mf, mr, FT_CIRCUITBREAKER_CALLS_TOTAL, nameTag);
+            openedCounterMetric = MetricsUtils.counterBuilder(mf, mr, FT_CIRCUITBREAKER_OPENED_TOTAL, nameTag);
         }
     }
 
@@ -133,6 +152,12 @@ class CircuitBreakerImpl implements CircuitBreaker {
         return schedule.get();
     }
 
+    private static boolean callerCancelled(Throwable throwable) {
+        return !(throwable instanceof Error)
+                && Thread.currentThread().isInterrupted()
+                && SupplierHelper.interrupted(throwable) != null;
+    }
+
     private <U> U executeTask(Supplier<? extends U> supplier) {
         try {
             U result = supplier.get();
@@ -140,7 +165,11 @@ class CircuitBreakerImpl implements CircuitBreaker {
             return result;
         } catch (Throwable t) {
             Throwable throwable = SupplierHelper.unwrapThrowable(t);
-            if (errorChecker.shouldSkip(throwable)) {
+            boolean shouldSkip = errorChecker.shouldSkip(throwable);
+            if (callerCancelled(t) && (!applyOnConfigured || shouldSkip)) {
+                throw SupplierHelper.toRuntimeException(throwable);
+            }
+            if (shouldSkip) {
                 results.update(ResultWindow.Result.SUCCESS);
             } else {
                 results.update(ResultWindow.Result.FAILURE);
@@ -174,7 +203,11 @@ class CircuitBreakerImpl implements CircuitBreaker {
                 return result;
             } catch (Throwable t) {
                 Throwable throwable = SupplierHelper.unwrapThrowable(t);
-                if (errorChecker.shouldSkip(throwable)) {
+                boolean shouldSkip = errorChecker.shouldSkip(throwable);
+                if (callerCancelled(t) && (!applyOnConfigured || shouldSkip)) {
+                    throw SupplierHelper.toRuntimeException(throwable);
+                }
+                if (shouldSkip) {
                     // success
                     int successes = successCounter.incrementAndGet();
                     if (successes >= successThreshold) {

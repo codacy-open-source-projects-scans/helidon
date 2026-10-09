@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package io.helidon.service.registry;
 
+import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -27,8 +29,11 @@ import io.helidon.service.registry.Service.QualifiedInstance;
 Manager of a single service. There is one instance per service provider (and per service descriptor).
  */
 class ServiceManager<T> {
+    private static final System.Logger LOGGER = System.getLogger(ServiceManager.class.getName());
+
     private final ServiceProvider<T> provider;
-    private final boolean explicitInstance;
+    private final boolean skipBindingPlan;
+    private final boolean fixedInstance;
     private final Supplier<Activator<T>> activatorSupplier;
     private final CoreServiceRegistry registry;
     private final Supplier<Scope> scopeSupplier;
@@ -36,12 +41,22 @@ class ServiceManager<T> {
     ServiceManager(CoreServiceRegistry registry,
                    Supplier<Scope> scopeSupplier,
                    ServiceProvider<T> provider,
-                   boolean explicitInstance,
+                   boolean skipBindingPlan,
+                   Supplier<Activator<T>> activatorSupplier) {
+        this(registry, scopeSupplier, provider, skipBindingPlan, skipBindingPlan, activatorSupplier);
+    }
+
+    ServiceManager(CoreServiceRegistry registry,
+                   Supplier<Scope> scopeSupplier,
+                   ServiceProvider<T> provider,
+                   boolean skipBindingPlan,
+                   boolean fixedInstance,
                    Supplier<Activator<T>> activatorSupplier) {
         this.registry = registry;
         this.scopeSupplier = scopeSupplier;
         this.provider = provider;
-        this.explicitInstance = explicitInstance;
+        this.skipBindingPlan = skipBindingPlan;
+        this.fixedInstance = fixedInstance;
         this.activatorSupplier = activatorSupplier;
     }
 
@@ -51,8 +66,8 @@ class ServiceManager<T> {
     }
 
     void ensureBindingPlan() {
-        if (explicitInstance) {
-            // we do not need injection plan, if service was provided as an instance
+        if (skipBindingPlan) {
+            // late-bound instances and descriptors are not part of the build-time binding plan
             return;
         }
         registry.bindings()
@@ -64,6 +79,108 @@ class ServiceManager<T> {
         return new ServiceInstanceImpl<>(provider.descriptor(),
                                          provider.contracts(lookup),
                                          instance);
+    }
+
+    Optional<List<QualifiedInstance<T>>> instances(Lookup lookup) {
+        ScopedRegistry scopedRegistry = scopeSupplier.get().registry();
+        try {
+            return scopedRegistry.activator(provider.descriptor(), activatorSupplier).instances(lookup);
+        } catch (ScopeNotActiveException e) {
+            // Older generated lifecycle callbacks resolve injected suppliers while their owning scope is shutting down.
+            if (lookup.dependency().filter(Dependency::isSupplier).isPresent()
+                    && scopedRegistry instanceof ScopedRegistryImpl scopedRegistryImpl) {
+                Optional<List<QualifiedInstance<T>>> instances =
+                        scopedRegistryImpl.<T>cleanupInstances(provider.descriptor(), lookup)
+                                .map(targets -> targets.stream()
+                                        .map(it -> GeneratedService.forCleanup(it, e))
+                                        .toList());
+                if (instances.isPresent()) {
+                    Dependency dependency = lookup.dependency().orElseThrow();
+                    LOGGER.log(System.Logger.Level.WARNING,
+                               "Service {0} requested during shutdown through injected supplier {1}.{2}. "
+                                       + "Retain dependencies needed for cleanup before shutdown.",
+                               provider.descriptor().serviceType(), dependency.service(), dependency.name());
+                    return instances;
+                }
+            }
+            throw e;
+        }
+    }
+
+    Optional<List<ServiceInstance<T>>> activeInstances(Lookup lookup) {
+        ServiceDescriptor<T> descriptor = provider.descriptor();
+        if (Service.PerLookup.TYPE.equals(descriptor.scope())) {
+            if (!fixedInstance) {
+                return Optional.empty();
+            }
+
+            FactoryType factoryType = descriptor.factoryType();
+            if (factoryType != FactoryType.NONE
+                    && factoryType != FactoryType.SERVICE
+                    && !Contracts.requestedProvider(lookup, descriptor, factoryType)) {
+                return Optional.empty();
+            }
+        }
+        if (!registry.scopeHandlerInitialized(descriptor.scope())) {
+            return Optional.empty();
+        }
+
+        Activator<T> serviceActivator;
+        if (fixedInstance) {
+            try {
+                ScopedRegistry scopedRegistry = scopeSupplier.get().registry();
+                if (scopedRegistry instanceof ScopedRegistryImpl scopedRegistryImpl) {
+                    serviceActivator = scopedRegistryImpl.<T>existingActivator(provider.descriptor())
+                            .orElseGet(activatorSupplier);
+                } else {
+                    serviceActivator = activator();
+                }
+            } catch (ScopeNotActiveException e) {
+                return Optional.empty();
+            }
+        } else {
+            Optional<Activator<T>> existingActivator = existingActivator();
+            if (existingActivator.isEmpty()) {
+                return Optional.empty();
+            }
+            serviceActivator = existingActivator.get();
+        }
+
+        if (serviceActivator.phase() != ActivationPhase.ACTIVE) {
+            return Optional.empty();
+        }
+        if (serviceActivator instanceof Activators.BaseActivator<?> baseActivator
+                && !baseActivator.activeInstancesAvailable(lookup)) {
+            return Optional.empty();
+        }
+
+        Optional<List<ServiceInstance<T>>> result = serviceActivator
+                .instances(lookup)
+                .map(it -> it.stream()
+                        .map(instance -> registryInstance(lookup, instance))
+                        .toList());
+        // Only retain a fixed activator when the active lookup actually uses it.
+        if (fixedInstance && result.map(it -> !it.isEmpty()).orElse(false)) {
+            try {
+                activator();
+            } catch (ScopeNotActiveException e) {
+                return Optional.empty();
+            }
+        }
+        return result;
+    }
+
+    private Optional<Activator<T>> existingActivator() {
+        try {
+            ScopedRegistry scopedRegistry = scopeSupplier.get().registry();
+            if (scopedRegistry instanceof ScopedRegistryImpl scopedRegistryImpl) {
+                return scopedRegistryImpl.existingActivator(provider.descriptor());
+            }
+
+            return Optional.empty();
+        } catch (ScopeNotActiveException e) {
+            return Optional.empty();
+        }
     }
 
     ServiceInfo descriptor() {

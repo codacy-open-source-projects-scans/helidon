@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2022 Oracle and/or its affiliates.
+ * Copyright (c) 2020, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,12 +19,15 @@ package io.helidon.config;
 import java.lang.System.Logger.Level;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 
 import io.helidon.config.spi.ChangeEventType;
@@ -45,10 +48,12 @@ public final class ScheduledPollingStrategy implements PollingStrategy {
 
     private final RecurringPolicy recurringPolicy;
     private final boolean defaultExecutor;
+    private final Lock lifecycleLock = new ReentrantLock();
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> scheduledFuture;
     private Polled polled;
+    private boolean pollFailureLogged;
 
     private ScheduledPollingStrategy(Builder builder) {
         this.recurringPolicy = builder.recurringPolicy;
@@ -88,26 +93,39 @@ public final class ScheduledPollingStrategy implements PollingStrategy {
     }
 
     @Override
-    public synchronized void start(Polled polled) {
-        if (defaultExecutor && executor.isShutdown()) {
-            executor = Executors.newSingleThreadScheduledExecutor(new ConfigThreadFactory("file-watch-polling"));
-        }
+    public void start(Polled polled) {
+        lifecycleLock.lock();
+        try {
+            Objects.requireNonNull(polled, "polled");
 
-        if (executor.isShutdown()) {
-            throw new ConfigException("Cannot start a scheduled polling strategy, as the executor service is shutdown");
-        }
+            if (defaultExecutor && executor.isShutdown()) {
+                executor = Executors.newSingleThreadScheduledExecutor(new ConfigThreadFactory("file-watch-polling"));
+            }
 
-        this.polled = polled;
-        scheduleNext();
+            if (executor.isShutdown()) {
+                throw new ConfigException("Cannot start a scheduled polling strategy, as the executor service is shutdown");
+            }
+
+            this.polled = polled;
+            this.pollFailureLogged = false;
+            scheduleNext();
+        } finally {
+            lifecycleLock.unlock();
+        }
     }
 
     @Override
-    public synchronized void stop() {
-        if (scheduledFuture != null) {
-            scheduledFuture.cancel(true);
-        }
-        if (defaultExecutor) {
-            ConfigUtils.shutdownExecutor(executor);
+    public void stop() {
+        lifecycleLock.lock();
+        try {
+            if (scheduledFuture != null) {
+                scheduledFuture.cancel(true);
+            }
+            if (defaultExecutor) {
+                ConfigUtils.shutdownExecutor(executor);
+            }
+        } finally {
+            lifecycleLock.unlock();
         }
     }
 
@@ -127,21 +145,43 @@ public final class ScheduledPollingStrategy implements PollingStrategy {
         }
     }
 
-    private synchronized void fireEvent() {
-        ChangeEventType event = polled.poll(Instant.now());
-        switch (event) {
-        case CHANGED:
-        case DELETED:
-            recurringPolicy.shorten();
-            break;
-        case UNCHANGED:
-            recurringPolicy.lengthen();
-            break;
-        case CREATED:
-        default:
-            break;
+    private void fireEvent() {
+        lifecycleLock.lock();
+        try {
+            ChangeEventType event;
+            try {
+                event = polled.poll(Instant.now());
+            } catch (RuntimeException e) {
+                if (!pollFailureLogged) {
+                    LOGGER.log(Level.WARNING, "Failed to poll config source, polling will continue; "
+                            + "further failures are logged at debug.", e);
+                    pollFailureLogged = true;
+                } else {
+                    LOGGER.log(Level.DEBUG, "Config polling failure", e);
+                }
+                scheduleNext();
+                return;
+            }
+
+            Objects.requireNonNull(event, "Change event type must not be null");
+            pollFailureLogged = false;
+
+            switch (event) {
+            case CHANGED:
+            case DELETED:
+                recurringPolicy.shorten();
+                break;
+            case UNCHANGED:
+                recurringPolicy.lengthen();
+                break;
+            case CREATED:
+            default:
+                break;
+            }
+            scheduleNext();
+        } finally {
+            lifecycleLock.unlock();
         }
-        scheduleNext();
     }
 
     ScheduledExecutorService executor() {

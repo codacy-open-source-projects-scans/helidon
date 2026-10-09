@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import java.util.Optional;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
+import io.helidon.common.Api;
 
 /**
  * Certificate revocation configuration.
@@ -35,6 +36,7 @@ import io.helidon.builder.api.Prototype;
  *     to check the status of a certificate, providing immediate verification of its validity</li>
  * </ul>
  */
+@Api.Stable
 @Prototype.Blueprint
 @Prototype.Configured
 interface RevocationConfigBlueprint {
@@ -83,8 +85,8 @@ interface RevocationConfigBlueprint {
     boolean fallbackEnabled();
 
     /**
-     * Allow revocation check to succeed if the revocation status cannot be
-     * determined for one of the following reasons:
+     * Allows a revocation check to succeed when a CRL or OCSP response cannot be obtained due to a network failure, or
+     * the OCSP responder returns {@code internalError} or {@code tryLater}.
      * <ul>
      *  <li>The CRL or OCSP response cannot be obtained because of a
      *      network error.

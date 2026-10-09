@@ -44,6 +44,7 @@ import io.helidon.common.types.TypeNames;
 import io.helidon.service.registry.ServiceSupplies.ServiceSupplyList;
 
 import static io.helidon.service.registry.LookupTrace.traceLookup;
+import static io.helidon.service.registry.LookupTrace.traceLookupInstance;
 import static io.helidon.service.registry.ServiceRegistryManager.SERVICE_INFO_COMPARATOR;
 
 /**
@@ -64,7 +65,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
     // map of service implementation class to service info
     private final Map<TypeName, ServiceInfo> servicesByType;
     // map of provided contracts to service info(s)
-    private final Map<ResolvedType, Set<ServiceInfo>> servicesByContract;
+    private final Map<ResolvedType, List<ServiceInfo>> servicesByContract = new HashMap<>();
     // map of qualifier annotations to service info(s)
     private final Map<TypeName, Set<ServiceInfo>> qualifiedProvidersByQualifier;
     // map of qualifier annotations and resolved type combination to service info(s)
@@ -134,7 +135,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
 
         this.scopeHandlerServices = scopeHandlers;
         this.servicesByType = new HashMap<>(servicesByType);
-        this.servicesByContract = new HashMap<>(servicesByContract);
+        servicesByContract.forEach((contract, services) -> this.servicesByContract.put(contract, List.copyOf(services)));
         this.qualifiedProvidersByQualifier = qualifiedProvidersByQualifier;
         this.typedQualifiedProviders = typedQualifiedProviders;
         this.activationRequest = ActivationRequest.builder()
@@ -153,7 +154,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                     (ServiceDescriptor<Object>) descriptor);
 
             if (instance != null) {
-                Activator<Object> activator = Activators.create(provider, instance);
+                Activator<Object> activator = Activators.createActive(provider, instance);
                 servicesByDescriptor.put(descriptor,
                                          new ServiceManager<>(this,
                                                               scopeSupplier(descriptor),
@@ -266,6 +267,69 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
     }
 
     @Override
+    public <T> Optional<T> firstActive(TypeName contract) {
+        return firstActive(Lookup.create(contract));
+    }
+
+    @Override
+    public <T> Optional<T> firstActive(Lookup lookup) {
+        List<ServiceManager<T>> managers = lookupManagers(lookup, false, false);
+
+        if (managers.isEmpty()) {
+            return Optional.empty();
+        }
+
+        traceLookup(lookup, "first active");
+
+        for (ServiceManager<T> serviceManager : managers) {
+            List<ServiceInstance<T>> thisManager = serviceManager.activeInstances(lookup)
+                    .orElseGet(List::of);
+
+            traceLookupInstance(lookup, serviceManager, thisManager);
+
+            if (!thisManager.isEmpty()) {
+                accessed(serviceManager.descriptor());
+                return Optional.of(thisManager.getFirst().get());
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    @Override
+    public <T> List<T> allActive(TypeName contract) {
+        return allActive(Lookup.create(contract));
+    }
+
+    @Override
+    public <T> List<T> allActive(Lookup lookup) {
+        List<ServiceManager<T>> managers = lookupManagers(lookup, false, false);
+
+        if (managers.isEmpty()) {
+            return List.of();
+        }
+
+        traceLookup(lookup, "all active");
+
+        var result = new ArrayList<T>();
+        for (ServiceManager<T> serviceManager : managers) {
+            List<ServiceInstance<T>> thisManager = serviceManager.activeInstances(lookup)
+                    .orElseGet(List::of);
+
+            traceLookupInstance(lookup, serviceManager, thisManager);
+
+            if (!thisManager.isEmpty()) {
+                accessed(serviceManager.descriptor());
+                for (ServiceInstance<T> serviceInstance : thisManager) {
+                    result.add(serviceInstance.get());
+                }
+            }
+        }
+
+        return List.copyOf(result);
+    }
+
+    @Override
     public <T> Supplier<Optional<T>> supplyFirst(TypeName contract) {
         return supplyFirst(Lookup.create(contract));
     }
@@ -312,6 +376,10 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
 
     @Override
     public List<ServiceInfo> lookupServices(Lookup lookup) {
+        return lookupServices(lookup, true);
+    }
+
+    private List<ServiceInfo> lookupServices(Lookup lookup, boolean useCache) {
         try {
             stateReadLock.lock();
             // a very special lookup
@@ -323,7 +391,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
             metrics.lookup();
             traceLookup(lookup, "start: {0}", lookup);
 
-            if (cacheEnabled) {
+            if (useCache && cacheEnabled) {
                 List<ServiceInfo> cacheResult = cache.get(lookup)
                         .orElse(null);
                 metrics.cacheAccess();
@@ -349,7 +417,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
             if (1 == lookup.contracts().size()) {
                 // a single contract is requested, we are ready for this ("indexed by contract")
                 ResolvedType theOnlyContractRequested = lookup.contracts().iterator().next();
-                Set<ServiceInfo> subsetOfMatches = servicesByContract.get(theOnlyContractRequested);
+                List<ServiceInfo> subsetOfMatches = servicesByContract.get(theOnlyContractRequested);
                 if (subsetOfMatches != null) {
                     // the subset is ordered, cannot use parallel, also no need to re-order
                     subsetOfMatches.stream()
@@ -357,8 +425,8 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                             .forEach(result::add);
                     if (!result.isEmpty()) {
                         traceLookup(lookup, "by single contract", result);
-                        if (cacheEnabled) {
-                            cache.put(lookup, result);
+                        if (useCache && cacheEnabled) {
+                            return cacheLookupResult(lookup, result);
                         }
 
                         return result;
@@ -398,8 +466,8 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                 }
             }
 
-            if (cacheEnabled) {
-                cache.put(lookup, result);
+            if (useCache && cacheEnabled) {
+                result = cacheLookupResult(lookup, result);
             }
 
             traceLookup(lookup, "full result", result);
@@ -460,6 +528,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                                                                       scopeSupplier(descriptor),
                                                                       provider,
                                                                       true,
+                                                                      false,
                                                                       activator));
 
             for (ResolvedType contract : contracts) {
@@ -469,7 +538,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                                                                + contract.type());
                 }
 
-                Set<ServiceInfo> serviceInfos = new TreeSet<>(SERVICE_INFO_COMPARATOR);
+                List<ServiceInfo> serviceInfos = new ArrayList<>();
                 var existing = servicesByContract.get(contract);
                 if (existing != null) {
                     // we may add new contracts in case somebody injects Object; this should only be done
@@ -477,7 +546,10 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                     serviceInfos.addAll(existing);
                 }
 
-                serviceInfos.add(descriptor);
+                if (!serviceInfos.contains(descriptor)) {
+                    serviceInfos.add(descriptor);
+                }
+                serviceInfos.sort(SERVICE_INFO_COMPARATOR);
 
                 // replace the instances
                 servicesByContract.put(contract, serviceInfos);
@@ -521,18 +593,25 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
         }
     }
 
+    private List<ServiceInfo> cacheLookupResult(Lookup lookup, List<ServiceInfo> result) {
+        List<ServiceInfo> cachedResult = List.copyOf(result);
+        cache.put(lookup, cachedResult);
+        return cachedResult;
+    }
+
     private <T> void doAdd(ResolvedType contract, double weight, T instance, Set<Qualifier> qualifiers) {
         checkValidContract(contract);
         ServiceInfo serviceInfo = servicesByType.get(contract.type());
         if (serviceInfo == null) {
-            Set<ServiceInfo> serviceInfos = new TreeSet<>(SERVICE_INFO_COMPARATOR);
-            Set<ServiceInfo> currentInfos = servicesByContract.get(contract);
+            List<ServiceInfo> serviceInfos = new ArrayList<>();
+            List<ServiceInfo> currentInfos = servicesByContract.get(contract);
             if (currentInfos != null) {
                 serviceInfos.addAll(currentInfos);
             }
 
             // each instance will have its own descriptor
             setContract(contract, instance, weight, serviceInfos, qualifiers);
+            serviceInfos.sort(SERVICE_INFO_COMPARATOR);
 
             // replace the instances
             servicesByContract.put(contract, serviceInfos);
@@ -559,8 +638,6 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
         } finally {
             stateWriteLock.unlock();
         }
-
-        stateWriteLock.lock();
     }
 
     <T> void set(Class<T> contract, T[] instances) {
@@ -592,14 +669,14 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                                                        + contract.resolvedName() + ", qualifiers: " + qualifiers);
         }
         if (serviceInfo == null) {
-            Set<ServiceInfo> serviceInfos = new TreeSet<>(SERVICE_INFO_COMPARATOR);
+            List<ServiceInfo> serviceInfos = new ArrayList<>();
 
             // we need to keep order of the instances; if somebody calls set, and then add, it may be tricky
 
             VirtualDescriptor vt = new VirtualDescriptor(contract.type(), Weighted.DEFAULT_WEIGHT, instance, qualifiers);
 
             ServiceProvider<Object> provider = new ServiceProvider<>(this, vt);
-            Activator<Object> activator = Activators.create(provider, instance);
+            Activator<Object> activator = Activators.createActive(provider, instance);
 
             servicesByDescriptor.put(vt, new ServiceManager<>(this,
                                                               scopeSupplier(vt),
@@ -615,7 +692,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
             ServiceProvider<Object> provider = new ServiceProvider<>(this,
                                                                      (ServiceDescriptor<Object>) serviceInfo);
 
-            Activator<Object> activator = Activators.create(provider, instance);
+            Activator<Object> activator = Activators.createActive(provider, instance);
             servicesByDescriptor.put(serviceInfo, new ServiceManager<>(this,
                                                                        scopeSupplier(serviceInfo),
                                                                        provider,
@@ -631,7 +708,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
         checkValidContract(contractType);
         ServiceInfo serviceInfo = servicesByType.get(contractType.type());
         if (serviceInfo == null) {
-            Set<ServiceInfo> serviceInfos = new TreeSet<>(SERVICE_INFO_COMPARATOR);
+            List<ServiceInfo> serviceInfos = new ArrayList<>();
 
             // we need to keep order of the instances; if somebody calls set, and then add, it may be tricky
             double currentWeight = Weighted.DEFAULT_WEIGHT;
@@ -651,7 +728,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
                 throw new ServiceRegistryException("Attempting to set a service provider with wrong number of instances. "
                                                            + "A service provider must have exactly one instance.");
             }
-            Activator<Object> activator = Activators.create(provider, instances[0]);
+            Activator<Object> activator = Activators.createActive(provider, instances[0]);
             servicesByDescriptor.put(serviceInfo, new ServiceManager<>(this,
                                                                        scopeSupplier(serviceInfo),
                                                                        provider,
@@ -671,7 +748,7 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
     }
 
     List<ServiceInfo> servicesByContract(ResolvedType contract) {
-        Set<ServiceInfo> serviceInfos = servicesByContract.get(contract);
+        List<ServiceInfo> serviceInfos = servicesByContract.get(contract);
         if (serviceInfos == null) {
             return List.of();
         }
@@ -722,11 +799,21 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
     }
 
     <T> List<ServiceManager<T>> lookupManagers(Lookup lookup) {
+        return lookupManagers(lookup, true);
+    }
+
+    private <T> List<ServiceManager<T>> lookupManagers(Lookup lookup, boolean markAccessed) {
+        return lookupManagers(lookup, markAccessed, true);
+    }
+
+    private <T> List<ServiceManager<T>> lookupManagers(Lookup lookup, boolean markAccessed, boolean useCache) {
         List<ServiceManager<T>> result = new ArrayList<>();
 
-        for (ServiceInfo service : lookupServices(lookup)) {
+        for (ServiceInfo service : lookupServices(lookup, useCache)) {
             result.add(serviceManager(service));
-            accessed(service);
+            if (markAccessed) {
+                accessed(service);
+            }
         }
 
         return result;
@@ -769,12 +856,12 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
     private <T> void setContract(ResolvedType contractType,
                                  T instance,
                                  double currentWeight,
-                                 Set<ServiceInfo> serviceInfos,
+                                 List<ServiceInfo> serviceInfos,
                                  Set<Qualifier> qualifiers) {
         VirtualDescriptor vt = new VirtualDescriptor(contractType.type(), currentWeight, instance, qualifiers);
         ServiceProvider<Object> provider = new ServiceProvider<>(this,
                                                                  vt);
-        Activator<Object> activator = Activators.create(provider, instance);
+        Activator<Object> activator = Activators.createActive(provider, instance);
 
         servicesByDescriptor.put(vt, new ServiceManager<>(this,
                                                           scopeSupplier(vt),
@@ -868,6 +955,19 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
         return scope;
     }
 
+    boolean scopeHandlerInitialized(TypeName scope) {
+        if (Service.Singleton.TYPE.equals(scope) || Service.PerLookup.TYPE.equals(scope)) {
+            return true;
+        }
+
+        scopeHandlerInstancesLock.lock();
+        try {
+            return scopeHandlerInstances.containsKey(scope);
+        } finally {
+            scopeHandlerInstancesLock.unlock();
+        }
+    }
+
     private Service.ScopeHandler scopeHandler(TypeName scope) {
         scopeHandlerInstancesLock.lock();
         try {
@@ -901,7 +1001,6 @@ class CoreServiceRegistry implements ServiceRegistry, Scopes {
         }
         return actualContracts;
     }
-
 
     private record ScopeImpl(TypeName scopeType,
                              Service.ScopeHandler handler,

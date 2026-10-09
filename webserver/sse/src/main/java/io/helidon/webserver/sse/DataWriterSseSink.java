@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.Optional;
 
 import io.helidon.common.GenericType;
@@ -47,6 +48,7 @@ import io.helidon.webserver.http.spi.SinkProviderContext;
 
 import static io.helidon.http.HeaderValues.CONTENT_TYPE_EVENT_STREAM;
 import static io.helidon.http.HeaderValues.create;
+import static io.helidon.http.HeaderValues.createCached;
 
 /**
  * Implementation of an SSE sink. Emits {@link SseEvent}s.
@@ -59,6 +61,8 @@ class DataWriterSseSink implements SseSink {
     public static final GenericType<DataWriterSseSink> TYPE = GenericType.create(DataWriterSseSink.class);
 
     private static final Header CACHE_NO_CACHE_ONLY = create(HeaderNames.CACHE_CONTROL, "no-cache");
+    private static final Header VARY_ACCEPT_ENCODING =
+            createCached(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME);
     private static final byte[] SSE_NL = "\n".getBytes(StandardCharsets.UTF_8);
     private static final byte[] SSE_ID = "id:".getBytes(StandardCharsets.UTF_8);
     private static final byte[] SSE_DATA = "data:".getBytes(StandardCharsets.UTF_8);
@@ -73,6 +77,11 @@ class DataWriterSseSink implements SseSink {
     private final Runnable closeRunnable;
     private final ConnectionContext ctx;
     private final OutputStream outputStream;
+    private final EventBufferedOutputStream bufferedOutputStream;
+    private final boolean closeServerSocket;
+    private final boolean closeOutputStreamBeforeCommit;
+    private boolean emitFailed;
+    private RuntimeException emitFailure;
 
     DataWriterSseSink(SinkProviderContext context) {
         this.response = context.serverResponse();
@@ -80,83 +89,109 @@ class DataWriterSseSink implements SseSink {
         this.mediaContext = ctx.listenerContext().mediaContext();
         this.closeRunnable = context.closeRunnable();
 
-        // output stream to write headers
-        OutputStream headersOutputStream = new DataWriterOutputStream(ctx.dataWriter());
+        prepareResponseHeaders(true);
+        Optional<OutputStream> entityOutputStream = context.entityOutputStream(() -> prepareResponseHeaders(false));
+        if (entityOutputStream.isPresent()) {
+            OutputStream protocolOutputStream = entityOutputStream.orElseThrow();
+            int writeBufferSize = ctx.listenerContext().config().writeBufferSize();
+            EventBufferedOutputStream eventBufferedOutputStream = writeBufferSize > 0
+                    ? new EventBufferedOutputStream(protocolOutputStream, writeBufferSize)
+                    : null;
+            this.outputStream = eventBufferedOutputStream == null ? protocolOutputStream : eventBufferedOutputStream;
+            this.bufferedOutputStream = eventBufferedOutputStream;
+            this.closeServerSocket = false;
+            this.closeOutputStreamBeforeCommit = true;
+            context.flushHeaders();
+        } else {
+            // check for content encoding
+            ContentEncoder encoder = null;
+            ServerRequestHeaders requestHeaders = context.serverRequest().headers();
+            ContentEncodingContext encodingContext = ctx.listenerContext().contentEncodingContext();
+            if (encodingContext.contentEncodingEnabled()) {
+                response.headers().add(VARY_ACCEPT_ENCODING);
+                if (requestHeaders.contains(HeaderNames.ACCEPT_ENCODING)) {
+                    encoder = encodingContext.encoder(requestHeaders);
+                    encoder.headers(response.headers());        // adds Content-Encoding
+                }
+            }
 
-        // check for content encoding
-        ContentEncoder encoder = null;
-        ServerRequestHeaders requestHeaders = context.serverRequest().headers();
-        ContentEncodingContext encodingContext = ctx.listenerContext().contentEncodingContext();
-        if (encodingContext.contentEncodingEnabled() && requestHeaders.contains(HeaderNames.ACCEPT_ENCODING)) {
-            encoder = encodingContext.encoder(requestHeaders);
-            encoder.headers(response.headers());        // adds Content-Encoding
+            // output stream to write headers
+            OutputStream headersOutputStream = new DataWriterOutputStream(ctx.dataWriter());
+            writeStatusAndHeaders(headersOutputStream);
+            this.outputStream = (encoder != null) ? encoder.apply(headersOutputStream) : headersOutputStream;
+            this.bufferedOutputStream = null;
+            this.closeServerSocket = true;
+            this.closeOutputStreamBeforeCommit = false;
         }
-
-        // write status and headers before encoding stream
-        writeStatusAndHeaders(headersOutputStream);
-
-        // set the final output stream
-        this.outputStream = (encoder != null) ? encoder.apply(headersOutputStream) : headersOutputStream;
     }
 
     @Override
     public DataWriterSseSink emit(SseEvent sseEvent) {
+        if (emitFailure != null) {
+            throw emitFailure;
+        }
+        boolean completed = false;
         try {
             Optional<String> comment = sseEvent.comment();
             if (comment.isPresent()) {
-                outputStream.write(SSE_COMMENT);
-                outputStream.write(comment.get().getBytes(StandardCharsets.UTF_8));
-                outputStream.write(SSE_NL);
+                writeSseMultiLineField(SSE_COMMENT, comment.get().getBytes(StandardCharsets.UTF_8));
             }
             Optional<String> id = sseEvent.id();
             if (id.isPresent()) {
-                outputStream.write(SSE_ID);
-                outputStream.write(id.get().getBytes(StandardCharsets.UTF_8));
-                outputStream.write(SSE_NL);
+                writeSseSingleLineField(SSE_ID, id.get());
             }
             Optional<String> name = sseEvent.name();
             if (name.isPresent()) {
-                outputStream.write(SSE_EVENT);
-                outputStream.write(name.get().getBytes(StandardCharsets.UTF_8));
-                outputStream.write(SSE_NL);
+                writeSseSingleLineField(SSE_EVENT, name.get());
             }
             Object data = sseEvent.data();
-            if (data != null) {
+            if (data != SseEvent.NO_DATA) {
                 MediaType mediaType = sseEvent.mediaType().orElse(MediaTypes.TEXT_PLAIN);
-
-                // is it multi-line string data?
-                if (data instanceof String stringData && stringData.contains("\n")) {
-                    String[] lines = stringData.split("\n");
-                    for (String line : lines) {
-                        outputStream.write(SSE_DATA);
-                        byte[] bytes = serializeData(line, mediaType);
-                        outputStream.write(bytes);
-                        outputStream.write(SSE_NL);
-                    }
-                } else {
-                    outputStream.write(SSE_DATA);
-                    byte[] bytes = serializeData(data, mediaType);
-                    outputStream.write(bytes);
-                    outputStream.write(SSE_NL);
-                }
+                writeSseMultiLineField(SSE_DATA, serializeData(data, mediaType));
             }
             outputStream.write(SSE_NL);
 
             // write event to the output
             outputStream.flush();
 
+            completed = true;
             return this;
         } catch (IOException e) {
-            throw new UncheckedIOException(e);
+            UncheckedIOException failure = new UncheckedIOException(e);
+            emitFailure = failure;
+            throw failure;
+        } catch (RuntimeException e) {
+            emitFailure = e;
+            throw e;
+        } finally {
+            if (!completed) {
+                emitFailed = true;
+            }
         }
     }
 
     @Override
     public void close() {
-        closeRunnable.run();
         try {
+            if (closeOutputStreamBeforeCommit) {
+                // Protocol responses commit after stream wrappers finish so final bytes are sent before FIN/trailers.
+                if (emitFailed) {
+                    if (bufferedOutputStream != null) {
+                        bufferedOutputStream.discardBuffer();
+                    }
+                    outputStream.close();
+                } else {
+                    outputStream.close();
+                    closeRunnable.run();
+                }
+                return;
+            }
+
+            closeRunnable.run();
             outputStream.close();
-            ctx.serverSocket().close();
+            if (closeServerSocket) {
+                ctx.serverSocket().close();
+            }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -164,14 +199,7 @@ class DataWriterSseSink implements SseSink {
 
     void writeStatusAndHeaders(OutputStream headersOutputStream) {
         try {
-            ServerResponseHeaders headers = response.headers();
-
-            // verify response has no status or content type
-            HttpMediaType ct = headers.contentType().orElse(null);
-            if (response.status().code() != Status.OK_200.code()
-                    || ct != null && !CONTENT_TYPE_EVENT_STREAM.values().equals(ct.mediaType().text())) {
-                throw new IllegalStateException("ServerResponse instance cannot be used to create SseSink");
-            }
+            ServerResponseHeaders headers = prepareResponseHeaders(false);
 
             // start writing status line
             headersOutputStream.write(OK_200);
@@ -184,10 +212,6 @@ class DataWriterSseSink implements SseSink {
             }
 
             // set up and write headers
-            if (ct == null) {
-                headers.add(CONTENT_TYPE_EVENT_STREAM);
-            }
-            headers.set(CACHE_NO_CACHE_ONLY);
             BufferData buffer = BufferData.growing(512);
             for (Header header : headers) {
                 header.writeHttp1Header(buffer);
@@ -203,6 +227,27 @@ class DataWriterSseSink implements SseSink {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    private ServerResponseHeaders prepareResponseHeaders(boolean addDateHeader) {
+        ServerResponseHeaders headers = response.headers();
+
+        // verify response has no status or content type
+        HttpMediaType ct = headers.contentType().orElse(null);
+        if (response.status().code() != Status.OK_200.code()
+                || ct != null && !CONTENT_TYPE_EVENT_STREAM.values().equals(ct.mediaType().text())) {
+            throw new IllegalStateException("ServerResponse instance cannot be used to create SseSink");
+        }
+
+        if (ct == null) {
+            headers.add(CONTENT_TYPE_EVENT_STREAM);
+        }
+        headers.remove(HeaderNames.CONTENT_LENGTH);
+        headers.set(CACHE_NO_CACHE_ONLY);
+        if (addDateHeader && !headers.contains(HeaderNames.DATE)) {
+            headers.set(create(HeaderNames.DATE, true, false, DateTime.rfc1123String()));
+        }
+        return headers;
     }
 
     private byte[] serializeData(Object object, MediaType mediaType) {
@@ -227,5 +272,130 @@ class DataWriterSseSink implements SseSink {
             }
         }
         throw new IllegalStateException("Unable to serialize SSE event without a media context");
+    }
+
+    private void writeSseSingleLineField(byte[] field, String value) throws IOException {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        outputStream.write(field);
+        int start = 0;
+        for (int i = 0; i < bytes.length; i++) {
+            byte b = bytes[i];
+            if (b == '\r' || b == '\n') {
+                outputStream.write(bytes, start, i - start);
+                outputStream.write(' ');
+                if (b == '\r' && i + 1 < bytes.length && bytes[i + 1] == '\n') {
+                    i++;
+                }
+                start = i + 1;
+            }
+        }
+        outputStream.write(bytes, start, bytes.length - start);
+        outputStream.write(SSE_NL);
+    }
+
+    private void writeSseMultiLineField(byte[] field, byte[] value) throws IOException {
+        int start = 0;
+        boolean lineWritten = false;
+        for (int i = 0; i < value.length; i++) {
+            byte b = value[i];
+            if (b == '\r' || b == '\n') {
+                outputStream.write(field);
+                outputStream.write(value, start, i - start);
+                outputStream.write(SSE_NL);
+                lineWritten = true;
+                if (b == '\r' && i + 1 < value.length && value[i + 1] == '\n') {
+                    i++;
+                }
+                start = i + 1;
+            }
+        }
+        if (!lineWritten || start < value.length) {
+            outputStream.write(field);
+            outputStream.write(value, start, value.length - start);
+            outputStream.write(SSE_NL);
+        }
+    }
+
+    private static final class EventBufferedOutputStream extends OutputStream {
+        private final OutputStream delegate;
+        private final byte[] buffer;
+
+        private int count;
+        private boolean discardOnClose;
+        private boolean closed;
+
+        private EventBufferedOutputStream(OutputStream delegate, int size) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.buffer = new byte[size];
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            ensureOpen();
+            if (count >= buffer.length) {
+                flushBuffer();
+            }
+            buffer[count++] = (byte) b;
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            Objects.checkFromIndexSize(offset, length, bytes.length);
+            ensureOpen();
+            if (length == 0) {
+                return;
+            }
+            if (length >= buffer.length) {
+                flushBuffer();
+                delegate.write(bytes, offset, length);
+                return;
+            }
+            if (length > buffer.length - count) {
+                flushBuffer();
+            }
+            System.arraycopy(bytes, offset, buffer, count, length);
+            count += length;
+        }
+
+        @Override
+        public void flush() throws IOException {
+            ensureOpen();
+            flushBuffer();
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            try {
+                if (!discardOnClose) {
+                    flushBuffer();
+                    delegate.flush();
+                }
+            } finally {
+                closed = true;
+                delegate.close();
+            }
+        }
+
+        private void discardBuffer() {
+            count = 0;
+            discardOnClose = true;
+        }
+
+        private void flushBuffer() throws IOException {
+            if (count > 0) {
+                delegate.write(buffer, 0, count);
+                count = 0;
+            }
+        }
+
+        private void ensureOpen() throws IOException {
+            if (closed) {
+                throw new IOException("Stream already closed");
+            }
+        }
     }
 }

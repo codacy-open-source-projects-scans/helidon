@@ -20,8 +20,9 @@ import java.lang.System.Logger.Level;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
-import io.helidon.service.registry.Services;
 import io.helidon.tracing.HeaderConsumer;
 import io.helidon.tracing.Scope;
 import io.helidon.tracing.Span;
@@ -40,6 +41,11 @@ import io.grpc.MethodDescriptor;
  */
 class GrpcClientTracingInterceptor implements ClientInterceptor {
     private static final Logger LOGGER = System.getLogger(GrpcClientTracingInterceptor.class.getName());
+    private final Supplier<Tracer> tracerSupplier;
+
+    GrpcClientTracingInterceptor(Supplier<Tracer> tracerSupplier) {
+        this.tracerSupplier = tracerSupplier;
+    }
 
     @Override
     public <ReqT, ResT> ClientCall<ReqT, ResT> interceptCall(MethodDescriptor<ReqT, ResT> method,
@@ -53,8 +59,10 @@ class GrpcClientTracingInterceptor implements ClientInterceptor {
 
             @Override
             public void start(Listener<ResT> responseListener, Metadata headers) {
-                LOGGER.log(Level.DEBUG, "Call start; metadata: {0}", headers);
-                var tracer = Services.get(Tracer.class);
+                if (LOGGER.isLoggable(Level.DEBUG)) {
+                    LOGGER.log(Level.DEBUG, "Call start; metadata keys: {0}", loggableMetadata(headers));
+                }
+                var tracer = tracerSupplier.get();
                 // Start a new span for the outgoing gRPC client call.
                 var outgoingClientSpanBuilder = tracer
                         .spanBuilder(method.getServiceName() + "-" + method.getFullMethodName())
@@ -64,7 +72,9 @@ class GrpcClientTracingInterceptor implements ClientInterceptor {
 
                 try {
                     tracer.inject(outgoingClientSpan.get().context(), null, new GrpcHeaderConsumer(headers));
-                    LOGGER.log(Level.DEBUG, "After injecting span context; metadata: {0}", headers);
+                    if (LOGGER.isLoggable(Level.DEBUG)) {
+                        LOGGER.log(Level.DEBUG, "After injecting span context; metadata keys: {0}", loggableMetadata(headers));
+                    }
                     outgoingClientScope = outgoingClientSpan.get().activate();
 
                     super.start(responseListener, headers);
@@ -100,6 +110,13 @@ class GrpcClientTracingInterceptor implements ClientInterceptor {
                 }
             }
         };
+    }
+
+    static String loggableMetadata(Metadata metadata) {
+        return metadata.keys()
+                .stream()
+                .sorted()
+                .collect(Collectors.joining(", ", "[", "]"));
     }
 
     private record GrpcHeaderConsumer(Metadata metadata) implements HeaderConsumer {

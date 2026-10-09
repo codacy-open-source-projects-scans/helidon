@@ -18,8 +18,8 @@ package io.helidon.webserver.observe.metrics;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -52,6 +52,7 @@ import io.helidon.metrics.api.MeterRegistry;
 import io.helidon.metrics.api.MeterRegistryFormatter;
 import io.helidon.metrics.api.MetricsConfig;
 import io.helidon.metrics.api.SystemTagsManager;
+import io.helidon.metrics.api.Tag;
 import io.helidon.metrics.api.Timer;
 
 /**
@@ -67,17 +68,21 @@ class JsonFormatter implements MeterRegistryFormatter {
                              .map(Pattern::quote)
                              .collect(Collectors.joining("", "[", "]")));
     private final Iterable<String> meterNameSelection;
-    private final Iterable<String> scopeSelection;
-    private final String scopeTagName;
+    private final Map<String, Set<String>> tagSelection;
     private final MetricsConfig metricsConfig;
     private final MeterRegistry meterRegistry;
+    private final SystemTagsManager systemTagsManager;
+    private final Map<String, String> systemTagPairs;
 
     private JsonFormatter(Builder builder) {
         meterNameSelection = builder.meterNameSelection;
-        scopeSelection = builder.scopeSelection;
-        scopeTagName = builder.scopeTagName;
+        tagSelection = builder.tagSelection.entrySet()
+                .stream()
+                .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, entry -> Set.copyOf(entry.getValue())));
         metricsConfig = builder.metricsConfig;
         meterRegistry = builder.meterRegistry;
+        systemTagsManager = SystemTagsManager.create(metricsConfig, meterRegistry.metricsFactory());
+        systemTagPairs = systemTagsManager.displayTagPairs();
     }
 
     /**
@@ -100,110 +105,69 @@ class JsonFormatter implements MeterRegistryFormatter {
     }
 
     /**
-     * Returns a JSON object conveying all the meter identification and data (but no metadata), organized by scope.
+     * Returns a flat JSON object conveying all the meter identification and data (but no metadata).
      *
      * @return meter data
      */
     @Override
     public Optional<Object> format() {
+        Map<String, MetricOutputBuilder> meterOutputBuilders = new HashMap<>();
 
-        boolean organizeByScope = shouldOrganizeByScope();
-
-        Map<String, Map<String, MetricOutputBuilder>> meterOutputBuildersByScope = organizeByScope ? new HashMap<>() : null;
-        Map<String, MetricOutputBuilder> meterOutputBuildersIgnoringScope = organizeByScope ? null : new HashMap<>();
-
-    /*
-     * If we organize by multiple scopes, then meterOutputBuildersByScope will have one top-level entry per scope we find,
-     * keyed by the scope name. We will gather the output for the metrics in each scope under a JSON node for that scope.
-     *
-     * On the other hand, if the scope selection accepts only one scope, or if we are NOT organizing by scopes, then we don't
-     *  use that map and instead use meterOutputBuildersIgnoringScope to gather all JSON for the meters under the same parent.
-     *
-     * The JSON output format has one "flat" entry for each single-valued meter--counter or gauge--with the JSON
-     * key set to the name and tags from the meter ID and the JSON value reporting the single value.
-     *
-     * In contrast, the JSON output has a "structured" entry for each multi-valued meter--distribution summary or timer.
-     * The JSON node key is the name only--no tags--from the meter ID, and the corresponding JSON structure has a child
-     *  for each distinct value-name plus tags group.
-     *
-     * Here is an example:
-     *
-         {
-         "carsCounter;car=suv;colour=red": 0,
-         "carsCounter;car=sedan;colour=blue": 0,
-         "carsTimer": {
-            "count;colour=red": 0,
-            "sum;colour=red": 0.0,
-            "max;colour=red": 0.0,
-            "count;colour=blue": 0,
-            "sum;colour=blue": 0.0,
-            "max;colour=blue": 0.0
-         }
-        }
-     */
+        /*
+         * The JSON output format has one "flat" entry for each single-valued meter--counter or gauge--with the JSON
+         * key set to the name and tags from the meter ID and the JSON value reporting the single value.
+         *
+         * In contrast, the JSON output has a "structured" entry for each multi-valued meter--distribution summary or timer.
+         * The JSON node key is the name only--no tags--from the meter ID, and the corresponding JSON structure has a child
+         * for each distinct value-name plus tags group.
+         *
+         * Here is an example:
+         *
+         * {
+         * "carsCounter;car=suv;colour=red": 0,
+         * "carsCounter;car=sedan;colour=blue": 0,
+         * "carsTimer": {
+         * "count;colour=red": 0,
+         * "sum;colour=red": 0.0,
+         * "max;colour=red": 0.0,
+         * "count;colour=blue": 0,
+         * "sum;colour=blue": 0.0,
+         * "max;colour=blue": 0.0
+         * }
+         * }
+         */
 
         AtomicBoolean isAnyOutput = new AtomicBoolean(false);
 
-        // Process each meter which matches the scope selection, adding it to the output map entry for its scope if the meter is
-        // enabled and it matches any name selection.
-
-        meterRegistry.meters(scopeSelection).forEach(meter -> {
+        meterRegistry.meters().forEach(meter -> {
             String name = meter.id().name();
-            if (meterRegistry.isMeterEnabled(name, meter.id().tagsMap(), meter.scope())
-                    && matchesName(name)) {
-
-                Map<String, MetricOutputBuilder> meterOutputBuilderMapToUpdate =
-                        organizeByScope ? meterOutputBuildersByScope
-                                .computeIfAbsent(meter.scope().orElse(""),
-                                                 ms -> new HashMap<>())
-                                : meterOutputBuildersIgnoringScope;
-
+            if (matchesName(name) && matchesTags(meter.id())) {
                 // Find the output builder for the key relevant to this meter and then
                 // add this meter's contribution to the output.
-                MetricOutputBuilder metricOutputBuilder = meterOutputBuilderMapToUpdate
+                MetricOutputBuilder metricOutputBuilder = meterOutputBuilders
                         .computeIfAbsent(metricOutputKey(meter),
-                                         k -> MetricOutputBuilder.create(meter, metricsConfig));
+                                         k -> MetricOutputBuilder.create(meter, metricsConfig, systemTagsManager));
                 metricOutputBuilder.add(meter);
                 isAnyOutput.set(true);
             }
         });
 
         JsonObject.Builder top = JsonObject.builder();
-        if (organizeByScope) {
-            meterOutputBuildersByScope.forEach((scope, outputBuilders) -> {
-                JsonObject.Builder scopeBuilder = JsonObject.builder();
-                outputBuilders.forEach((key, outputBuilder) -> outputBuilder.apply(scopeBuilder));
-                top.set(scope, scopeBuilder.build());
-            });
-        } else {
-            meterOutputBuildersIgnoringScope.forEach((key, outputBuilder) -> outputBuilder.apply(top));
-        }
+        meterOutputBuilders.forEach((key, outputBuilder) -> outputBuilder.apply(top));
 
         return isAnyOutput.get() ? Optional.of(top.build()) : Optional.empty();
     }
 
     @Override
     public Optional<Object> formatMetadata() {
-
-        boolean organizeByScope = shouldOrganizeByScope();
-
-        Map<String, Map<String, JsonObject.Builder>> metadataOutputBuildersByScope = organizeByScope ? new HashMap<>() : null;
-        Map<String, JsonObject.Builder> metadataOutputBuildersIgnoringScope = organizeByScope ? null : new HashMap<>();
+        Map<String, JsonObject.Builder> metadataOutputBuilders = new HashMap<>();
 
         AtomicBoolean isAnyOutput = new AtomicBoolean(false);
 
-        meterRegistry.meters(scopeSelection).forEach(meter -> {
+        meterRegistry.meters().forEach(meter -> {
             String name = meter.id().name();
-            if (meterRegistry.isMeterEnabled(name, meter.id().tagsMap(), meter.scope())
-                    && matchesName(name)) {
-
-                Map<String, JsonObject.Builder> metadataOutputBuilderWithinParent =
-                        organizeByScope ? metadataOutputBuildersByScope
-                                .computeIfAbsent(meter.scope().orElse(""),
-                                                 ms -> new HashMap<>())
-                                : metadataOutputBuildersIgnoringScope;
-
-                JsonObject.Builder builderForThisName = metadataOutputBuilderWithinParent
+            if (matchesName(name) && matchesTags(meter.id())) {
+                JsonObject.Builder builderForThisName = metadataOutputBuilders
                         .computeIfAbsent(name, k -> JsonObject.builder());
                 addNonEmpty(builderForThisName, "type", meter.type().typeName());
                 addUnit(meter, builderForThisName);
@@ -212,8 +176,8 @@ class JsonFormatter implements MeterRegistryFormatter {
 
                 List<List<String>> tagGroups = new ArrayList<>();
 
-                List<String> tags = StreamSupport.stream(SystemTagsManager.instance()
-                                                                 .withoutSystemOrScopeTags(meter.id().tags())
+                List<String> tags = StreamSupport.stream(systemTagsManager
+                                                                 .withoutSystemTags(meter.id().tags())
                                                                  .spliterator(), false)
                         .map(tag -> jsonEscape(tag.key()) + "=" + jsonEscape(tag.value()))
                         .toList();
@@ -231,15 +195,7 @@ class JsonFormatter implements MeterRegistryFormatter {
             }
         });
         JsonObject.Builder top = JsonObject.builder();
-        if (organizeByScope) {
-            metadataOutputBuildersByScope.forEach((scope, builders) -> {
-                JsonObject.Builder scopeBuilder = JsonObject.builder();
-                builders.forEach((name, builder) -> scopeBuilder.set(name, builder.build()));
-                top.set(scope, scopeBuilder.build());
-            });
-        } else {
-            metadataOutputBuildersIgnoringScope.forEach((name, builder) -> top.set(name, builder.build()));
-        }
+        metadataOutputBuilders.forEach((name, builder) -> top.set(name, builder.build()));
         return isAnyOutput.get() ? Optional.of(top.build()) : Optional.empty();
     }
 
@@ -297,50 +253,22 @@ class JsonFormatter implements MeterRegistryFormatter {
         }
     }
 
-    private static String metricOutputKey(Meter meter) {
-        return meter instanceof Counter || meter instanceof io.helidon.metrics.api.Gauge
-                ? flatNameAndTags(meter.id())
+    private String metricOutputKey(Meter meter) {
+        return meter instanceof Counter || meter instanceof Gauge
+                ? flatNameAndTags(meter.id(), systemTagsManager)
                 : structureName(meter.id());
     }
 
-    private static String flatNameAndTags(Meter.Id meterId) {
+    private static String flatNameAndTags(Meter.Id meterId, SystemTagsManager systemTagsManager) {
         StringJoiner sj = new StringJoiner(";");
         sj.add(meterId.name());
-        SystemTagsManager.instance()
-                .withoutSystemOrScopeTags(meterId.tags())
+        systemTagsManager.withoutSystemTags(meterId.tags())
                 .forEach(tag -> sj.add(tag.key() + "=" + tag.value()));
         return sj.toString();
     }
 
     private static String structureName(Meter.Id meterId) {
         return meterId.name();
-    }
-
-    private boolean shouldOrganizeByScope() {
-        var it = scopeSelection.iterator();
-        if (it.hasNext()) {
-            it.next();
-            // return false if exactly one selection; true if at least two.
-            return it.hasNext();
-        }
-        return true;
-    }
-
-    private Iterable<String> scopesToReport() {
-
-        Set<String> selection = new HashSet<>();
-        scopeSelection.forEach(selection::add);
-
-        List<String> scopesToReport = new ArrayList<>();
-
-        if (!selection.isEmpty()) {
-            meterRegistry.scopes().forEach(candidateScope -> {
-                if (selection.contains(candidateScope)) {
-                    scopesToReport.add(candidateScope);
-                }
-            });
-        }
-        return scopesToReport;
     }
 
     private boolean matchesName(String metricName) {
@@ -356,28 +284,60 @@ class JsonFormatter implements MeterRegistryFormatter {
         return false;
     }
 
+    private boolean matchesTags(Meter.Id meterId) {
+        if (tagSelection.isEmpty()) {
+            return true;
+        }
+        for (Map.Entry<String, Set<String>> selection : tagSelection.entrySet()) {
+            boolean matches;
+            if (systemTagPairs.containsKey(selection.getKey())) {
+                matches = selection.getValue().contains(systemTagPairs.get(selection.getKey()));
+            } else {
+                matches = false;
+                for (Tag tag : meterId.tags()) {
+                    if (tag.key().equals(selection.getKey()) && selection.getValue().contains(tag.value())) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+            if (!matches) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private abstract static class MetricOutputBuilder {
 
         private final Meter meter;
+        private final SystemTagsManager systemTagsManager;
 
-        protected MetricOutputBuilder(Meter meter) {
+        protected MetricOutputBuilder(Meter meter, SystemTagsManager systemTagsManager) {
             this.meter = meter;
+            this.systemTagsManager = systemTagsManager;
         }
 
         protected Meter meter() {
             return meter;
         }
 
+        protected SystemTagsManager systemTagsManager() {
+            return systemTagsManager;
+        }
+
         protected abstract void add(Meter meter);
 
         protected abstract void apply(JsonObject.Builder builder);
 
-        private static MetricOutputBuilder create(Meter meter, MetricsConfig metricsConfig) {
+        private static MetricOutputBuilder create(Meter meter,
+                                                  MetricsConfig metricsConfig,
+                                                  SystemTagsManager systemTagsManager) {
             return meter instanceof Counter
-                    || meter instanceof io.helidon.metrics.api.Gauge
+                    || meter instanceof Gauge
                     || meter instanceof FunctionalCounter
-                    ? new Flat(meter)
-                    : new Structured(meter, metricsConfig);
+                    ? new Flat(meter, systemTagsManager)
+                    : new Structured(meter, metricsConfig, systemTagsManager);
         }
 
         private static void addNarrowed(JsonObject.Builder builder, String nameWithTags, Number number) {
@@ -409,29 +369,31 @@ class JsonFormatter implements MeterRegistryFormatter {
                 builder.set(nameWithTags, v.longValue());
             } else if (number instanceof Short v) {
                 builder.set(nameWithTags, v);
+            } else if (number != null) {
+                builder.set(nameWithTags, number.doubleValue());
             }
         }
 
         private static class Flat extends MetricOutputBuilder {
 
-            private Flat(Meter meter) {
-                super(meter);
+            private Flat(Meter meter, SystemTagsManager systemTagsManager) {
+                super(meter, systemTagsManager);
             }
 
             @Override
             protected void apply(JsonObject.Builder builder) {
                 if (meter() instanceof Counter counter) {
-                    builder.set(flatNameAndTags(meter().id()), counter.count());
+                    builder.set(flatNameAndTags(meter().id(), systemTagsManager()), counter.count());
                     return;
                 }
-                if (meter() instanceof io.helidon.metrics.api.Gauge gauge) {
+                if (meter() instanceof Gauge gauge) {
 
-                    String nameWithTags = flatNameAndTags(meter().id());
+                    String nameWithTags = flatNameAndTags(meter().id(), systemTagsManager());
                     addNarrowed(builder, nameWithTags, gauge.value());
                     return;
                 }
                 if (meter() instanceof FunctionalCounter fCounter) {
-                    builder.set(flatNameAndTags(meter().id()), fCounter.count());
+                    builder.set(flatNameAndTags(meter().id(), systemTagsManager()), fCounter.count());
                     return;
                 }
                 throw new IllegalArgumentException("Attempt to format meter with structured data as flat JSON "
@@ -449,8 +411,8 @@ class JsonFormatter implements MeterRegistryFormatter {
             private final JsonObject.Builder sameNameBuilder = JsonObject.builder();
             private final MetricsConfig metricsConfig;
 
-            Structured(Meter meter, MetricsConfig metricsConfig) {
-                super(meter);
+            Structured(Meter meter, MetricsConfig metricsConfig, SystemTagsManager systemTagsManager) {
+                super(meter, systemTagsManager);
                 this.metricsConfig = metricsConfig;
             }
 
@@ -534,15 +496,14 @@ class JsonFormatter implements MeterRegistryFormatter {
                 return TimeUnit.SECONDS;
             }
 
-            private static String valueId(String valueName, Meter.Id meterId) {
+            private String valueId(String valueName, Meter.Id meterId) {
                 return valueName + tagsPortion(meterId);
             }
 
-            private static String tagsPortion(Meter.Id metricID) {
+            private String tagsPortion(Meter.Id metricID) {
                 StringJoiner sj = new StringJoiner(";", ";", "");
                 sj.setEmptyValue("");
-                SystemTagsManager.instance()
-                        .withoutSystemOrScopeTags(metricID.tags())
+                systemTagsManager().withoutSystemTags(metricID.tags())
                         .forEach(tag -> sj.add(tag.key() + "=" + tag.value()));
                 return sj.toString();
             }
@@ -555,8 +516,7 @@ class JsonFormatter implements MeterRegistryFormatter {
         private final MetricsConfig metricsConfig;
         private final MeterRegistry meterRegistry;
         private Iterable<String> meterNameSelection = Set.of();
-        private String scopeTagName;
-        private Iterable<String> scopeSelection = Set.of();
+        private Map<String, Collection<String>> tagSelection = Map.of();
 
         /**
          * Used only internally.
@@ -583,24 +543,13 @@ class JsonFormatter implements MeterRegistryFormatter {
         }
 
         /**
-         * Sets the scope value with which to filter the output.
+         * Sets the tags with which to filter the output.
          *
-         * @param scopeSelection scope to select
+         * @param tagSelection tag names and values to select
          * @return updated builder
          */
-        public Builder scopeSelection(Iterable<String> scopeSelection) {
-            this.scopeSelection = scopeSelection;
-            return identity();
-        }
-
-        /**
-         * Sets the scope tag name with which to filter the output.
-         *
-         * @param scopeTagName scope tag name
-         * @return updated builder
-         */
-        public Builder scopeTagName(String scopeTagName) {
-            this.scopeTagName = scopeTagName;
+        public Builder tagSelection(Map<String, Collection<String>> tagSelection) {
+            this.tagSelection = tagSelection;
             return identity();
         }
     }

@@ -18,8 +18,6 @@ package io.helidon.webclient.api;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.security.cert.Certificate;
@@ -27,14 +25,18 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 
+import io.helidon.common.Api;
 import io.helidon.common.buffers.BufferData;
 import io.helidon.common.buffers.DataReader;
 import io.helidon.common.buffers.DataWriter;
@@ -42,7 +44,12 @@ import io.helidon.common.socket.HelidonSocket;
 import io.helidon.common.socket.PlainSocket;
 import io.helidon.common.socket.TlsSocket;
 import io.helidon.common.tls.Tls;
-import io.helidon.webclient.spi.DnsResolver;
+import io.helidon.http.HttpTransportObserver;
+import io.helidon.http.HttpTransportObserver.ConnectionObservation;
+import io.helidon.http.HttpTransportObserver.ConnectionOutcome;
+import io.helidon.http.HttpTransportObserver.Handshake;
+import io.helidon.http.HttpTransportObserver.HandshakeOutcome;
+import io.helidon.webclient.api.HttpTransportObserverSupport.ConnectionObservationContext;
 
 import static java.lang.System.Logger.Level.DEBUG;
 import static java.lang.System.Logger.Level.TRACE;
@@ -51,11 +58,12 @@ import static java.lang.System.Logger.Level.TRACE;
  * A TCP connection that can be used by any protocol that is based on TCP.
  * The connection supports proxying and is not attempting to cache anything.
  */
-public class TcpClientConnection implements ClientConnection {
+public class TcpClientConnection implements ClientConnection, ConnectionObservationContext {
     private static final System.Logger LOGGER = System.getLogger(TcpClientConnection.class.getName());
 
     private final WebClient webClient;
     private final ConnectionKey connectionKey;
+    private final ClientConnectionTarget connectionTarget;
     private final List<String> tcpProtocolIds;
     private final Function<TcpClientConnection, Boolean> releaseFunction;
     private final Consumer<TcpClientConnection> closeConsumer;
@@ -67,14 +75,34 @@ public class TcpClientConnection implements ClientConnection {
     private DataWriter writer;
     private boolean closed;
     private boolean allowExpectContinue = true;
+    private ResolvedClientTarget resolvedTarget;
+    private ClientTransportObservation transportObservation;
 
     private TcpClientConnection(WebClient webClient,
                                 ConnectionKey connectionKey,
                                 List<String> tcpProtocolIds,
                                 Function<TcpClientConnection, Boolean> releaseFunction,
                                 Consumer<TcpClientConnection> closeConsumer) {
+        this(webClient,
+             connectionKey,
+             null,
+             null,
+             tcpProtocolIds,
+             releaseFunction,
+             closeConsumer);
+    }
+
+    private TcpClientConnection(WebClient webClient,
+                                ConnectionKey connectionKey,
+                                ClientConnectionTarget connectionTarget,
+                                ResolvedClientTarget resolvedTarget,
+                                List<String> tcpProtocolIds,
+                                Function<TcpClientConnection, Boolean> releaseFunction,
+                                Consumer<TcpClientConnection> closeConsumer) {
         this.webClient = webClient;
         this.connectionKey = connectionKey;
+        this.connectionTarget = connectionTarget;
+        this.resolvedTarget = resolvedTarget;
         this.tcpProtocolIds = tcpProtocolIds;
         this.releaseFunction = releaseFunction;
         this.closeConsumer = closeConsumer;
@@ -100,6 +128,58 @@ public class TcpClientConnection implements ClientConnection {
     }
 
     /**
+     * Create a TCP connection from a logical connection target.
+     *
+     * @param webClient webclient, may be used to create proxy connections
+     * @param connectionTarget logical connection target
+     * @param tcpProtocolIds protocol IDs for ALPN
+     * @param releaseFunction release callback
+     * @param closeConsumer close callback
+     * @return a new unconnected TCP connection
+     */
+    @Api.Internal
+    public static TcpClientConnection create(WebClient webClient,
+                                             ClientConnectionTarget connectionTarget,
+                                             List<String> tcpProtocolIds,
+                                             Function<TcpClientConnection, Boolean> releaseFunction,
+                                             Consumer<TcpClientConnection> closeConsumer) {
+        ClientConnectionTarget target = Objects.requireNonNull(connectionTarget, "connectionTarget");
+        return new TcpClientConnection(webClient,
+                                       target.connectionKey(),
+                                       target,
+                                       null,
+                                       tcpProtocolIds,
+                                       releaseFunction,
+                                       closeConsumer);
+    }
+
+    /**
+     * Create a TCP connection from a resolved physical target.
+     *
+     * @param webClient webclient, may be used to create proxy connections
+     * @param resolvedTarget resolved physical target
+     * @param tcpProtocolIds protocol IDs for ALPN
+     * @param releaseFunction release callback
+     * @param closeConsumer close callback
+     * @return a new unconnected TCP connection
+     */
+    @Api.Internal
+    public static TcpClientConnection create(WebClient webClient,
+                                             ResolvedClientTarget resolvedTarget,
+                                             List<String> tcpProtocolIds,
+                                             Function<TcpClientConnection, Boolean> releaseFunction,
+                                             Consumer<TcpClientConnection> closeConsumer) {
+        ResolvedClientTarget target = Objects.requireNonNull(resolvedTarget, "resolvedTarget");
+        return new TcpClientConnection(webClient,
+                                       target.logicalTarget().connectionKey(),
+                                       target.logicalTarget(),
+                                       target,
+                                       tcpProtocolIds,
+                                       releaseFunction,
+                                       closeConsumer);
+    }
+
+    /**
      * Connect this connection over the network.
      * This will resolve proxy connection, TLS negotiation (including ALPN) and return a connected connection.
      *
@@ -108,60 +188,52 @@ public class TcpClientConnection implements ClientConnection {
     @Override
     public TcpClientConnection connect() {
         Tls tls = connectionKey.tls();
-        InetSocketAddress targetAddress = inetSocketAddress();
-
-        /*
-        Obtain target socket through proxy (if enabled), or connect to target socket
-         */
-        this.socket = connectionKey.proxy()
-                .tcpSocket(webClient,
-                           targetAddress,
-                           webClient.prototype().socketOptions(),
-                           tls.enabled());
-
-        this.channelId = createChannelId(socket);
-
-        if (LOGGER.isLoggable(DEBUG)) {
-            LOGGER.log(DEBUG, String.format("[client %s] client connected %s:%d %s",
-                                            channelId,
-                                            socket.getLocalAddress().getHostAddress(),
-                                            socket.getLocalPort(),
-                                            Thread.currentThread().getName()));
+        ResolvedClientTarget target = resolvedTarget;
+        if (target == null) {
+            ClientConnectionTarget logicalTarget = connectionTarget;
+            if (logicalTarget == null) {
+                logicalTarget = ClientConnectionTarget.create(connectionKey, connectionKey.scheme());
+            }
+            target = logicalTarget.resolve();
+            resolvedTarget = target;
         }
 
         try {
-            webClient.prototype().connectionListener()
-                .socketConnected(new ConnectedSocketInfoImpl(this.channelId, this.socket));
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to execute connection initializer", e);
-        }
-
-
-        if (tls.enabled()) {
-            SSLSocket sslSocket = tls.createSocket(tcpProtocolIds, socket, targetAddress);
-            try {
-                sslSocket.startHandshake();
-            } catch (IOException e) {
+            return connect(tls, target);
+        } catch (RuntimeException failure) {
+            if (transportObservation != null) {
+                transportObservation.failed(failure);
                 try {
-                    sslSocket.close();
-                } catch (IOException ex) {
-                    e.addSuppressed(ex);
+                    closeResource();
+                } catch (RuntimeException closeFailure) {
+                    failure.addSuppressed(closeFailure);
                 }
-                throw new UncheckedIOException("Failed to execute SSL handshake", e);
             }
-            if (LOGGER.isLoggable(TRACE)) {
-                debugTls(sslSocket, channelId);
-            }
-            this.helidonSocket = TlsSocket.client(sslSocket, channelId);
-        } else {
-            this.helidonSocket = PlainSocket.client(socket, channelId);
+            throw failure;
         }
+    }
 
-        this.reader = DataReader.create(helidonSocket);
-        int writeBufferSize = webClient.prototype().writeBufferSize();
-        this.writer = new BufferedDataWriter(helidonSocket, writeBufferSize);
+    @Override
+    @Api.Internal
+    public void httpTransportObserver(HttpTransportObserver observer) {
+        if (socket != null || transportObservation != null) {
+            throw new IllegalStateException("Transport observation must be configured once before connecting");
+        }
+        transportObservation = new ClientTransportObservation(Objects.requireNonNull(observer, "observer"));
+    }
 
-        return this;
+    @Override
+    @Api.Internal
+    public ConnectionObservation httpTransportObservation() {
+        return transportObservation == null ? ConnectionObservation.noop() : transportObservation;
+    }
+
+    @Override
+    @Api.Internal
+    public void httpTransportOutcome(ConnectionOutcome outcome) {
+        if (transportObservation != null) {
+            transportObservation.outcome(outcome);
+        }
     }
 
     @Override
@@ -206,11 +278,20 @@ public class TcpClientConnection implements ClientConnection {
             return;
         }
         try {
-            this.socket.close();
+            if (this.socket != null) {
+                this.socket.close();
+            }
         } catch (IOException e) {
+            if (transportObservation != null) {
+                transportObservation.failed(e);
+            }
             LOGGER.log(TRACE, "Failed to close a client socket", e);
+        } finally {
+            this.closed = true;
+            if (transportObservation != null) {
+                transportObservation.closed();
+            }
         }
-        this.closed = true;
         closeConsumer.accept(this);
     }
 
@@ -246,7 +327,7 @@ public class TcpClientConnection implements ClientConnection {
 
     @Override
     public boolean isConnected() {
-        return socket != null && socket.isConnected() && helidonSocket().isConnected();
+        return !closed && socket != null && socket.isConnected() && helidonSocket().isConnected();
     }
 
     @Override
@@ -259,18 +340,22 @@ public class TcpClientConnection implements ClientConnection {
         this.allowExpectContinue = allowExpectContinue;
     }
 
+    /**
+     * Concrete target retained by this connection after physical resolution.
+     *
+     * @return resolved target, empty until a target is supplied or resolved
+     */
+    @Api.Internal
+    public Optional<ResolvedClientTarget> resolvedTarget() {
+        return Optional.ofNullable(resolvedTarget);
+    }
+
     Socket socket() {
         return socket;
     }
 
     private String createChannelId(Socket socket) {
         return "0x" + HexFormat.of().toHexDigits(System.identityHashCode(socket));
-    }
-
-    private InetSocketAddress inetSocketAddress() {
-        DnsResolver dnsResolver = connectionKey.dnsResolver();
-        InetAddress address = dnsResolver.resolveAddress(connectionKey.host(), connectionKey.dnsAddressLookup());
-        return new InetSocketAddress(address, connectionKey.port());
     }
 
     static void debugTls(SSLEngine sslEngine, String channelId) {
@@ -334,6 +419,102 @@ public class TcpClientConnection implements ClientConnection {
         }
 
         return String.join(", ", certs);
+    }
+
+    private TcpClientConnection connect(Tls tls, ResolvedClientTarget target) {
+        /*
+        Obtain target socket through proxy (if enabled), or connect to target socket
+         */
+        if (transportObservation == null) {
+            socketConnected(connectionKey.proxy().tcpSocket(webClient, target, webClient.prototype().socketOptions()));
+        } else {
+            connectionKey.proxy()
+                    .tcpSocket(webClient,
+                               target,
+                               webClient.prototype().socketOptions(),
+                               this::socketConnected);
+        }
+
+        if (LOGGER.isLoggable(DEBUG)) {
+            LOGGER.log(DEBUG, String.format("[client %s] client connected %s:%d %s",
+                                            channelId,
+                                            socket.getLocalAddress().getHostAddress(),
+                                            socket.getLocalPort(),
+                                            Thread.currentThread().getName()));
+        }
+
+        try {
+            webClient.prototype().connectionListener()
+                .socketConnected(new ConnectedSocketInfoImpl(this.channelId, this.socket));
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to execute connection initializer", e);
+        }
+
+
+        if (tls.enabled()) {
+            if (transportObservation != null) {
+                transportObservation.handshakeStarted();
+            }
+            List<SNIServerName> serverNamesOverride = connectionKey.serverNamesOverride();
+            SSLSocket sslSocket = serverNamesOverride == null
+                    ? tls.createSocket(tcpProtocolIds,
+                                       socket,
+                                       connectionKey.tlsPeerHost(),
+                                       connectionKey.tlsPeerPort())
+                    : tls.createSocket(tcpProtocolIds,
+                                       socket,
+                                       connectionKey.tlsPeerHost(),
+                                       connectionKey.tlsPeerPort(),
+                                       serverNamesOverride);
+            try {
+                sslSocket.startHandshake();
+            } catch (IOException e) {
+                try {
+                    sslSocket.close();
+                } catch (IOException ex) {
+                    e.addSuppressed(ex);
+                }
+                throw new UncheckedIOException("Failed to execute SSL handshake", e);
+            }
+            if (transportObservation != null) {
+                transportObservation.handshakeStarted().close(HandshakeOutcome.SUCCESS);
+            }
+            if (LOGGER.isLoggable(TRACE)) {
+                debugTls(sslSocket, channelId);
+            }
+            this.helidonSocket = TlsSocket.client(sslSocket, channelId);
+        } else {
+            this.helidonSocket = PlainSocket.client(socket, channelId);
+        }
+
+        if (!target.logicalTarget().currentTlsGeneration()) {
+            IllegalStateException failure =
+                    new IllegalStateException("TLS configuration was reloaded during connection setup");
+            if (transportObservation != null) {
+                transportObservation.failed(failure);
+            }
+            try {
+                closeResource();
+            } catch (RuntimeException | Error closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+
+        this.reader = DataReader.create(helidonSocket);
+        int writeBufferSize = webClient.prototype().writeBufferSize();
+        this.writer = new BufferedDataWriter(helidonSocket, writeBufferSize);
+
+        return this;
+    }
+
+    private void socketConnected(Socket socket) {
+        this.socket = socket;
+        this.channelId = createChannelId(socket);
+        if (transportObservation != null) {
+            transportObservation.opened(HttpTransportObserver.TRANSPORT_TCP,
+                                        connectionKey.tls().enabled() ? Handshake.TLS : Handshake.NONE);
+        }
     }
 
     static class BufferedDataWriter implements DataWriter {

@@ -25,7 +25,7 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-dependencies</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
         <relativePath>./dependencies/pom.xml</relativePath>
     </parent>
     <artifactId>helidon-project</artifactId>
@@ -35,7 +35,7 @@
     <description>Java libraries for writing microservices</description>
 
     <properties>
-        <version.java>26</version.java>
+        <version.java>27</version.java>
 
         <doclint>all</doclint>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -62,85 +62,71 @@
 
         Changing these version requires approval for a new third party dependency!
         -->
-        <version.lib.asm>9.9.1</version.lib.asm>
-        <version.lib.checkstyle>13.3.0</version.lib.checkstyle>
+        <version.lib.asm>9.10.1</version.lib.asm>
+        <version.lib.checkstyle>14.1.0</version.lib.checkstyle>
+        <!-- Persistence providers used only by tests. -->
+        <version.lib.eclipselink>5.0.2</version.lib.eclipselink>
+        <version.lib.hibernate.family>7.4</version.lib.hibernate.family>
+        <version.lib.hibernate>${version.lib.hibernate.family}.11.Final</version.lib.hibernate>
         <!-- Dependencies convergence via jinjava -->
         <version.lib.mockito>2.23.4</version.lib.mockito>
         <version.lib.mockserver>5.15.0</version.lib.mockserver>
         <version.lib.restito>0.9.1</version.lib.restito>
         <version.lib.rxjava2-jdk9-interop>0.1.0</version.lib.rxjava2-jdk9-interop>
         <version.lib.rxjava>2.2.10</version.lib.rxjava>
-        <version.lib.scala>2.12.10</version.lib.scala>
-        <!-- This is to force upgrade of transitive dep from arquillian -->
-        <!-- 2.x versions used http (not https) to access maven central -->
-        <version.lib.shrinkwrap-resolver>3.0.1</version.lib.shrinkwrap-resolver>
-        <version.lib.spotbugs-annotations>3.1.12</version.lib.spotbugs-annotations>
         <version.lib.testng>7.8.0</version.lib.testng>
         <version.lib.bedrock>7.0.1</version.lib.bedrock>
         <version.lib.awaitility>3.1.6</version.lib.awaitility>
-        <version.lib.jmh>1.23</version.lib.jmh>
+        <version.lib.jmh>1.37</version.lib.jmh>
         <version.lib.vertx-core>4.3.8</version.lib.vertx-core>
-        <version.lib.commons-text>1.15.0</version.lib.commons-text>
-        <version.lib.classgraph>4.8.165</version.lib.classgraph>
+        <version.lib.classgraph>4.8.195</version.lib.classgraph>
         <version.lib.maven.plugin.annotations>3.15.1</version.lib.maven.plugin.annotations>
         <version.lib.maven.plugin.api>3.9.15</version.lib.maven.plugin.api>
         <version.lib.maven.plugin.project>2.2.1</version.lib.maven.plugin.project>
-        <version.lib.groovy>2.5.23</version.lib.groovy>
-        <version.lib.groovy-all>${version.lib.groovy}</version.lib.groovy-all>
         <version.lib.nimbus.jose.jwt>10.4</version.lib.nimbus.jose.jwt>
         <!--
         !Version statement! - end
         -->
 
         <!-- maven plugin versions -->
-        <version.plugin.archetype>3.1.2</version.plugin.archetype>
-        <version.plugin.ant>3.1.0</version.plugin.ant>
-        <version.plugin.build-helper>3.4.0</version.plugin.build-helper>
+        <version.plugin.build-helper>3.6.1</version.plugin.build-helper>
         <version.plugin.checkstyle>3.6.0</version.plugin.checkstyle>
-        <version.plugin.compiler>3.11.0</version.plugin.compiler>
-        <version.plugin.dependency>3.10.0</version.plugin.dependency>
+        <version.plugin.compiler>3.16.0</version.plugin.compiler>
+        <version.plugin.dependency>3.11.0</version.plugin.dependency>
         <version.plugin.directory>1.0</version.plugin.directory>
-        <version.plugin.enforcer>3.3.0</version.plugin.enforcer>
-        <version.plugin.exec>3.1.0</version.plugin.exec>
-        <version.plugin.failsafe>3.1.2</version.plugin.failsafe>
-        <version.plugin.glassfish-copyright>2.3</version.plugin.glassfish-copyright>
+        <version.plugin.enforcer>3.6.3</version.plugin.enforcer>
+        <version.plugin.exec>3.6.3</version.plugin.exec>
+        <version.plugin.failsafe>3.5.6</version.plugin.failsafe>
         <version.plugin.helidon-build-tools>4.0.26</version.plugin.helidon-build-tools>
-        <version.plugin.hibernate-enhance>${version.lib.hibernate}</version.plugin.hibernate-enhance>
-        <version.plugin.install>3.1.2</version.plugin.install>
-        <version.plugin.invoker>3.2.2</version.plugin.invoker>
-        <version.plugin.jandex>${version.lib.jandex}</version.plugin.jandex>
-        <version.plugin.jar>3.3.0</version.plugin.jar>
-        <version.plugin.javadoc>3.6.2</version.plugin.javadoc>
-        <version.plugin.jaxb>2.5.0</version.plugin.jaxb>
-        <version.plugin.license>1.16</version.plugin.license>
-        <version.plugin.os>1.5.0.Final</version.plugin.os>
-        <version.plugin.plugin>3.15.1</version.plugin.plugin>
-        <version.plugin.project-info-reports>3.0.0</version.plugin.project-info-reports>
+        <version.plugin.install>3.2.0</version.plugin.install>
+        <version.plugin.invoker>3.10.1</version.plugin.invoker>
+        <version.plugin.jar>3.5.1</version.plugin.jar>
+        <version.plugin.javadoc>3.12.0</version.plugin.javadoc>
+        <version.plugin.license>2.7.1</version.plugin.license>
+        <version.plugin.os>1.7.1</version.plugin.os>
+        <version.plugin.plugin>3.15.2</version.plugin.plugin>
         <version.plugin.protobuf>0.6.1</version.plugin.protobuf>
-        <version.plugin.resources>3.3.1</version.plugin.resources>
-        <version.plugin.scm-publish-plugin>3.0.0</version.plugin.scm-publish-plugin>
-        <version.plugin.shade>3.5.0</version.plugin.shade>
-        <version.plugin.source>3.0.1</version.plugin.source>
-        <version.plugin.spotbugs>4.9.8.2</version.plugin.spotbugs>
-        <version.plugin.findsecbugs>1.12.0</version.plugin.findsecbugs>
-        <version.plugin.dependency-check>12.2.1</version.plugin.dependency-check>
-        <version.plugin.surefire>3.1.0</version.plugin.surefire>
-        <version.plugin.toolchains>1.1</version.plugin.toolchains>
-        <version.plugin.buildnumber>3.1.0</version.plugin.buildnumber>
-        <version.plugin.wiremock>2.14.0</version.plugin.wiremock>
+        <version.plugin.resources>3.5.0</version.plugin.resources>
+        <version.plugin.source>3.4.0</version.plugin.source>
+        <version.plugin.spotbugs>4.10.4.1</version.plugin.spotbugs>
+        <version.plugin.findsecbugs>1.14.0</version.plugin.findsecbugs>
+        <version.plugin.dependency-check>13.0.0</version.plugin.dependency-check>
+        <version.plugin.surefire>3.5.6</version.plugin.surefire>
+        <version.plugin.toolchains>3.3.0</version.plugin.toolchains>
+        <version.plugin.buildnumber>3.3.0</version.plugin.buildnumber>
         <version.plugin.replacer>1.4.1</version.plugin.replacer>
 
 
         <!-- Links to external javadocs. If you see a hardcoded version it means the javadocs for the version we use is not available. -->
         <javadoc.link.jakarta-jsonb>https://jakarta.ee/specifications/jsonb/3.0/apidocs/</javadoc.link.jakarta-jsonb>
-        <javadoc.link.jakarta-persistence>https://jakarta.ee/specifications/persistence/3.1/apidocs/</javadoc.link.jakarta-persistence>
+        <javadoc.link.jakarta-persistence>https://jakarta.ee/specifications/persistence/3.2/apidocs/</javadoc.link.jakarta-persistence>
         <javadoc.link.jakarta-jsonp>https://jakarta.ee/specifications/jsonp/2.1/apidocs/</javadoc.link.jakarta-jsonp>
         <javadoc.link.jakarta-inject>https://jakarta.ee/specifications/dependency-injection/2.0/apidocs/</javadoc.link.jakarta-inject>
         <javadoc.link.jakarta-jaxb>https://jakarta.ee/specifications/xml-binding/4.0/apidocs/</javadoc.link.jakarta-jaxb>
         <javadoc.link.jakarta-transaction>https://jakarta.ee/specifications/transactions/2.0/apidocs/</javadoc.link.jakarta-transaction>
 
         <javadoc.link.narayana>https://narayana.io/docs/api/</javadoc.link.narayana>
-        <javadoc.link.eclipselink>https://www.eclipse.org/eclipselink/api/4.0/</javadoc.link.eclipselink>
+        <javadoc.link.eclipselink>https://www.eclipse.org/eclipselink/api/5.0/</javadoc.link.eclipselink>
         <javadoc.link.hibernate>https://docs.jboss.org/hibernate/orm/${version.lib.hibernate.family}/javadocs/</javadoc.link.hibernate>
         <javadoc.link.ojdbc>https://docs.oracle.com/en/database/oracle/oracle-database/${version.lib.ojdbc.family}/jajdb/</javadoc.link.ojdbc>
         <javadoc.link.ucp>https://docs.oracle.com/en/database/oracle/oracle-database/${version.lib.ojdbc.family}/jjuar/</javadoc.link.ucp>
@@ -151,7 +137,7 @@
         <javadoc.link.jackson-databind>https://fasterxml.github.io/jackson-databind/javadoc/${javadoc.jackson.version}/</javadoc.link.jackson-databind>
         <javadoc.link.reactive-streams>https://www.reactive-streams.org/reactive-streams-${version.lib.reactivestreams}-javadoc</javadoc.link.reactive-streams>
         <javadoc.link.typesafe-config>https://static.javadoc.io/com.typesafe/config/${version.lib.typesafe-config}</javadoc.link.typesafe-config>
-        <javadoc.link.prometheus>https://static.javadoc.io/io.prometheus/simpleclient/${version.lib.prometheus}</javadoc.link.prometheus>
+        <javadoc.link.prometheus>https://prometheus.github.io/client_java/api/</javadoc.link.prometheus>
         <javadoc.link.grpc-api>https://grpc.github.io/grpc-java/javadoc</javadoc.link.grpc-api>
 
         <!--suppress UnresolvedMavenProperty -->
@@ -191,6 +177,7 @@
         <module>metadata</module>
         <module>testing</module>
         <module>declarative</module>
+        <module>messaging</module>
         <module>discovery</module>
         <module>data</module>
         <module>transaction</module>
@@ -341,11 +328,6 @@
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-project-info-reports-plugin</artifactId>
-                    <version>${version.plugin.project-info-reports}</version>
-                </plugin>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-source-plugin</artifactId>
                     <version>${version.plugin.source}</version>
                 </plugin>
@@ -398,11 +380,6 @@
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
                     <version>${version.plugin.exec}</version>
-                </plugin>
-                <plugin>
-                    <groupId>io.smallrye</groupId>
-                    <artifactId>jandex-maven-plugin</artifactId>
-                    <version>${version.plugin.jandex}</version>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
@@ -458,28 +435,6 @@
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-scm-publish-plugin</artifactId>
-                    <version>${version.plugin.scm-publish-plugin}</version>
-                </plugin>
-                <plugin>
-                    <groupId>org.glassfish.copyright</groupId>
-                    <artifactId>glassfish-copyright-maven-plugin</artifactId>
-                    <version>${version.plugin.glassfish-copyright}</version>
-                    <configuration>
-                        <!--suppress UnresolvedMavenProperty -->
-                        <templateFile>${copyright.template}</templateFile>
-                        <!--suppress UnresolvedMavenProperty -->
-                        <excludeFile>${copyright.exclude}</excludeFile>
-                        <scm>git</scm>
-                        <debug>false</debug>
-                        <scmOnly>true</scmOnly>
-                        <warn>true</warn>
-                        <ignoreYear>false</ignoreYear>
-                        <useDash>false</useDash>
-                    </configuration>
-                </plugin>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-checkstyle-plugin</artifactId>
                     <version>${version.plugin.checkstyle}</version>
                     <configuration>
@@ -532,18 +487,10 @@
                         <skipTestScope>true</skipTestScope>
                         <failBuildOnCVSS>0</failBuildOnCVSS>
                         <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
-                        <excludes>
-                            <!-- Exclude stuff we do not deploy -->
-                            <exclude>io.helidon.tracing:helidon-tracing-tests</exclude>
-                            <exclude>io.helidon.config.tests*</exclude>
-                            <exclude>io.helidon.test*</exclude>
-                            <exclude>io.helidon.examples*</exclude>
-                            <!-- This should be excluded by above, but for some reason it persists -->
-                            <exclude>org.testng:testng</exclude>
-                        </excludes>
+                        <!-- Bump up from 24 to 72 to reduce token use -->
+                        <ossIndexAnalyzerCacheValidForHours>72</ossIndexAnalyzerCacheValidForHours>
                         <formats>
                             <format>HTML</format>
-                            <format>CSV</format>
                         </formats>
                         <suppressionFiles>
                             <!--suppress UnresolvedMavenProperty -->
@@ -588,47 +535,6 @@
                     </dependencies>
                 </plugin>
                 <plugin>
-                    <groupId>org.hibernate.orm.tooling</groupId>
-                    <artifactId>hibernate-enhance-maven-plugin</artifactId>
-                    <version>${version.plugin.hibernate-enhance}</version>
-                    <!-- Force upgrade for latest Java support -->
-                    <dependencies>
-                        <dependency>
-                            <groupId>net.bytebuddy</groupId>
-                            <artifactId>byte-buddy</artifactId>
-                            <version>${version.lib.bytebuddy}</version>
-                        </dependency>
-                    </dependencies>
-                </plugin>
-                <plugin>
-                    <groupId>org.codehaus.mojo</groupId>
-                    <artifactId>jaxb2-maven-plugin</artifactId>
-                    <version>${version.plugin.jaxb}</version>
-                    <dependencies>
-                        <!-- Force upgrade version to use jakarta packages. -->
-                        <dependency>
-                            <groupId>org.glassfish.jaxb</groupId>
-                            <artifactId>jaxb-xjc</artifactId>
-                            <version>${version.lib.jaxb-runtime}</version>
-                        </dependency>
-                        <dependency>
-                            <groupId>com.sun.xml.bind</groupId>
-                            <artifactId>jaxb-impl</artifactId>
-                            <version>${version.lib.jaxb-runtime}</version>
-                        </dependency>
-                        <dependency>
-                            <groupId>jakarta.activation</groupId>
-                            <artifactId>jakarta.activation-api</artifactId>
-                            <version>${version.lib.jakarta.activation-api}</version>
-                        </dependency>
-                        <dependency>
-                            <groupId>jakarta.xml.bind</groupId>
-                            <artifactId>jakarta.xml.bind-api</artifactId>
-                            <version>${version.lib.jakarta.xml.bind-api}</version>
-                        </dependency>
-                    </dependencies>
-                </plugin>
-                <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>buildnumber-maven-plugin</artifactId>
                     <version>${version.plugin.buildnumber}</version>
@@ -645,33 +551,6 @@
                     </configuration>
                 </plugin>
                 <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-shade-plugin</artifactId>
-                    <version>${version.plugin.shade}</version>
-                    <dependencies>
-                        <dependency>
-                            <groupId>org.ow2.asm</groupId>
-                            <artifactId>asm</artifactId>
-                            <version>${version.lib.asm}</version>
-                        </dependency>
-                        <dependency>
-                            <groupId>org.ow2.asm</groupId>
-                            <artifactId>asm-commons</artifactId>
-                            <version>${version.lib.asm}</version>
-                        </dependency>
-                    </dependencies>
-                </plugin>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-archetype-plugin</artifactId>
-                    <version>${version.plugin.archetype}</version>
-                </plugin>
-                <plugin>
-                    <groupId>uk.co.automatictester</groupId>
-                    <artifactId>wiremock-maven-plugin</artifactId>
-                    <version>${version.plugin.wiremock}</version>
-                </plugin>
-                <plugin>
                     <groupId>io.helidon.build-tools</groupId>
                     <artifactId>sitegen-maven-plugin</artifactId>
                     <version>${version.plugin.helidon-build-tools}</version>
@@ -679,16 +558,6 @@
                 <plugin>
                     <groupId>io.helidon.build-tools</groupId>
                     <artifactId>helidon-javadoc-maven-plugin</artifactId>
-                    <version>${version.plugin.helidon-build-tools}</version>
-                </plugin>
-                <plugin>
-                    <groupId>io.helidon.build-tools</groupId>
-                    <artifactId>snakeyaml-codegen-maven-plugin</artifactId>
-                    <version>${version.plugin.helidon-build-tools}</version>
-                </plugin>
-                <plugin>
-                    <groupId>io.helidon.build-tools</groupId>
-                    <artifactId>helidon-stager-maven-plugin</artifactId>
                     <version>${version.plugin.helidon-build-tools}</version>
                 </plugin>
                 <plugin>
@@ -738,11 +607,6 @@
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-antrun-plugin</artifactId>
-                    <version>${version.plugin.ant}</version>
-                </plugin>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-invoker-plugin</artifactId>
                     <version>${version.plugin.invoker}</version>
                     <configuration>
@@ -766,13 +630,6 @@
                             <goal>install</goal>
                         </goals>
                     </configuration>
-                    <dependencies>
-                        <dependency>
-                            <groupId>org.codehaus.groovy</groupId>
-                            <artifactId>groovy</artifactId>
-                            <version>${version.lib.groovy}</version>
-                        </dependency>
-                    </dependencies>
                 </plugin>
                 <plugin>
                     <groupId>org.antlr</groupId>
@@ -911,16 +768,21 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- Persistence providers used only by tests. -->
             <dependency>
-                <groupId>org.apache.zookeeper</groupId>
-                <artifactId>zookeeper</artifactId>
-                <version>${version.lib.zookeeper}</version>
+                <groupId>org.eclipse.persistence</groupId>
+                <artifactId>org.eclipse.persistence.core</artifactId>
+                <version>${version.lib.eclipselink}</version>
             </dependency>
             <dependency>
-                <groupId>org.scala-lang</groupId>
-                <artifactId>scala-library</artifactId>
-                <scope>test</scope>
-                <version>${version.lib.scala}</version>
+                <groupId>org.eclipse.persistence</groupId>
+                <artifactId>org.eclipse.persistence.jpa</artifactId>
+                <version>${version.lib.eclipselink}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.hibernate.orm</groupId>
+                <artifactId>hibernate-core</artifactId>
+                <version>${version.lib.hibernate}</version>
             </dependency>
             <dependency>
                 <groupId>com.github.akarnokd</groupId>
@@ -953,11 +815,6 @@
                 <version>${version.lib.bedrock}</version>
             </dependency>
             <dependency>
-                <groupId>com.github.spotbugs</groupId>
-                <artifactId>spotbugs-annotations</artifactId>
-                <version>${version.lib.spotbugs-annotations}</version>
-            </dependency>
-            <dependency>
                 <groupId>org.reactivestreams</groupId>
                 <artifactId>reactive-streams-tck-flow</artifactId>
                 <version>${version.lib.reactivestreams}</version>
@@ -973,23 +830,6 @@
                 <version>${version.lib.vertx-core}</version>
             </dependency>
             <dependency>
-                <!-- for dependency convergence with handlebars and force upgrade -->
-                <groupId>org.apache.commons</groupId>
-                <artifactId>commons-text</artifactId>
-                <version>${version.lib.commons-text}</version>
-            </dependency>
-            <dependency>
-                <!--
-                Required for dependency convergence
-                Used by both
-                io.rest-assured:rest-assured (from metrics rest TCK)
-                hamcrest-integration (from metrics API TCK)
-                -->
-                <groupId>org.hamcrest</groupId>
-                <artifactId>hamcrest-library</artifactId>
-                <version>${version.lib.hamcrest}</version>
-            </dependency>
-            <dependency>
                 <groupId>org.testng</groupId>
                 <artifactId>testng</artifactId>
                 <version>${version.lib.testng}</version>
@@ -999,17 +839,6 @@
                         <artifactId>jsr305</artifactId>
                     </exclusion>
                 </exclusions>
-            </dependency>
-            <!-- Force update of shrinkwrap version used by arquillian -->
-            <dependency>
-                <groupId>org.jboss.shrinkwrap.resolver</groupId>
-                <artifactId>shrinkwrap-resolver-impl-maven</artifactId>
-                <version>${version.lib.shrinkwrap-resolver}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.jboss.shrinkwrap.resolver</groupId>
-                <artifactId>shrinkwrap-resolver-api-maven</artifactId>
-                <version>${version.lib.shrinkwrap-resolver}</version>
             </dependency>
             <dependency>
                 <groupId>org.awaitility</groupId>
@@ -1031,12 +860,6 @@
                 <groupId>io.github.classgraph</groupId>
                 <artifactId>classgraph</artifactId>
                 <version>${version.lib.classgraph}</version>
-            </dependency>
-            <!-- Injection TCK tests -->
-            <dependency>
-                <groupId>jakarta.inject</groupId>
-                <artifactId>jakarta.inject-tck</artifactId>
-                <version>${version.lib.jakarta.inject}</version>
             </dependency>
             <!-- Maven plugin -->
             <dependency>
@@ -1086,7 +909,35 @@
             </modules>
         </profile>
         <profile>
+            <id>invoker-split-repository</id>
+            <activation>
+                <property>
+                    <name>aether.enhancedLocalRepository.split</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <build>
+                <pluginManagement>
+                    <plugins>
+                        <plugin>
+                            <groupId>org.apache.maven.plugins</groupId>
+                            <artifactId>maven-invoker-plugin</artifactId>
+                            <configuration>
+                                <properties>
+                                    <aether.enhancedLocalRepository.split>true</aether.enhancedLocalRepository.split>
+                                    <aether.enhancedLocalRepository.localPrefix>${aether.enhancedLocalRepository.localPrefix}</aether.enhancedLocalRepository.localPrefix>
+                                </properties>
+                            </configuration>
+                        </plugin>
+                    </plugins>
+                </pluginManagement>
+            </build>
+        </profile>
+        <profile>
             <id>javadoc</id>
+            <modules>
+                <module>javadocs</module>
+            </modules>
             <build>
                 <plugins>
                     <plugin>
@@ -1192,7 +1043,7 @@
             <id>release</id>
             <modules>
                 <module>archetypes</module>
-                <module>docs</module>
+                <module>javadocs</module>
             </modules>
             <build>
                 <plugins>

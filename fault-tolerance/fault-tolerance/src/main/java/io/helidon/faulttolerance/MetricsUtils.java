@@ -18,25 +18,19 @@ package io.helidon.faulttolerance;
 import java.util.List;
 import java.util.function.Supplier;
 
-import io.helidon.common.LazyValue;
 import io.helidon.config.Config;
 import io.helidon.metrics.api.Counter;
-import io.helidon.metrics.api.Gauge;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
 import io.helidon.metrics.api.MetricsFactory;
 import io.helidon.metrics.api.Tag;
 import io.helidon.metrics.api.Timer;
-import io.helidon.service.registry.Services;
+import io.helidon.service.registry.GlobalServiceRegistry;
+import io.helidon.service.registry.ServiceRegistry;
 
 import static io.helidon.faulttolerance.FaultTolerance.FT_METRICS_DEFAULT_ENABLED;
-import static io.helidon.metrics.api.Meter.Scope.VENDOR;
 
 @SuppressWarnings("unchecked")
 class MetricsUtils {
-
-    private static final LazyValue<MetricsFactory> METRICS_FACTORY = LazyValue.create(MetricsFactory::getInstance);
-    private static final LazyValue<MeterRegistry> METRICS_REGISTRY = LazyValue.create(Metrics::globalRegistry);
 
     private MetricsUtils() {
     }
@@ -48,45 +42,46 @@ class MetricsUtils {
      * @return value of metrics flag
      */
     static boolean defaultEnabled() {
-        return Services.get(Config.class)
-                .get(FT_METRICS_DEFAULT_ENABLED)
-                .asBoolean()
+        if (!GlobalServiceRegistry.configured()) {
+            return false;
+        }
+
+        return defaultEnabled(GlobalServiceRegistry.registry());
+    }
+
+    static boolean defaultEnabled(ServiceRegistry serviceRegistry) {
+        return serviceRegistry
+                .firstActive(Config.class)
+                .map(config -> config.get(FT_METRICS_DEFAULT_ENABLED)
+                        .asBoolean()
+                        .orElse(false))
                 .orElse(false);
     }
 
-    static <T extends Number> void gaugeBuilder(String name, Supplier<T> supplier, Tag... tags) {
-        Gauge.Builder<T> builder = METRICS_FACTORY.get().gaugeBuilder(name, supplier).scope(VENDOR);
-        List<Tag> tagList = List.of(tags);
-        builder.tags(tagList);
-        METRICS_REGISTRY.get().getOrCreate(builder);
-        METRICS_REGISTRY.get().gauge(name, tagList).orElseThrow();
+    static Tag tag(MetricsFactory metricsFactory, String name, String value) {
+        return metricsFactory.tagCreate(name, value);
     }
 
-    static Counter counterBuilder(String name, Tag... tags) {
-        Counter.Builder builder = METRICS_FACTORY.get().counterBuilder(name).scope(VENDOR);
-        List<Tag> tagList = List.of(tags);
-        builder.tags(tagList);
-        METRICS_REGISTRY.get().getOrCreate(builder);
-        return METRICS_REGISTRY.get().counter(name, tagList).orElseThrow();
+    static <T extends Number> void gaugeBuilder(MetricsFactory metricsFactory,
+                                                MeterRegistry meterRegistry,
+                                                String name,
+                                                Supplier<T> supplier,
+                                                Tag... tags) {
+        meterRegistry.getOrCreate(metricsFactory.gaugeBuilder(name, supplier)
+                                          .tags(List.of(tags))
+                                          .origin(FaultTolerance.class.getName()));
     }
 
-    static Timer timerBuilder(String name, Tag... tags) {
-        Timer.Builder builder = METRICS_FACTORY.get().timerBuilder(name).scope(VENDOR);
-        List<Tag> tagList = List.of(tags);
-        builder.tags(tagList);
-        METRICS_REGISTRY.get().getOrCreate(builder);
-        return METRICS_REGISTRY.get().timer(name, tagList).orElseThrow();
+    static Counter counterBuilder(MetricsFactory metricsFactory, MeterRegistry meterRegistry, String name, Tag... tags) {
+        return meterRegistry.getOrCreate(metricsFactory.counterBuilder(name)
+                                                 .tags(List.of(tags))
+                                                 .origin(FaultTolerance.class.getName()));
     }
 
-    static <T extends Number> Gauge<T> gauge(String name, Tag... tags) {
-        return METRICS_REGISTRY.get().gauge(name, List.of(tags)).orElseThrow();
+    static Timer timerBuilder(MetricsFactory metricsFactory, MeterRegistry meterRegistry, String name, Tag... tags) {
+        return meterRegistry.getOrCreate(metricsFactory.timerBuilder(name)
+                                                 .tags(List.of(tags))
+                                                 .origin(FaultTolerance.class.getName()));
     }
 
-    static Counter counter(String name, Tag... tags) {
-        return METRICS_REGISTRY.get().counter(name, List.of(tags)).orElseThrow();
-    }
-
-    static Timer timer(String name, Tag... tags) {
-        return METRICS_REGISTRY.get().timer(name, List.of(tags)).orElseThrow();
-    }
 }

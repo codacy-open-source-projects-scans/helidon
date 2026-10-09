@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ final class GenerateBuilder {
     public static void generate(List<BuilderCodegenExtension> extensions,
                                 ClassModel.Builder classBuilder,
                                 PrototypeInfo prototypeInfo,
+                                TypeName implementationType,
                                 List<TypeArgument> typeArguments,
                                 List<TypeName> typeArgumentNames, List<OptionHandler> options) {
 
@@ -77,23 +78,30 @@ final class GenerateBuilder {
                     })
                     .addMethod(method -> {
                         method.name("buildPrototype")
+                                .description("Create an instance of the prototype. Calling this method may update this builder"
+                                                     + " from providers and decorators, so repeated calls may have side effects.")
                                 .returnType(prototype)
                                 .addAnnotation(Annotations.OVERRIDE)
                                 .addContentLine("preBuildPrototype();")
-                                .addContentLine("validatePrototype();")
-                                .addContent("return new ")
-                                .addContent(prototype.genericTypeName())
-                                .addContent("Impl");
-                        if (!typeArguments.isEmpty()) {
-                            method.addContent("<>");
+                                .addContentLine("validatePrototype();");
+                        if (prototypeInfo.blueprint().hasAnnotation(Types.PROTOTYPE_SEALED)) {
+                            method.addContentLine("return buildPrototype(this);");
+                        } else {
+                            method.addContent("return new ")
+                                    .addContent(implementationType);
+                            if (!typeArguments.isEmpty()) {
+                                method.addContent("<>");
+                            }
+                            method.addContentLine("(this);");
                         }
-                        method.addContentLine("(this);");
                     });
             if (isFactory) {
                 GenerateAbstractBuilder.buildRuntimeObjectMethod(builder, prototypeInfo, runtimeType, true);
             } else {
                 // build method returns the same as buildPrototype method
                 builder.addMethod(method -> method.name("build")
+                        .description("Create an instance from this builder. Calling this method may update this builder"
+                                             + " from providers and decorators, so repeated calls may have side effects.")
                         .addAnnotation(Annotations.OVERRIDE)
                         .returnType(runtimeType)
                         .addContentLine("return buildPrototype();"));

@@ -17,11 +17,14 @@
 package io.helidon.webserver.http1;
 
 import java.util.List;
+import java.util.Optional;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
-import io.helidon.common.Size;
+import io.helidon.common.Api;
+import io.helidon.http.HttpConfig;
 import io.helidon.http.RequestedUriDiscoveryContext;
+import io.helidon.webserver.http.AltSvc;
 import io.helidon.webserver.spi.ProtocolConfig;
 import io.helidon.webserver.spi.ProtocolConfigProvider;
 
@@ -31,8 +34,8 @@ import io.helidon.webserver.spi.ProtocolConfigProvider;
 @Prototype.Blueprint(decorator = Http1BuilderDecorator.class)
 @Prototype.Configured(root = false, value = Http1ConnectionProvider.CONFIG_NAME)
 @Prototype.Provides(ProtocolConfigProvider.class)
-@Prototype.IncludeDefaultMethods("maxBufferedEntitySize")
-interface Http1ConfigBlueprint extends ProtocolConfig {
+@Prototype.IncludeDefaultMethods({"maxBufferedEntitySize", "log", "altSvc"})
+interface Http1ConfigBlueprint extends HttpConfig, ProtocolConfig {
     /**
      * Name of this configuration, in most cases the same as {@link #type()}.
      *
@@ -51,58 +54,20 @@ interface Http1ConfigBlueprint extends ProtocolConfig {
     int maxPrologueLength();
 
     /**
-     * Maximal size of received headers in bytes.
+     * Maximum size of received headers in bytes, which must be greater than {@code 0}.
+     * Defaults to {@code 16384}.
+     * <p>
+     * This override preserves generated {@code Http1Config.BuilderBase} binary compatibility.
      *
-     * @return maximal header size
+     * @return maximum headers size
      */
     @Option.Configured
     @Option.DefaultInt(16384)
     int maxHeadersSize();
 
     /**
-     * Configure the maximum size allowed for an entity that can be explicitly
-     * buffered by the application by calling {@link io.helidon.http.media.ReadableEntity#buffer}.
-     *
-     * @return maximum size for a buffered entity
-     */
-    @Option.Configured
-    @Option.Default("64 KB")
-    Size maxBufferedEntitySize();
-
-    /**
-     * Whether to validate headers.
-     * If set to false, any value is accepted, otherwise validates headers + known headers
-     * are validated by format
-     * (content length is always validated as it is part of protocol processing (other headers may be validated if
-     * features use them)).
-     * <p>
-     *     Defaults to {@code true}.
-     * </p>
-     *
-     * @return whether to validate headers
-     */
-    @Option.Configured
-    @Option.DefaultBoolean(true)
-    boolean validateRequestHeaders();
-
-    /**
-     * Whether to validate headers.
-     * If set to false, any value is accepted, otherwise validates headers + known headers
-     * are validated by format
-     * (content length is always validated as it is part of protocol processing (other headers may be validated if
-     * features use them)).
-     * <p>
-     *     Defaults to {@code false} as user has control on the header creation.
-     * </p>
-     *
-     * @return whether to validate headers
-     */
-    @Option.Configured
-    @Option.DefaultBoolean(false)
-    boolean validateResponseHeaders();
-
-    /**
-     * If set to false, any query and fragment is accepted (even containing illegal characters).
+     * Disables query and fragment syntax validation when set to {@code false}; intended only for closed systems receiving
+     * trusted, valid request targets, as behavior for invalid input is unspecified.
      * Validation of path is controlled by {@link #validatePath()}.
      *
      * @return whether to validate prologue query and fragment
@@ -113,33 +78,13 @@ interface Http1ConfigBlueprint extends ProtocolConfig {
 
 
     /**
-     * If set to false, any path is accepted (even containing illegal characters).
+     * Whether to validate path characters and HTTP/1.1 request-target forms.
      *
      * @return whether to validate path
      */
     @Option.Configured
     @Option.DefaultBoolean(true)
     boolean validatePath();
-
-    /**
-     * Logging of received packets. Uses trace and debug levels on logger of
-     * {@link Http1LoggingConnectionListener} with suffix of {@code .recv`}.
-     *
-     * @return {@code true} if logging should be enabled for received packets, {@code false} if no logging should be done
-     */
-    @Option.Configured("recv-log")
-    @Option.DefaultBoolean(true)
-    boolean receiveLog();
-
-    /**
-     * Logging of sent packets. Uses trace and debug levels on logger of
-     * {@link Http1LoggingConnectionListener} with suffix of {@code .send`}.
-     *
-     * @return {@code true} if logging should be enabled for sent packets, {@code false} if no logging should be done
-     */
-    @Option.Configured
-    @Option.DefaultBoolean(true)
-    boolean sendLog();
 
     /**
      * When true WebServer answers to expect continue with 100 continue immediately,
@@ -176,6 +121,18 @@ interface Http1ConfigBlueprint extends ProtocolConfig {
     List<Http1ConnectionListener> receiveListeners();
 
     /**
+     * Explicit {@code Alt-Svc} advertisement.
+     *
+     * @return alternative service advertisement
+     */
+    @Api.Preview
+    @Option.Configured
+    @Option.PrototypedBy("io.helidon.webserver.http.AltSvcConfig")
+    default Optional<AltSvc> altSvc() {
+        return Optional.empty();
+    }
+
+    /**
      * A single send listener, this value is computed.
      *
      * @return send listener
@@ -197,4 +154,30 @@ interface Http1ConfigBlueprint extends ProtocolConfig {
     default String type() {
         return Http1ConnectionProvider.CONFIG_NAME;
     }
+
+    /**
+     * Logging of received packets. Uses trace and debug levels on logger of
+     * {@link Http1LoggingConnectionListener} with suffix of {@code .recv`}.
+     *
+     * @return {@code true} if logging should be enabled for received packets, {@code false} if no logging should be done
+     *
+     * @deprecated use {@link #log()}
+     */
+    @Deprecated(forRemoval = true, since = "4.5.0")
+    @Option.Configured("recv-log")
+    @Option.DefaultBoolean(true)
+    boolean receiveLog();
+
+    /**
+     * Logging of sent packets. Uses trace and debug levels on logger of
+     * {@link Http1LoggingConnectionListener} with suffix of {@code .send`}.
+     *
+     * @return {@code true} if logging should be enabled for sent packets, {@code false} if no logging should be done
+     *
+     * @deprecated use {@link #log()}
+     */
+    @Deprecated(forRemoval = true, since = "4.5.0")
+    @Option.Configured
+    @Option.DefaultBoolean(true)
+    boolean sendLog();
 }

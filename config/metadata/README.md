@@ -10,7 +10,9 @@ The following modules for handling config metadata exist:
 
 - `io.helidon.config.metadata:helidon-config-metadata`: annotations to add to non-Blueprint types to generate documentation
 - `io.helidon.config.metadata:helidon-config-metadata-codegen`: code generator that reads annotations and creates `config-metadata.json`
-- `io.helidon.config.metadata:helidon-config-metadata-docs`: code generator that reads `config.metadata.json` and generates Helidon `.adoc` files that are part of Helidon Config reference documentation
+- `io.helidon.config.metadata:helidon-config-metadata-docs`: code generator
+  that reads `config.metadata.json` and generates Markdown files that are part
+  of the Helidon Config reference documentation
 
 How to handle each task is described below.
 
@@ -106,7 +108,7 @@ There are two ways to do this:
 1. go to the `config/metadata/docs` directory, and run `mvn compile exec:exec`
 2. go to the `docs` directory, and run `mvn package -Pconfigdoc`
 
-In both cases, all dependencies from `all/pom.xml` except for `helidon-logging-log4j` and `helidon-logging-slf4j` are analyzed, and documentation is updated in `docs/src/main/asciidoc/config`.
+In both cases, all dependencies from `all/pom.xml` except for `helidon-logging-log4j` and `helidon-logging-slf4j` are analyzed, and documentation is updated in `docs/config`.
 Please check the output of, as there may be warnings that point out a possible problem (such as a file that exists, but is not backed by any `config-metadata.json`).
 
 ## Output file format
@@ -169,7 +171,7 @@ defined by another type (nested types).
      "key": "key in configuration (may be missing, if this merges with parent)",
      "type": "fully qualified type of the configuration option, defaults to java.lang.String",
      "description": "description of this configuration node (expected to be non-empty)",
-     "kind": "LIST|MAP|VALUE",
+     "kind": "LIST|MAP|MAP_OR_LIST|VALUE",
      "method": "annotated method",
      "merge": true,
      "experimental": true,
@@ -194,6 +196,7 @@ defined by another type (nested types).
   * `Kind.LIST` - this is a list of values (either simple values, or objects)
   * `Kind.MAP` - this is a map of values, using keys of the map as keys, and values of the map as values, `type` defines 
      the value type (must be a simple value), key is expected to be `java.lang.String`
+  * `Kind.MAP_OR_LIST` - either the `Kind.MAP` or `Kind.LIST` configuration shape is accepted
   * `Kind.VALUE` - either a simple value (String, Long etc.) or a nested object (this is the default)
 * method - method to be called to configure this option (may be a static factory method, such as `create(Config)`, or a builder method)
 * merge - if set to `true` (default is `false`) this option's key is ignored and all its nested keys are inserted

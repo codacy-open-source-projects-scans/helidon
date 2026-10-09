@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +23,9 @@ import io.helidon.config.Config;
 import io.helidon.config.ConfigSources;
 import io.helidon.metrics.api.Counter;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
 import io.helidon.metrics.api.MetricsConfig;
 import io.helidon.metrics.api.MetricsFactory;
-import io.helidon.metrics.api.Tag;
-import io.helidon.metrics.api.Timer;
+import io.helidon.service.registry.Services;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -45,11 +43,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class SimpleMeterRegistryTests {
 
+    private static MetricsFactory metricsFactory;
     private static MeterRegistry meterRegistry;
 
     @BeforeAll
     static void prep() {
-        meterRegistry = Metrics.globalRegistry();
+        metricsFactory = Services.get(MetricsFactory.class);
+        meterRegistry = Services.get(MeterRegistry.class);
     }
 
     @Test
@@ -58,31 +58,31 @@ class SimpleMeterRegistryTests {
                    meterRegistry.getClass().getSimpleName(),
                    equalTo("MMeterRegistry"));
 
-        Counter counter = meterRegistry.getOrCreate(Counter.builder("b"));
+        Counter counter = meterRegistry.getOrCreate(metricsFactory.counterBuilder("b"));
         assertThat("Counter", counter, notNullValue());
         assertThat("Counter", counter.getClass().getSimpleName(), equalTo("MCounter"));
 
         assertThrows(IllegalArgumentException.class, () -> {
             assertThat("Meter registry before adding timer", meterRegistry.meters(), not(empty()));
-            meterRegistry.getOrCreate(Timer.builder("b"));
+            meterRegistry.getOrCreate(metricsFactory.timerBuilder("b"));
         });
     }
 
     @Test
     void testSameNameNoTags() {
-        Counter counter1 = meterRegistry.getOrCreate(Counter.builder("a"));
-        Counter counter2 = meterRegistry.getOrCreate(Counter.builder("a"));
+        Counter counter1 = meterRegistry.getOrCreate(metricsFactory.counterBuilder("a"));
+        Counter counter2 = meterRegistry.getOrCreate(metricsFactory.counterBuilder("a"));
         assertThat("Counter with same name, no tags", counter1, is(sameInstance(counter2)));
     }
 
     @Test
     void testSameNameSameTwoTags() {
-        var tags = List.of(Tag.create("foo", "1"),
-                           Tag.create("bar", "1"));
+        var tags = List.of(metricsFactory.tagCreate("foo", "1"),
+                           metricsFactory.tagCreate("bar", "1"));
 
-        Counter counter1 = meterRegistry.getOrCreate(Counter.builder("c")
+        Counter counter1 = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c")
                                                              .tags(tags));
-        Counter counter2 = meterRegistry.getOrCreate(Counter.builder("c")
+        Counter counter2 = meterRegistry.getOrCreate(metricsFactory.counterBuilder("c")
                                                              .tags(tags));
         assertThat("Counter with same name, same two tags", counter1, is(sameInstance(counter2)));
     }
@@ -91,10 +91,9 @@ class SimpleMeterRegistryTests {
     void testDisabledYieldsNoOp() {
         // Disable metrics using config.
         Config metricsDisabledConfig = Config.just(ConfigSources.create(Map.of("enabled", "false")));
-        MeterRegistry shouldBeNoOp = MetricsFactory.getInstance()
-                .createMeterRegistry(MetricsConfig.create(metricsDisabledConfig));
+        MeterRegistry shouldBeNoOp = metricsFactory.createMeterRegistry(MetricsConfig.create(metricsDisabledConfig));
 
-        Counter shouldBeNoOpCounter = shouldBeNoOp.getOrCreate(Counter.builder("shouldBeNoOpCounter"));
+        Counter shouldBeNoOpCounter = shouldBeNoOp.getOrCreate(metricsFactory.counterBuilder("shouldBeNoOpCounter"));
         assertThat("Counters after registration", shouldBeNoOp.meters(), is(emptyIterable()));
 
         shouldBeNoOpCounter.increment();
@@ -102,22 +101,45 @@ class SimpleMeterRegistryTests {
     }
 
     @Test
-    void testDisabledMeters() {
+    @SuppressWarnings("removal")
+    void testScopingFiltersAreIgnored() {
         Config config = Config.just(ConfigSources.create(Map.of("scoping.scopes.0.name", "application",
                                                                  "scoping.scopes.0.filter.exclude", ".*Ignore.*")));
-        MeterRegistry selectiveRegistry = MetricsFactory.getInstance().createMeterRegistry(MetricsConfig.create(config));
+        MeterRegistry selectiveRegistry = metricsFactory.createMeterRegistry(MetricsConfig.create(config));
+        try {
+            Counter formerlyExcluded = selectiveRegistry.getOrCreate(metricsFactory.counterBuilder("pleaseIgnoreThis"));
+            Counter included = selectiveRegistry.getOrCreate(metricsFactory.counterBuilder("pleaseIncludeThis"));
+            assertThat("Scoping filter does not suppress registration", selectiveRegistry.meters(), hasSize(2));
+            assertThat("Formerly excluded counter retrieved",
+                       selectiveRegistry.counter("pleaseIgnoreThis", List.of()),
+                       OptionalMatcher.optionalPresent());
 
-        Counter shouldBeNoOpCounter = selectiveRegistry.getOrCreate(Counter.builder("pleaseIgnoreThis"));
-        Counter shouldBeLive = selectiveRegistry.getOrCreate(Counter.builder("pleaseIncludeThis"));
-        assertThat("Counters after ignored registration", selectiveRegistry.meters(), hasSize(1));
-        assertThat("Counter retrieved",
-                   selectiveRegistry.counter("pleaseIncludeThis", List.of()),
-                   OptionalMatcher.optionalPresent());
+            formerlyExcluded.increment();
+            included.increment();
 
-        shouldBeNoOpCounter.increment();
-        shouldBeLive.increment();
+            assertThat("Incremented formerly excluded counter", formerlyExcluded.count(), is(1L));
+            assertThat("Incremented included counter", included.count(), is(1L));
+        } finally {
+            selectiveRegistry.close();
+        }
+    }
 
-        assertThat("Incremented disabled counter", shouldBeNoOpCounter.count(), is(0L));
-        assertThat("Incremented live counter", shouldBeLive.count(), is(1L));
+    @Test
+    @SuppressWarnings("removal")
+    void testConfiguredScopeDoesNotAffectMeter() {
+        Config config = Config.just(ConfigSources.create(Map.of("scoping.default", "custom",
+                                                                 "scoping.scopes.0.name", "custom",
+                                                                 "scoping.scopes.0.filter.exclude", "disabled")));
+        MeterRegistry customRegistry = metricsFactory.createMeterRegistry(MetricsConfig.create(config));
+        try {
+            Counter counter = customRegistry.getOrCreate(metricsFactory.counterBuilder("disabled"));
+            counter.increment();
+
+            assertThat("Configured default scope is ignored", counter.scope(), OptionalMatcher.optionalEmpty());
+            assertThat("Configured default scope does not add tags", counter.id().tags(), emptyIterable());
+            assertThat("Configured scope filter is ignored", counter.count(), is(1L));
+        } finally {
+            customRegistry.close();
+        }
     }
 }

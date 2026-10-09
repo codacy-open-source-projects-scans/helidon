@@ -13,8 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-
 package io.helidon.webserver.staticcontent;
 
 import java.io.IOException;
@@ -25,21 +23,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
-import java.util.function.BiConsumer;
+import java.util.Optional;
 
 import io.helidon.common.LruCache;
 import io.helidon.common.media.type.MediaType;
-import io.helidon.http.Header;
-import io.helidon.http.HeaderNames;
-import io.helidon.http.HeaderValues;
-import io.helidon.http.Method;
-import io.helidon.http.ServerResponseHeaders;
-import io.helidon.webserver.http.ServerRequest;
-import io.helidon.webserver.http.ServerResponse;
-
-import static io.helidon.webserver.staticcontent.StaticContentHandler.formatLastModified;
-import static io.helidon.webserver.staticcontent.StaticContentHandler.processEtag;
-import static io.helidon.webserver.staticcontent.StaticContentHandler.processModifyHeaders;
 
 /**
  * Handles a jar file entry.
@@ -47,25 +34,20 @@ import static io.helidon.webserver.staticcontent.StaticContentHandler.processMod
  */
 class CachedHandlerJar implements CachedHandler {
     private static final System.Logger LOGGER = System.getLogger(CachedHandlerJar.class.getName());
-    private final MediaType mediaType;
-    private final Header contentLength;
-    private final Instant lastModified;
-    private final BiConsumer<ServerResponseHeaders, Instant> setLastModifiedHeader;
+
+    private final StaticContentMetadata metadata;
     private final Path path;
     private final URL url;
+    private final SidecarCache sidecarCache;
 
-    private CachedHandlerJar(MediaType mediaType,
+    private CachedHandlerJar(StaticContentMetadata metadata,
                              URL url,
-                             long contentLength,
-                             Instant lastModified,
-                             BiConsumer<ServerResponseHeaders, Instant> setLastModifiedHeader,
-                             Path path) {
-        this.mediaType = mediaType;
+                             Path path,
+                             SidecarCache sidecarCache) {
+        this.metadata = metadata;
         this.url = url;
-        this.contentLength = HeaderValues.create(HeaderNames.CONTENT_LENGTH, true, false, contentLength);
-        this.lastModified = lastModified;
-        this.setLastModifiedHeader = setLastModifiedHeader;
         this.path = path;
+        this.sidecarCache = sidecarCache;
     }
 
     static CachedHandlerJar create(TemporaryStorage tmpStorage,
@@ -73,79 +55,64 @@ class CachedHandlerJar implements CachedHandler {
                                    Instant lastModified,
                                    MediaType mediaType,
                                    long contentLength) {
-
-        BiConsumer<ServerResponseHeaders, Instant> headerHandler = headerHandler(lastModified);
-
+        SidecarCache sidecarCache = SidecarCache.create();
         var createdTmpFile = tmpStorage.createFile();
         if (createdTmpFile.isPresent()) {
-            // extract entry
             Path tmpFile = createdTmpFile.get();
-            try (InputStream is = fileUrl.openStream()) {
-                Files.copy(is, tmpFile, StandardCopyOption.REPLACE_EXISTING);
+            try (InputStream is = ResourceConnections.openStream(fileUrl)) {
+                long extractedLength = Files.copy(is, tmpFile, StandardCopyOption.REPLACE_EXISTING);
+                if (contentLength < 0 || extractedLength == contentLength) {
+                    return new CachedHandlerJar(StaticContentMetadata.create(mediaType,
+                                                                             lastModified,
+                                                                             extractedLength),
+                                                fileUrl,
+                                                tmpFile,
+                                                sidecarCache);
+                }
             } catch (IOException e) {
-                // silently consume the exception, as the tmp file may have been removed, we may throw when reading the file
                 LOGGER.log(Level.TRACE, "Failed to create temporary extracted file for " + fileUrl, e);
             }
-            return new CachedHandlerJar(mediaType, fileUrl, contentLength, lastModified, headerHandler, tmpFile);
-        } else {
-            // use the entry always
-            return new CachedHandlerJar(mediaType, fileUrl, contentLength, lastModified, headerHandler, null);
+            try {
+                Files.deleteIfExists(tmpFile);
+            } catch (IOException e) {
+                LOGGER.log(Level.TRACE, "Failed to delete incomplete temporary extracted file for " + fileUrl, e);
+            }
         }
+        return new CachedHandlerJar(StaticContentMetadata.create(mediaType, lastModified, contentLength),
+                                    fileUrl,
+                                    null,
+                                    sidecarCache);
     }
 
     @Override
-    public boolean handle(LruCache<String, CachedHandler> cache,
-                          Method method,
-                          ServerRequest request,
-                          ServerResponse response,
-                          String requestedResource) throws IOException {
-
+    public Optional<PreparedContent> prepare(LruCache<String, CachedHandler> cache,
+                                             String requestedResource) throws IOException {
         if (LOGGER.isLoggable(Level.TRACE)) {
             LOGGER.log(Level.TRACE, "Sending static content from jar: " + requestedResource);
         }
 
-        // etag etc.
-        if (lastModified != null) {
-            processEtag(String.valueOf(lastModified.toEpochMilli()), request.headers(), response.headers());
-            processModifyHeaders(lastModified, request.headers(), response.headers(), setLastModifiedHeader);
-        }
-
-        response.headers().contentType(mediaType);
-
-        if (method == Method.GET) {
-            try {
-                if (path != null && Files.exists(path)) {
-                    FileBasedContentHandler.send(request, response, path);
-                    return true;
-                }
-            } catch (IOException e) {
-                if (LOGGER.isLoggable(Level.TRACE)) {
-                    LOGGER.log(Level.TRACE, "Failed to send jar entry from extracted path: " + path
-                                       + ", will send directly from jar",
-                               e);
+        IoSupplier<PreparedContent.Body> bodySource = () -> {
+            if (path != null && Files.isRegularFile(path)) {
+                try {
+                    return PreparedContent.channel(Files.newByteChannel(path));
+                } catch (IOException e) {
+                    if (LOGGER.isLoggable(Level.TRACE)) {
+                        LOGGER.log(Level.TRACE, "Failed to open jar entry from extracted path: " + path
+                                           + ", will send directly from jar",
+                                   e);
+                    }
                 }
             }
-            try (var in = url.openStream(); var out = response.outputStream()) {
-                // no support for ranges when using jar stream
-                in.transferTo(out);
-            }
-        } else {
-            response.headers().set(contentLength);
-            response.send();
-        }
+            return PreparedContent.stream(ResourceConnections.openStream(url));
+        };
 
-        return true;
+        return Optional.of(new PreparedContent(metadata,
+                                               null,
+                                               bodySource));
     }
 
-    private static BiConsumer<ServerResponseHeaders, Instant> headerHandler(Instant lastModified) {
-        if (lastModified == null) {
-            return (headers, instant) -> {
-            };
-        }
-        Header instantHeader = HeaderValues.create(HeaderNames.LAST_MODIFIED,
-                                                   true,
-                                                   false,
-                                                   formatLastModified(lastModified));
-        return (headers, instant) -> headers.set(instantHeader);
+    @Override
+    public SidecarCache sidecarCache() {
+        return sidecarCache;
     }
 }

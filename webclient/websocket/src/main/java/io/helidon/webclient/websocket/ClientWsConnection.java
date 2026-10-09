@@ -19,6 +19,7 @@ package io.helidon.webclient.websocket;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -26,7 +27,9 @@ import io.helidon.common.buffers.BufferData;
 import io.helidon.common.buffers.DataReader;
 import io.helidon.common.socket.HelidonSocket;
 import io.helidon.common.socket.SocketContext;
+import io.helidon.http.HttpTransportObserver.ConnectionOutcome;
 import io.helidon.webclient.api.ClientConnection;
+import io.helidon.webclient.api.HttpTransportObserverSupport;
 import io.helidon.websocket.ClientWsFrame;
 import io.helidon.websocket.ServerWsFrame;
 import io.helidon.websocket.WsCloseCodes;
@@ -44,22 +47,33 @@ public class ClientWsConnection implements WsSession, Runnable {
 
     private final WsListener listener;
     private final String subProtocol;
+    private final WsClientProtocolConfig protocolConfig;
     private final BufferData sendBuffer = BufferData.growing(1024);
     private final ClientConnection connection;
     private final HelidonSocket helidonSocket;
     private final Lock sendLock = new ReentrantLock();
+    private final AtomicReference<ConnectionOutcome> closeInitiator = new AtomicReference<>();
+    private final AtomicBoolean closeSent = new AtomicBoolean();
+    private final AtomicBoolean closeNotified = new AtomicBoolean();
 
     private ContinuationType recvContinuation = ContinuationType.NONE;
     private boolean sendContinuation;
-    private final AtomicBoolean closeSent = new AtomicBoolean();
     private boolean terminated;
 
     ClientWsConnection(ClientConnection connection,
                        WsListener listener,
                        String subProtocol) {
+        this(connection, listener, subProtocol, WsClientProtocolConfig.create());
+    }
+
+    ClientWsConnection(ClientConnection connection,
+                       WsListener listener,
+                       String subProtocol,
+                       WsClientProtocolConfig protocolConfig) {
         this.connection = connection;
         this.listener = listener;
         this.subProtocol = subProtocol;
+        this.protocolConfig = protocolConfig;
         this.helidonSocket = connection.helidonSocket();
     }
 
@@ -101,6 +115,7 @@ public class ClientWsConnection implements WsSession, Runnable {
         try {
             doRun();
         } catch (Exception e) {
+            HttpTransportObserverSupport.connectionFailed(connection, e);
             try {
                 listener.onError(this, e);
                 this.close(WsCloseCodes.UNEXPECTED_CONDITION, e.getMessage());
@@ -111,6 +126,10 @@ public class ClientWsConnection implements WsSession, Runnable {
                 }
             }
         } finally {
+            ConnectionOutcome outcome = closeInitiator.get();
+            if (outcome != null) {
+                HttpTransportObserverSupport.connectionOutcome(connection, outcome);
+            }
             connection.closeResource();
         }
     }
@@ -166,10 +185,16 @@ public class ClientWsConnection implements WsSession, Runnable {
      */
     @Override
     public WsSession close(int code, String reason) {
+        closeInitiated(ConnectionOutcome.LOCAL_CLOSE);
         if (!closeSent.compareAndSet(false, true)) {
             return this;
         }
 
+        sendClose(code, reason);
+        return this;
+    }
+
+    private void sendClose(int code, String reason) {
         sendLock.lock();
         try {
             // send empty close (no code or reason) if code is negative
@@ -185,7 +210,6 @@ public class ClientWsConnection implements WsSession, Runnable {
         } finally {
             sendLock.unlock();
         }
-        return this;
     }
 
     @Override
@@ -199,6 +223,11 @@ public class ClientWsConnection implements WsSession, Runnable {
     @Override
     public Optional<String> subProtocol() {
         return Optional.ofNullable(subProtocol);
+    }
+
+    @Override
+    public WsClientProtocolConfig protocolConfig() {
+        return protocolConfig;
     }
 
     @Override
@@ -246,34 +275,60 @@ public class ClientWsConnection implements WsSession, Runnable {
         sendBuffer.write(maskingKey[2]);
         sendBuffer.write(maskingKey[3]);
         sendBuffer.write(frame.maskedData());
-        connection.writer().writeNow(sendBuffer);
+        try {
+            connection.writer().writeNow(sendBuffer);
+        } catch (RuntimeException e) {
+            HttpTransportObserverSupport.connectionFailed(connection, e);
+            throw e;
+        }
         return this;
     }
 
     private void doRun() {
         listener.onOpen(this);
         while (!terminated) {
+            boolean frameStarted = false;
             try {
+                connection.reader().ensureAvailable();
+                frameStarted = true;
                 ServerWsFrame frame = readFrame();
                 if (!processFrame(frame)) {
                     return;
                 }
             } catch (DataReader.InsufficientDataAvailableException e) {
+                if (frameStarted) {
+                    HttpTransportObserverSupport.connectionFailed(connection, e);
+                } else {
+                    closeInitiated(ConnectionOutcome.REMOTE_CLOSE);
+                }
                 return;
             } catch (WsCloseException e) {
-                if (!closeSent.get()) {
-                    try {
-                        close(e.closeCode(), e.getMessage());
-                    } catch (Exception ex) {
-                        // we may receive an exception if the remote site closed the connection already
-                        if (LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
-                            helidonSocket.log(LOGGER,
-                                              System.Logger.Level.DEBUG,
-                                              "Failed to send close, remote probably closed connection",
-                                              ex);
+                if (e.closeCode() != WsCloseCodes.NORMAL_CLOSE) {
+                    HttpTransportObserverSupport.connectionFailed(connection, e);
+                }
+                boolean notifyClose = closeNotified.compareAndSet(false, true);
+                boolean closeReserved = closeSent.compareAndSet(false, true);
+                try {
+                    if (notifyClose) {
+                        listener.onClose(this, e.closeCode(), e.getMessage());
+                    }
+                } finally {
+                    if (closeReserved) {
+                        closeInitiated(ConnectionOutcome.LOCAL_CLOSE);
+                        try {
+                            sendClose(e.closeCode(), e.getMessage());
+                        } catch (Exception ex) {
+                            // we may receive an exception if the remote site closed the connection already
+                            if (LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
+                                helidonSocket.log(LOGGER,
+                                                  System.Logger.Level.DEBUG,
+                                                  "Failed to send close, remote probably closed connection",
+                                                  ex);
+                            }
                         }
                     }
                 }
+                return;
             } catch (Exception e) {
                 if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
                     LOGGER.log(System.Logger.Level.TRACE, "Failed while reading or processing frames", e);
@@ -310,6 +365,7 @@ public class ClientWsConnection implements WsSession, Runnable {
             listener.onMessage(this, payload, frame.fin());
         }
         case CLOSE -> {
+            closeInitiated(ConnectionOutcome.REMOTE_CLOSE);
             int status = payload.readInt16();
             String reason;
             if (payload.available() > 0) {
@@ -317,8 +373,13 @@ public class ClientWsConnection implements WsSession, Runnable {
             } else {
                 reason = "normal";
             }
-            listener.onClose(this, status, reason);
-            throw new WsCloseException("normal", WsCloseCodes.NORMAL_CLOSE);
+            if (closeNotified.compareAndSet(false, true)) {
+                listener.onClose(this, status, reason);
+            }
+            if (!closeSent.get()) {
+                close(WsCloseCodes.NORMAL_CLOSE, "normal");
+            }
+            return false;
         }
         case PING -> listener.onPing(this, payload);
         case PONG -> listener.onPong(this, payload);
@@ -331,9 +392,14 @@ public class ClientWsConnection implements WsSession, Runnable {
         try {
             return ServerWsFrame.read(helidonSocket, connection.reader(), Integer.MAX_VALUE);
         } catch (WsCloseException e) {
+            HttpTransportObserverSupport.connectionFailed(connection, e);
             close(e.closeCode(), e.getMessage());
             throw e;
         }
+    }
+
+    private void closeInitiated(ConnectionOutcome outcome) {
+        closeInitiator.compareAndSet(null, outcome);
     }
 
     private enum ContinuationType {

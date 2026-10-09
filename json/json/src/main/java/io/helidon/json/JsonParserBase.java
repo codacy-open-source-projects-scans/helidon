@@ -17,12 +17,19 @@
 package io.helidon.json;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+
+import io.helidon.common.Api;
 
 /**
  * Base implementation of {@link JsonParser}.
  */
+@Api.Preview
 public abstract class JsonParserBase implements JsonParser {
+
+    private int nestingDepth;
+    private BigIntegerExpansionBudget bigIntegerExpansionBudget;
 
     /**
      * Protected default constructor for subclasses.
@@ -51,66 +58,50 @@ public abstract class JsonParserBase implements JsonParser {
         if (currentByte() != '{') {
             throw createException("Object start expected", currentByte());
         }
-        byte b = nextToken();
-        if (b == '}') {
-            return JsonObject.EMPTY_OBJECT;
-        }
-        List<JsonObject.Pair> pairs = new ArrayList<>();
-        while (hasNext()) {
-            JsonString key;
-            if (b == '"') {
-                key = readJsonString();
-            } else {
-                throw createException("Key name start expected", b);
-            }
-            b = nextToken();
-            if (b != ':') {
-                throw createException("Colon expected", b);
-            }
-            b = nextToken();
-            switch (b) {
-            case '"':
-                pairs.add(new JsonObject.Pair(key, readJsonString()));
-                break;
-            case '{':
-                pairs.add(new JsonObject.Pair(key, readJsonObject()));
-                break;
-            case '[':
-                pairs.add(new JsonObject.Pair(key, readJsonArray()));
-                break;
-            case '-':
-            case '0':
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-            case '8':
-            case '9':
-                pairs.add(new JsonObject.Pair(key, readJsonNumber()));
-                break;
-            case 'n':
-                checkNull();
-                pairs.add(new JsonObject.Pair(key, JsonNull.instance()));
-                break;
-            case 't':
-            case 'f':
-                pairs.add(new JsonObject.Pair(key, JsonBoolean.create(readBoolean())));
-                break;
-            default:
-                throw createException("Unexpected json value type", b);
-            }
-            b = nextToken();
+        enterStructure();
+        try {
+            byte b = nextToken();
             if (b == '}') {
-                return JsonObject.create(pairs);
-            } else if (b != ',') {
-                throw createException("Comma or object end expected", b);
+                return JsonObject.EMPTY_OBJECT;
             }
-            b = nextToken();
+            LinkedHashMap<String, JsonValue> values = new LinkedHashMap<>();
+            while (hasNext()) {
+                String key;
+                if (b == '"') {
+                    key = readString();
+                } else {
+                    throw createException("Key name start expected", b);
+                }
+                b = nextToken();
+                if (b != ':') {
+                    throw createException("Colon expected", b);
+                }
+                b = nextToken();
+                JsonValue value = switch (b) {
+                case '"' -> readJsonString();
+                case '{' -> readJsonObject();
+                case '[' -> readJsonArray();
+                case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9' -> readJsonNumber();
+                case 'n' -> {
+                    checkNull();
+                    yield JsonNull.instance();
+                }
+                case 't', 'f' -> JsonBoolean.create(readBoolean());
+                default -> throw createException("Unexpected json value type", b);
+                };
+                values.put(key, value);
+                b = nextToken();
+                if (b == '}') {
+                    return JsonObject.createFromOwnedMap(values);
+                } else if (b != ',') {
+                    throw createException("Comma or object end expected", b);
+                }
+                b = nextToken();
+            }
+            throw createException("Unexpected end of the object. Possibly incomplete JSON");
+        } finally {
+            exitStructure();
         }
-        throw createException("Unexpected end of the object. Possibly incomplete JSON");
     }
 
     @Override
@@ -118,55 +109,86 @@ public abstract class JsonParserBase implements JsonParser {
         if (currentByte() != '[') {
             throw createException("Array start expected", currentByte());
         }
-        byte b = nextToken();
-        if (b == ']') {
-            return JsonArray.EMPTY_ARRAY;
-        }
-        List<JsonValue> values = new ArrayList<>();
-        while (hasNext()) {
-            switch (b) {
-            case '"':
-                values.add(readJsonString());
-                break;
-            case '{':
-                values.add(readJsonObject());
-                break;
-            case '[':
-                values.add(readJsonArray());
-                break;
-            case '-':
-            case '0':
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-            case '8':
-            case '9':
-                values.add(readJsonNumber());
-                break;
-            case 'n':
-                checkNull();
-                values.add(JsonNull.instance());
-                break;
-            case 't':
-            case 'f':
-                values.add(JsonBoolean.create(readBoolean()));
-                break;
-            default:
-                throw createException("Invalid JSON value type", b);
-            }
-            b = nextToken();
+        enterStructure();
+        try {
+            byte b = nextToken();
             if (b == ']') {
-                return JsonArray.create(values);
-            } else if (b != ',') {
-                throw createException("Comma or array end expected", b);
+                return JsonArray.EMPTY_ARRAY;
             }
-            b = nextToken();
+            List<JsonValue> values = new ArrayList<>();
+            while (hasNext()) {
+                switch (b) {
+                case '"':
+                    values.add(readJsonString());
+                    break;
+                case '{':
+                    values.add(readJsonObject());
+                    break;
+                case '[':
+                    values.add(readJsonArray());
+                    break;
+                case '-':
+                case '0':
+                case '1':
+                case '2':
+                case '3':
+                case '4':
+                case '5':
+                case '6':
+                case '7':
+                case '8':
+                case '9':
+                    values.add(readJsonNumber());
+                    break;
+                case 'n':
+                    checkNull();
+                    values.add(JsonNull.instance());
+                    break;
+                case 't':
+                case 'f':
+                    values.add(JsonBoolean.create(readBoolean()));
+                    break;
+                default:
+                    throw createException("Invalid JSON value type", b);
+                }
+                b = nextToken();
+                if (b == ']') {
+                    return JsonArray.createFromOwnedList(values);
+                } else if (b != ',') {
+                    throw createException("Comma or array end expected", b);
+                }
+                b = nextToken();
+            }
+            throw createException("Unexpected end of the array. Possibly incomplete JSON");
+        } finally {
+            exitStructure();
         }
-        throw createException("Unexpected end of the array. Possibly incomplete JSON");
+    }
+
+    /**
+     * Records entry into an object or array structure.
+     */
+    final void enterStructure() {
+        if (nestingDepth >= MAX_NESTING_DEPTH) {
+            throw createException("Maximum JSON nesting depth exceeded");
+        }
+        nestingDepth++;
+    }
+
+    /**
+     * Records exit from an object or array structure.
+     */
+    final void exitStructure() {
+        nestingDepth--;
+    }
+
+    final BigIntegerExpansionBudget bigIntegerExpansionBudget() {
+        BigIntegerExpansionBudget budget = bigIntegerExpansionBudget;
+        if (budget == null) {
+            budget = new BigIntegerExpansionBudget();
+            bigIntegerExpansionBudget = budget;
+        }
+        return budget;
     }
 
 }

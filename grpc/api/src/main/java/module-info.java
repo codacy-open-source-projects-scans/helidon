@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,8 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/**
+ * Helidon gRPC API module.
+ */
 module io.helidon.grpc.api {
 
+    requires io.helidon.common;
+    requires io.helidon.service.registry;
     requires transitive io.grpc;
 
     exports io.helidon.grpc.api;

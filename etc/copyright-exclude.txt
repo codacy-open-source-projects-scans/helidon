@@ -47,7 +47,6 @@
 archetypes/
 conf/secrets/
 config/metadata/docs/src/test/resources/
-docs/src/main/asciidoc/config
 empty_file
 etc/dependency-check-suppression.xml
 etc/HELIDON_THIRD_PARTY_LICENSES.xml
@@ -59,5 +58,8 @@ persistence_3_0.xjb
 persistence_3_0.xsd
 src/main/proto/
 src/test/resources/keystore/
+src/test/resources/web/resource.txt.br
+src/test/resources/web/resource.txt.gz
+src/test/resources/web/resource.txt.zz
 src/test/resources/static/classpath/index.html
 target/

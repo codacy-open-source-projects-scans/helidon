@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,7 +58,8 @@ final class MetricCounter extends MetricService<Counter> {
 
     @Override
     protected Counter metric(MeterRegistry registry, MeterMetadata meta) {
-        return registry.getOrCreate(meta.apply(Counter.builder(meta.name())));
+        return registry.getOrCreate(meta.apply(metricsFactory().counterBuilder(meta.name()))
+                                            .origin(DbClientMetrics.class.getName()));
     }
 
     @Override
@@ -69,6 +70,7 @@ final class MetricCounter extends MetricService<Counter> {
     /**
      * Fluent API builder for {@link MetricCounter}.
      */
+    @SuppressWarnings("removal")
     static class Builder extends DbClientMetricBuilder<Builder, MetricCounter> {
 
         @Override

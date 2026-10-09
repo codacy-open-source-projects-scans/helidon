@@ -44,7 +44,8 @@ public final class HeaderNames {
      * This header is no longer sent by browsers, and it should be ignored by servers.
      * Character sets that are accepted.
      */
-    public static final HeaderName ACCEPT_CHARSET = HeaderNameEnum.ACCEPT_CHARSET;
+    // RFC 9110 deprecates this header, so it is intentionally not indexed.
+    public static final HeaderName ACCEPT_CHARSET = createNonIndexed(ACCEPT_CHARSET_NAME);
     /**
      * The {@value} header name.
      * List of acceptedTypes encodings.
@@ -343,7 +344,7 @@ public final class HeaderNames {
      */
     public static final String REFRESH_NAME = Strings.REFRESH_NAME;
     /**
-     * The {@value #REFERER_NAME} header name.
+     * The {@value #REFRESH_NAME} header name.
      */
     public static final HeaderName REFRESH = HeaderNameEnum.REFRESH;
     /**
@@ -396,6 +397,18 @@ public final class HeaderNames {
     public static final HeaderName ACCEPT_PATCH = HeaderNameEnum.ACCEPT_PATCH;
     /**
      * The {@value} header name.
+     * Specifies the media types this resource supports for {@link Method#QUERY} request content.
+     */
+    public static final String ACCEPT_QUERY_NAME = Strings.ACCEPT_QUERY_NAME;
+    /**
+     * The {@value #ACCEPT_QUERY_NAME} header name.
+     * Specifies the media types this resource supports for {@link Method#QUERY} request content.
+     * <p>
+     * This specialized response header is not part of the indexed known-header set.
+     */
+    public static final HeaderName ACCEPT_QUERY = createNonIndexed(ACCEPT_QUERY_NAME);
+    /**
+     * The {@value} header name.
      * What partial content range types this server supports via byte serving.
      */
     public static final String ACCEPT_RANGES_NAME = Strings.ACCEPT_RANGES_NAME;
@@ -436,6 +449,18 @@ public final class HeaderNames {
      * accessed at a different network location (host or port) or using a different protocol.
      */
     public static final HeaderName ALT_SVC = HeaderNameEnum.ALT_SVC;
+    /**
+     * The {@value} header name.
+     * Identifies the alternative service used for a request.
+     */
+    public static final String ALT_USED_NAME = Strings.ALT_USED_NAME;
+    /**
+     * The {@value #ALT_USED_NAME} header name.
+     * Identifies the alternative service used for a request.
+     * <p>
+     * This infrequently used header is not part of the indexed known-header set.
+     */
+    public static final HeaderName ALT_USED = createNonIndexed(ALT_USED_NAME);
     /**
      * The {@value} header name.
      * Tells all caching mechanisms from server to client whether they may cache this object. It is measured in seconds.
@@ -607,7 +632,8 @@ public final class HeaderNames {
      * The {@value #PUBLIC_KEY_PINS_NAME} header name.
      * HTTP Public Key Pinning, announces hash of website's authentic TLS certificate.
      */
-    public static final HeaderName PUBLIC_KEY_PINS = HeaderNameEnum.PUBLIC_KEY_PINS;
+    // Browser support for RFC 7469 was removed because HPKP had low adoption and denial-of-service risks.
+    public static final HeaderName PUBLIC_KEY_PINS = createNonIndexed(PUBLIC_KEY_PINS_NAME);
     /**
      * The {@value} header name.
      * If an entity is temporarily unavailable, this instructs the client to try again later. Value could be a specified
@@ -649,7 +675,8 @@ public final class HeaderNames {
      * The {@value #SET_COOKIE2_NAME} header name.
      * An HTTP cookie set directive.
      */
-    public static final HeaderName SET_COOKIE2 = HeaderNameEnum.SET_COOKIE2;
+    // RFC 6265 obsoletes RFC 2965 and this header, so it is intentionally not indexed.
+    public static final HeaderName SET_COOKIE2 = createNonIndexed(SET_COOKIE2_NAME);
     /**
      * The {@value} header name.
      * A HSTS Policy informing The {@code HTTP client} how long to cache the HTTPS only policy and whether this applies to
@@ -687,15 +714,21 @@ public final class HeaderNames {
      */
     public static final HeaderName TRANSFER_ENCODING = HeaderNameEnum.TRANSFER_ENCODING;
     /**
-     * The {@value} header name.
-     * Tracking Status Value, value suggested to be sent in response to a DNT(do-not-track).
+     * The {@value} name of the tracking status value ABNF production from the retired DNT specification.
+     *
+     * @deprecated The retired DNT specification defines {@value} as an ABNF production for values of the
+     *             {@code Tk} header field, not as an HTTP header field name
      */
+    @Deprecated(since = "27.0.0", forRemoval = true)
     public static final String TSV_NAME = Strings.TSV_NAME;
     /**
-     * The {@value #TSV_NAME} header name.
-     * Tracking Status Value, value suggested to be sent in response to a DNT(do-not-track).
+     * Legacy header-name representation of the {@value #TSV_NAME} ABNF production name.
+     *
+     * @deprecated The retired DNT specification defines {@value #TSV_NAME} as an ABNF production for values of the
+     *             {@code Tk} header field, not as an HTTP header field name
      */
-    public static final HeaderName TSV = HeaderNameEnum.TSV;
+    @Deprecated(since = "27.0.0", forRemoval = true)
+    public static final HeaderName TSV = createNonIndexed(TSV_NAME);
     /**
      * The {@value} header name.
      * Ask to upgrade to another protocol.
@@ -727,7 +760,8 @@ public final class HeaderNames {
      * The {@value #WARNING_NAME} header name.
      * A general warning about possible problems with the entity body.
      */
-    public static final HeaderName WARNING = HeaderNameEnum.WARNING;
+    // RFC 9111 obsoletes this header, so it is intentionally not indexed.
+    public static final HeaderName WARNING = createNonIndexed(WARNING_NAME);
     /**
      * The {@value} header name.
      * Indicates the authentication scheme that should be used to access the requested entity.
@@ -866,6 +900,10 @@ public final class HeaderNames {
         } else {
             return headerName;
         }
+    }
+
+    private static HeaderName createNonIndexed(String name) {
+        return new HeaderNameImpl(Ascii.toLowerCase(name), name);
     }
 
 }

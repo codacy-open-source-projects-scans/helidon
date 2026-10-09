@@ -16,13 +16,28 @@
 
 package io.helidon.webserver.grpc;
 
+import java.util.Map;
+
+import io.helidon.common.Api;
 import io.helidon.config.Config;
+import io.helidon.config.ConfigSources;
+import io.helidon.config.MergedConfig;
 import io.helidon.webserver.spi.ProtocolConfigProvider;
 
 /**
  * Implementation of a service provider interface to create grpc protocol configuration.
  */
 public class GrpcProtocolConfigProvider implements ProtocolConfigProvider<GrpcConfig> {
+    private static final Config DISCOVERY_DISABLED_CONFIG = Config.just(ConfigSources.create(
+            Map.of("grpc-services-discover-services", "false")));
+
+    /**
+     * Required public constructor for {@link java.util.ServiceLoader}.
+     */
+    @Api.Internal
+    public GrpcProtocolConfigProvider() {
+    }
+
     @Override
     public String configKey() {
         return GrpcProtocolProvider.CONFIG_NAME;
@@ -31,7 +46,7 @@ public class GrpcProtocolConfigProvider implements ProtocolConfigProvider<GrpcCo
     @Override
     public GrpcConfig create(Config config, String name) {
         return GrpcConfig.builder()
-                .config(config)
+                .config(MergedConfig.create(DISCOVERY_DISABLED_CONFIG, config))
                 .name(name)
                 .build();
     }

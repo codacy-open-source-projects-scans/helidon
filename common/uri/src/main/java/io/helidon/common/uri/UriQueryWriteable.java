@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,12 @@ package io.helidon.common.uri;
 import java.util.List;
 import java.util.function.Consumer;
 
+import io.helidon.common.Api;
+
 /**
  * Mutable HTTP query.
  */
+@Api.Stable
 public interface UriQueryWriteable extends UriQuery {
     /**
      * Create a new HTTP Query to write parameter into.
@@ -89,6 +92,9 @@ public interface UriQueryWriteable extends UriQuery {
      * <p>
      * This documentation (and behavior) has been changed, as we cannot create a proper query from {@code decoded} values,
      *  as these may contain characters used to split the query.
+     * Malformed percent-encoded sequences are preserved literally when parameter names and values are decoded.
+     * Use {@link UriValidator#validateQuery(String)} for strict query validation before updating this instance.
+     *
      * @param queryString encoded query string to update this instance
      */
     void fromQueryString(String queryString);

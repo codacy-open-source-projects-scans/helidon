@@ -128,6 +128,7 @@ class MetricsConfigSupport {
     static class BuilderDecorator implements Prototype.BuilderDecorator<MetricsConfig.BuilderBase<?, ?>> {
 
         @Override
+        @SuppressWarnings("removal")
         public void decorate(MetricsConfig.BuilderBase<?, ?> builder) {
             if (builder.config().isEmpty()) {
                 builder.config(Services.get(Config.class).get(MetricsConfigBlueprint.METRICS_CONFIG_KEY));
@@ -141,11 +142,4 @@ class MetricsConfigSupport {
         }
     }
 
-    static class RestRequestEnabledDecorator implements Prototype.OptionDecorator<MetricsConfig.BuilderBase<?, ?>, Optional<Boolean>> {
-
-        @Override
-        public void decorate(MetricsConfig.BuilderBase<?, ?> builder, Optional<Boolean> optionValue) {
-            optionValue.ifPresent(builder::restRequestEnabled);
-        }
-    }
 }

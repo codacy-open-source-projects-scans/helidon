@@ -27,18 +27,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import io.helidon.common.Errors;
 import io.helidon.common.HelidonServiceLoader;
-import io.helidon.common.LruCache;
+import io.helidon.common.LazyValue;
 import io.helidon.common.Weight;
 import io.helidon.common.context.Context;
 import io.helidon.common.context.Contexts;
+import io.helidon.common.crypto.CryptoException;
 import io.helidon.common.mapper.OptionalValue;
 import io.helidon.common.parameters.Parameters;
 import io.helidon.config.Config;
+import io.helidon.faulttolerance.CircuitBreaker;
+import io.helidon.faulttolerance.ResilientValue;
+import io.helidon.faulttolerance.ResilientValueConfig;
+import io.helidon.faulttolerance.Retry;
+import io.helidon.faulttolerance.Timeout;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.ServerRequestHeaders;
@@ -50,11 +58,13 @@ import io.helidon.security.Security;
 import io.helidon.security.SecurityException;
 import io.helidon.security.jwt.EncryptedJwt;
 import io.helidon.security.jwt.Jwt;
+import io.helidon.security.jwt.JwtException;
 import io.helidon.security.jwt.JwtHeaders;
 import io.helidon.security.jwt.SignedJwt;
 import io.helidon.security.jwt.jwk.JwkKeys;
 import io.helidon.security.providers.oidc.common.OidcConfig;
 import io.helidon.security.providers.oidc.common.OidcCookieHandler;
+import io.helidon.security.providers.oidc.common.RedirectAttemptCounterStrategy;
 import io.helidon.security.providers.oidc.common.Tenant;
 import io.helidon.security.providers.oidc.common.TenantConfig;
 import io.helidon.security.providers.oidc.common.spi.TenantConfigFinder;
@@ -150,8 +160,7 @@ public final class OidcFeature implements HttpFeature {
     private static final String STATE_PARAM_NAME = "state";
     private static final String DEFAULT_REDIRECT = "/index.html";
 
-    private final List<TenantConfigFinder> oidcConfigFinders;
-    private final LruCache<String, Tenant> tenants = LruCache.create();
+    private final TenantCache<Tenant> tenants;
     private final OidcConfig oidcConfig;
     private final OidcCookieHandler tokenCookieHandler;
     private final OidcCookieHandler idTokenCookieHandler;
@@ -168,15 +177,15 @@ public final class OidcFeature implements HttpFeature {
             this.refreshTokenCookieHandler = oidcConfig.refreshTokenCookieHandler();
             this.tenantCookieHandler = oidcConfig.tenantCookieHandler();
             this.stateCookieHandler = oidcConfig.stateCookieHandler();
-            this.oidcConfigFinders = List.copyOf(builder.tenantConfigFinders);
-            this.oidcConfigFinders.forEach(tenantConfigFinder -> tenantConfigFinder.onChange(tenants::remove));
+            oidcConfig.validateForAuthentication();
+            this.tenants = new TenantCache<>(builder.tenantConfigFinders, oidcConfig, this::tenantSupplier);
         } else {
             this.tokenCookieHandler = null;
             this.idTokenCookieHandler = null;
             this.refreshTokenCookieHandler = null;
             this.tenantCookieHandler = null;
             this.stateCookieHandler = null;
-            this.oidcConfigFinders = List.of();
+            this.tenants = new TenantCache<>(List.of(), oidcConfig, this::tenantSupplier);
         }
     }
 
@@ -280,27 +289,6 @@ public final class OidcFeature implements HttpFeature {
     }
 
     private void processTenantLogout(ServerRequest req, ServerResponse res, String tenantName) {
-        Tenant tenant = obtainCurrentTenant(tenantName);
-
-        logoutWithTenant(req, res, tenant);
-    }
-
-    private Tenant obtainCurrentTenant(String tenantName) {
-        Optional<Tenant> maybeTenant = tenants.get(tenantName);
-        if (maybeTenant.isPresent()) {
-            return maybeTenant.get();
-        } else {
-            Tenant tenant = oidcConfigFinders.stream()
-                    .map(finder -> finder.config(tenantName))
-                    .flatMap(Optional::stream)
-                    .map(tenantConfig -> Tenant.create(oidcConfig, tenantConfig))
-                    .findFirst()
-                    .orElseGet(() -> Tenant.create(oidcConfig, oidcConfig.tenantConfig(tenantName)));
-            return tenants.computeValue(tenantName, () -> Optional.of(tenant)).get();
-        }
-    }
-
-    private void logoutWithTenant(ServerRequest req, ServerResponse res, Tenant tenant) {
         OptionalValue<String> idTokenCookie = req.headers()
                 .cookies()
                 .first(idTokenCookieHandler.cookieName());
@@ -312,23 +300,107 @@ public final class OidcFeature implements HttpFeature {
             return;
         }
 
-        String encryptedIdToken = idTokenCookie.get();
+        OptionalValue<String> state = req.query().first(STATE_PARAM_NAME);
+        String stateQuery = null;
+        if (state.isPresent()) {
+            String stateValue = state.get();
+            try {
+                HeaderValues.create(HeaderNames.LOCATION, "&" + STATE_PARAM_NAME + "=" + stateValue).validate();
+            } catch (IllegalArgumentException e) {
+                LOGGER.log(Level.TRACE, "Invalid OIDC logout state query parameter", e);
+                res.status(Status.BAD_REQUEST_400)
+                        .send();
+                return;
+            }
+            stateQuery = "&" + STATE_PARAM_NAME + "=" + encode(stateValue);
+        }
 
+        Optional<Tenant> tenant;
         try {
-            String idToken = idTokenCookieHandler.decrypt(encryptedIdToken);
-            StringBuilder sb = new StringBuilder(tenant.logoutEndpointUri()
-                                                         + "?id_token_hint="
-                                                         + idToken
-                                                         + "&post_logout_redirect_uri=" + postLogoutUri(req));
+            tenant = obtainCurrentTenant(tenantName);
+        } catch (ResilientValue.UnavailableException _) {
+            clearLocalOidcCookies(res.headers());
+            sendUnavailableTenantResponse(res);
+            return;
+        }
+        if (tenant.isEmpty()) {
+            clearLocalOidcCookies(res.headers());
+            sendUnknownTenantResponse(res);
+            return;
+        }
 
-            req.query().first("state")
-                    .ifPresent(it -> sb.append("&state=").append(it));
+        logoutWithTenant(req, res, tenant.get(), idTokenCookie.get(), stateQuery);
+    }
+
+    private Optional<Tenant> obtainCurrentTenant(String tenantName) {
+        return cachedTenant(tenantName)
+                .map(Supplier::get);
+    }
+
+    private Optional<Supplier<Tenant>> cachedTenant(String tenantName) {
+        return tenants.get(tenantName);
+    }
+
+    private Supplier<Tenant> tenantSupplier(TenantConfig tenantConfig) {
+        oidcConfig.validateTenantForAuthentication(tenantConfig);
+        Supplier<Tenant> loader = () -> Tenant.create(oidcConfig, tenantConfig);
+        if (!tenantConfig.tenantLoadingLazy()) {
+            return LazyValue.create(loader);
+        }
+        return ResilientValue.create(new ResilientConfig<>("OIDC web feature tenant",
+                                                           loader,
+                                                           tenantConfig.jwkRetry(),
+                                                           tenantConfig.jwkCircuitBreaker(),
+                                                           tenantConfig.jwkTimeout()));
+    }
+
+    private void logoutWithTenant(ServerRequest req,
+                                  ServerResponse res,
+                                  Tenant tenant,
+                                  String encryptedIdToken,
+                                  String stateQuery) {
+        try {
+            String idToken;
+            try {
+                idToken = idTokenCookieHandler.decrypt(encryptedIdToken);
+                JwtHeaders jwtHeaders = JwtHeaders.parseToken(idToken);
+                if (jwtHeaders.encryption().isPresent()) {
+                    EncryptedJwt.parseToken(jwtHeaders, idToken);
+                } else {
+                    SignedJwt.parseToken(jwtHeaders, idToken);
+                }
+            } catch (CryptoException
+                     | IllegalArgumentException
+                     | JwtException
+                     | Errors.ErrorMessagesException e) {
+                if (LOGGER.isLoggable(Level.TRACE)) {
+                    LOGGER.log(Level.TRACE, "Invalid OIDC logout ID token cookie", e);
+                }
+                clearLocalOidcCookies(res.headers());
+                res.status(Status.BAD_REQUEST_400)
+                        .send();
+                return;
+            }
+
+            URI logoutEndpoint = tenant.logoutEndpointUri();
+            String logoutQuery = logoutEndpoint.getRawQuery();
+            String querySeparator = "?";
+            if (logoutQuery != null) {
+                querySeparator = logoutQuery.isEmpty() || logoutQuery.endsWith("&") ? "" : "&";
+            }
+            StringBuilder sb = new StringBuilder(logoutEndpoint.toString())
+                    .append(querySeparator)
+                    .append("id_token_hint=")
+                    .append(encode(idToken))
+                    .append("&post_logout_redirect_uri=")
+                    .append(postLogoutUri(req));
+
+            if (stateQuery != null) {
+                sb.append(stateQuery);
+            }
 
             ServerResponseHeaders headers = res.headers();
-            headers.addCookie(tokenCookieHandler.removeCookie().build());
-            headers.addCookie(idTokenCookieHandler.removeCookie().build());
-            headers.addCookie(tenantCookieHandler.removeCookie().build());
-            headers.addCookie(refreshTokenCookieHandler.removeCookie().build());
+            clearLocalOidcCookies(headers);
 
             res.status(Status.TEMPORARY_REDIRECT_307)
                     .header(HeaderNames.LOCATION, sb.toString())
@@ -336,6 +408,13 @@ public final class OidcFeature implements HttpFeature {
         } catch (Exception e) {
             sendError(res, e);
         }
+    }
+
+    private void clearLocalOidcCookies(ServerResponseHeaders headers) {
+        headers.addCookie(tokenCookieHandler.removeCookie().build());
+        headers.addCookie(idTokenCookieHandler.removeCookie().build());
+        headers.addCookie(tenantCookieHandler.removeCookie().build());
+        headers.addCookie(refreshTokenCookieHandler.removeCookie().build());
     }
 
     private void addRequestAsHeader(ServerRequest req, ServerResponse res) {
@@ -373,12 +452,6 @@ public final class OidcFeature implements HttpFeature {
 
     private void processCode(String code, ServerRequest req, ServerResponse res) {
         String tenantName = req.query().first(oidcConfig.tenantParamName()).orElse(TenantConfigFinder.DEFAULT_TENANT_ID);
-        Tenant tenant = obtainCurrentTenant(tenantName);
-
-        processCodeWithTenant(code, req, res, tenantName, tenant);
-    }
-
-    private void processCodeWithTenant(String code, ServerRequest req, ServerResponse res, String tenantName, Tenant tenant) {
         Optional<String> maybeStateCookie = stateCookieHandler.findCookie(req.headers().toMap());
         if (maybeStateCookie.isEmpty()) {
             processError(res,
@@ -386,15 +459,39 @@ public final class OidcFeature implements HttpFeature {
                          "State cookie needs to be provided upon redirect");
             return;
         }
+
         String stateCookieJson = new String(Base64.getDecoder().decode(maybeStateCookie.get()), StandardCharsets.UTF_8);
         JsonObject stateCookie = JsonParser.create(stateCookieJson).readJsonObject();
-        //Remove state cookie
         res.headers().addCookie(stateCookieHandler.removeCookie().build());
+
+        Optional<Tenant> tenant;
+        try {
+            tenant = obtainCurrentTenant(tenantName);
+        } catch (ResilientValue.UnavailableException _) {
+            sendUnavailableTenantResponse(res);
+            return;
+        }
+        if (tenant.isEmpty()) {
+            processError(res, Status.UNAUTHORIZED_401, "Not a valid authorization code");
+            return;
+        }
+
+        processCodeWithTenant(code, req, res, tenantName, tenant.get(), stateCookie);
+    }
+
+    private void processCodeWithTenant(String code,
+                                       ServerRequest req,
+                                       ServerResponse res,
+                                       String tenantName,
+                                       Tenant tenant,
+                                       JsonObject stateCookie) {
         String state = stateCookie.stringValue("state")
                 .orElseThrow(() -> new IllegalStateException("JSON field \"state\" must be defined"));
         String queryState = req.query().get("state");
         if (!state.equals(queryState)) {
             processError(res,
+                         tenantName,
+                         stateCookie,
                          Status.UNAUTHORIZED_401,
                          "State of the original request and obtained from identity server does not match");
             return;
@@ -427,24 +524,24 @@ public final class OidcFeature implements HttpFeature {
                     JsonObject jsonObject = response.as(JsonObject.class);
                     processJsonResponse(req, res, jsonObject, tenantName, stateCookie, tenant);
                 } catch (Exception e) {
-                    processError(res, e, "Failed to read JSON from response");
+                    processError(res, tenantName, stateCookie, e, "Failed to read JSON from response");
                 }
             } else {
                 String message;
                 try {
                     message = response.as(String.class);
                 } catch (Exception e) {
-                    processError(res, e, "Failed to process error entity");
+                    processError(res, tenantName, stateCookie, e, "Failed to process error entity");
                     return;
                 }
                 try {
-                    processError(res, response.status(), message);
+                    processError(res, tenantName, stateCookie, response.status(), message);
                 } catch (Exception e) {
                     throw new SecurityException("Failed to process request: " + message);
                 }
             }
         } catch (Exception e) {
-            processError(res, e, "Failed to invoke request");
+            processError(res, tenantName, stateCookie, e, "Failed to invoke request");
         }
     }
 
@@ -514,20 +611,11 @@ public final class OidcFeature implements HttpFeature {
         }
 
         //redirect to "originalUri"
-        String originalUri = stateCookie.stringValue("originalUri", DEFAULT_REDIRECT);
+        ServerResponseHeaders headers = res.headers();
+        String originalUri = postLoginRedirectUri(stateCookie, idToken, accessToken, tenantName);
         res.status(Status.TEMPORARY_REDIRECT_307);
-        if (oidcConfig.useParam()) {
-            originalUri += (originalUri.contains("?") ? "&" : "?") + encode(oidcConfig.paramName()) + "=" + accessToken;
-            if (idToken.isPresent()) {
-                originalUri += "&" + encode(oidcConfig.idTokenParamName()) + "=" + idToken.get();
-            }
-            if (!DEFAULT_TENANT_ID.equals(tenantName)) {
-                originalUri += "&" + encode(oidcConfig.tenantParamName()) + "=" + encode(tenantName);
-            }
-        }
-
-        originalUri = increaseRedirectCounter(originalUri);
-        res.headers().add(HeaderNames.LOCATION, originalUri);
+        originalUri = updateRedirectCounter(req, headers, tenantName, originalUri);
+        headers.add(HeaderNames.LOCATION, originalUri);
 
         if (oidcConfig.useCookie()) {
             try {
@@ -537,8 +625,6 @@ public final class OidcFeature implements HttpFeature {
                         .build();
                 String encodedAccessToken = Base64.getEncoder()
                         .encodeToString(accessTokenJson.toString().getBytes(StandardCharsets.UTF_8));
-
-                ServerResponseHeaders headers = res.headers();
 
                 OidcCookieHandler tenantCookieHandler = oidcConfig.tenantCookieHandler();
 
@@ -558,6 +644,38 @@ public final class OidcFeature implements HttpFeature {
         }
 
         return "done";
+    }
+
+    // Package-private test seam for validating the post-login Location value without invoking the token endpoint.
+    String postLoginRedirectUri(JsonObject stateCookie,
+                                Optional<String> idToken,
+                                String accessToken,
+                                String tenantName) {
+        String originalUri = OidcUtil.localRedirectUri(
+                stateCookie.stringValue("originalUri", DEFAULT_REDIRECT))
+                .orElse(DEFAULT_REDIRECT);
+        if (oidcConfig.useParam()) {
+            StringBuilder redirectUri = new StringBuilder(originalUri)
+                    .append(originalUri.contains("?") ? '&' : '?')
+                    .append(encode(oidcConfig.paramName()))
+                    .append('=')
+                    .append(accessToken);
+            if (idToken.isPresent()) {
+                redirectUri.append('&')
+                        .append(encode(oidcConfig.idTokenParamName()))
+                        .append('=')
+                        .append(idToken.get());
+            }
+            if (!DEFAULT_TENANT_ID.equals(tenantName)) {
+                redirectUri.append('&')
+                        .append(encode(oidcConfig.tenantParamName()))
+                        .append('=')
+                        .append(encode(tenantName));
+            }
+            originalUri = redirectUri.toString();
+        }
+
+        return originalUri;
     }
 
     private String encode(String toEncode) {
@@ -590,11 +708,34 @@ public final class OidcFeature implements HttpFeature {
         return Optional.empty();
     }
 
+    private Optional<String> processError(ServerResponse res,
+                                          String tenantName,
+                                          JsonObject stateCookie,
+                                          Status status,
+                                          String entity) {
+        clearRedirectAttemptCookie(res.headers(), tenantName, stateCookie);
+        return processError(res, status, entity);
+    }
+
+    private Optional<String> processError(ServerResponse res,
+                                          String tenantName,
+                                          JsonObject stateCookie,
+                                          Throwable t,
+                                          String message) {
+        clearRedirectAttemptCookie(res.headers(), tenantName, stateCookie);
+        return processError(res, t, message);
+    }
+
     // this must always be the same, so clients cannot guess what kind of problem they are facing
     // if they try to provide wrong data
     private void sendErrorResponse(ServerResponse serverResponse) {
         serverResponse.status(Status.UNAUTHORIZED_401);
         serverResponse.send("Not a valid authorization code");
+    }
+
+    private void sendUnknownTenantResponse(ServerResponse serverResponse) {
+        serverResponse.status(Status.UNAUTHORIZED_401);
+        serverResponse.send("Unauthorized");
     }
 
     String increaseRedirectCounter(String state) {
@@ -618,7 +759,30 @@ public final class OidcFeature implements HttpFeature {
         }
     }
 
-    private void processError(ServerRequest req, ServerResponse res) {
+    String updateRedirectCounter(ServerRequest req, ServerResponseHeaders headers, String state) {
+        return updateRedirectCounter(req, headers, DEFAULT_TENANT_ID, state);
+    }
+
+    String updateRedirectCounter(ServerRequest req, ServerResponseHeaders headers, String tenantName, String state) {
+        switch (oidcConfig.redirectAttemptCounterStrategy()) {
+        case NONE:
+            return state;
+        case PARAM:
+            return increaseRedirectCounter(state);
+        case COOKIE:
+            return state;
+        default:
+            throw new IllegalStateException("Unsupported redirect attempt counter strategy: "
+                                                    + oidcConfig.redirectAttemptCounterStrategy());
+        }
+    }
+
+    void processError(ServerRequest req, ServerResponse res) {
+        String tenantName = req.query().first(oidcConfig.tenantParamName()).orElse(DEFAULT_TENANT_ID);
+        stateCookie(req).ifPresent(stateCookie -> {
+            res.headers().addCookie(stateCookieHandler.removeCookie().build());
+            clearRedirectAttemptCookie(res.headers(), tenantName, stateCookie);
+        });
         String error = req.query().first("error").orElse("invalid_request");
         String errorDescription = req.query().first("error_description")
                 .orElseGet(() -> "Failed to process authorization request. Expected redirect from OIDC server with code"
@@ -631,6 +795,43 @@ public final class OidcFeature implements HttpFeature {
 
         res.status(Status.BAD_REQUEST_400);
         res.send("{\"error\": \"" + error + "\", \"error_description\": \"" + errorDescription + "\"}");
+    }
+
+    private void sendUnavailableTenantResponse(ServerResponse serverResponse) {
+        serverResponse.status(Status.SERVICE_UNAVAILABLE_503);
+        serverResponse.send();
+    }
+
+    private Optional<JsonObject> stateCookie(ServerRequest req) {
+        return stateCookieHandler.findCookie(req.headers().toMap())
+                .flatMap(this::decodeStateCookie);
+    }
+
+    private Optional<JsonObject> decodeStateCookie(String encodedStateCookie) {
+        try {
+            String stateCookieJson = new String(Base64.getDecoder().decode(encodedStateCookie), StandardCharsets.UTF_8);
+            return Optional.of(JsonParser.create(stateCookieJson).readJsonObject());
+        } catch (Exception e) {
+            LOGGER.log(Level.DEBUG, "Failed to process OIDC state cookie", e);
+            return Optional.empty();
+        }
+    }
+
+    private void clearRedirectAttemptCookie(ServerResponseHeaders headers, String tenantName, JsonObject stateCookie) {
+        if (oidcConfig.redirectAttemptCounterStrategy() != RedirectAttemptCounterStrategy.COOKIE) {
+            return;
+        }
+        stateCookie.stringValue("originalUri")
+                .ifPresent(originalUri -> headers.addCookie(RedirectAttemptCookie.remove(oidcConfig,
+                                                                                         tenantName,
+                                                                                         originalUri)));
+    }
+
+    private record ResilientConfig<T>(String description,
+                                      Supplier<T> loader,
+                                      Retry retry,
+                                      CircuitBreaker circuitBreaker,
+                                      Timeout timeout) implements ResilientValueConfig<T> {
     }
 
     /**

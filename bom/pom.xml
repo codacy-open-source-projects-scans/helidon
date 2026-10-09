@@ -23,7 +23,7 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-parent</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
         <relativePath>../parent/pom.xml</relativePath>
     </parent>
     <artifactId>helidon-bom</artifactId>
@@ -31,7 +31,7 @@
     <name>Helidon BOM POM</name>
 
     <properties>
-        <helidon.version>27.0.0-SNAPSHOT</helidon.version>
+        <helidon.version>28.0.0-SNAPSHOT</helidon.version>
     </properties>
 
     <dependencyManagement>
@@ -48,6 +48,11 @@
                 <version>${helidon.version}</version>
             </dependency>
             <!-- graphQL -->
+            <dependency>
+                <groupId>io.helidon.graphql</groupId>
+                <artifactId>helidon-graphql</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
             <dependency>
                 <groupId>io.helidon.graphql</groupId>
                 <artifactId>helidon-graphql-server</artifactId>
@@ -476,6 +481,21 @@
                 <version>${helidon.version}</version>
             </dependency>
             <dependency>
+                <groupId>io.helidon.data.jdbc</groupId>
+                <artifactId>helidon-data-jdbc</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.data.jdbc</groupId>
+                <artifactId>helidon-data-jdbc-codegen</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.data.jdbc</groupId>
+                <artifactId>helidon-data-jdbc-lexical</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
                 <groupId>io.helidon.data.jakarta.persistence</groupId>
                 <artifactId>helidon-data-jakarta-persistence</artifactId>
                 <version>${helidon.version}</version>
@@ -586,6 +606,11 @@
             <!-- telemetry -->
             <dependency>
                 <groupId>io.helidon.telemetry</groupId>
+                <artifactId>helidon-telemetry-opentelemetry</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.telemetry</groupId>
                 <artifactId>helidon-telemetry-opentelemetry-config</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
@@ -637,6 +662,16 @@
                 <artifactId>helidon-openapi</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
+            <dependency>
+                <groupId>io.helidon.openapi</groupId>
+                <artifactId>helidon-openapi-31</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.openapi</groupId>
+                <artifactId>helidon-openapi-32</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
             <!-- CORS support -->
             <!-- Testing -->
             <dependency>
@@ -672,7 +707,17 @@
             </dependency>
             <dependency>
                 <groupId>io.helidon.http</groupId>
+                <artifactId>helidon-http-http1</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.http</groupId>
                 <artifactId>helidon-http-http2</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.http</groupId>
+                <artifactId>helidon-http-metrics</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
             <dependency>
@@ -753,6 +798,16 @@
             <dependency>
                 <groupId>io.helidon.webserver</groupId>
                 <artifactId>helidon-webserver-grpc</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.webserver</groupId>
+                <artifactId>helidon-webserver-grpc-security</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.helidon.webserver</groupId>
+                <artifactId>helidon-webserver-grpc-validation</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
             <dependency>
@@ -1019,6 +1074,13 @@
             <dependency>
                 <groupId>io.helidon.service</groupId>
                 <artifactId>helidon-service-jndi</artifactId>
+                <version>${helidon.version}</version>
+            </dependency>
+
+            <!-- Messaging -->
+            <dependency>
+                <groupId>io.helidon.messaging</groupId>
+                <artifactId>helidon-messaging</artifactId>
                 <version>${helidon.version}</version>
             </dependency>
 

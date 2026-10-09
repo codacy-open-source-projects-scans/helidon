@@ -31,20 +31,22 @@ module io.helidon.metrics.providers.micrometer {
 
     requires io.helidon.metrics.api;
     requires micrometer.core;
-    requires static micrometer.registry.prometheus;
-    requires static micrometer.registry.prometheus.simpleclient;
+    requires transitive micrometer.registry.prometheus;
     requires io.helidon.common;
     requires io.helidon.common.media.type;
     requires io.helidon.config;
-    requires simpleclient.common;
-    requires simpleclient.tracer.common;
-    requires simpleclient;
     requires micrometer.registry.otlp;
     requires io.helidon.service.registry;
     requires io.prometheus.metrics.model;
-    requires io.helidon.common.context;
+    requires transitive io.prometheus.metrics.tracer.common;
+    requires io.prometheus.writer.text;
 
+    exports io.helidon.metrics.providers.micrometer;
     exports io.helidon.metrics.providers.micrometer.spi;
+
+    uses io.helidon.metrics.spi.MeterBuilderCustomizer;
+    uses io.helidon.metrics.spi.MeterRegistryLifeCycleListener;
+    uses io.helidon.metrics.providers.micrometer.spi.SpanContextSupplierProvider;
 
     provides io.helidon.metrics.spi.MetricsFactoryProvider with
             io.helidon.metrics.providers.micrometer.MicrometerMetricsFactoryProvider;
@@ -53,8 +55,5 @@ module io.helidon.metrics.providers.micrometer {
     provides io.helidon.metrics.spi.MetricsPublisherProvider
             with io.helidon.metrics.providers.micrometer.PrometheusPublisherProvider,
             io.helidon.metrics.providers.micrometer.OtlpPublisherProvider;
-
-    uses io.helidon.metrics.spi.MeterRegistryLifeCycleListener;
-    uses io.helidon.metrics.providers.micrometer.spi.SpanContextSupplierProvider;
 
 }

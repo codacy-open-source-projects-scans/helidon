@@ -23,7 +23,7 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-bom</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
         <relativePath>../bom/pom.xml</relativePath>
     </parent>
     <artifactId>helidon-dependencies</artifactId>
@@ -41,73 +41,59 @@
         <version.lib.commons-compress>1.27.1</version.lib.commons-compress>
         <version.lib.commons-lang>3.18.0</version.lib.commons-lang>
         <version.lib.cron-utils>9.2.1</version.lib.cron-utils>
-        <version.lib.dropwizard.metrics>4.1.36</version.lib.dropwizard.metrics>
-        <version.lib.eclipselink>4.0.7</version.lib.eclipselink>
+        <version.lib.dropwizard.metrics>4.2.40</version.lib.dropwizard.metrics>
         <version.lib.google-error-prone-annotations>2.30.0</version.lib.google-error-prone-annotations>
         <version.lib.google-gson>2.13.2</version.lib.google-gson>
-        <version.lib.google-protobuf>4.31.1</version.lib.google-protobuf>
+        <version.lib.google-protobuf>4.36.2</version.lib.google-protobuf>
         <version.lib.google-j2objc-annotations>3.0.0</version.lib.google-j2objc-annotations>
-        <version.lib.graphql-java>22.1</version.lib.graphql-java>
+        <version.lib.graphql-java>22.4</version.lib.graphql-java>
         <version.lib.graphql-java.extended.scalars>22.0</version.lib.graphql-java.extended.scalars>
         <version.lib.grpc>1.73.0</version.lib.grpc>
-        <version.lib.google-findbugs-jsr305>3.0.2</version.lib.google-findbugs-jsr305>
         <version.lib.guava>33.3.1-jre</version.lib.guava>
         <version.lib.h2>2.4.240</version.lib.h2>
         <version.lib.hamcrest>1.3</version.lib.hamcrest>
-        <version.lib.handlebars>4.4.0</version.lib.handlebars>
-        <version.lib.hibernate.family>6.3</version.lib.hibernate.family>
-        <version.lib.hibernate>${version.lib.hibernate.family}.1.Final</version.lib.hibernate>
-        <version.lib.hibernate-validator>8.0.2.Final</version.lib.hibernate-validator>
-        <version.lib.hikaricp>5.0.1</version.lib.hikaricp>
-        <version.lib.jackson>2.21.1</version.lib.jackson>
+        <version.lib.handlebars>4.5.2</version.lib.handlebars>
+        <version.lib.hikaricp>7.1.0</version.lib.hikaricp>
+        <version.lib.jackson>2.21.7</version.lib.jackson>
         <version.lib.jakarta.activation-api>2.1.3</version.lib.jakarta.activation-api>
-        <version.lib.jakarta.annotation-api>2.1.1</version.lib.jakarta.annotation-api>
+        <version.lib.jakarta.annotation-api>3.0.0</version.lib.jakarta.annotation-api>
         <!-- Needed for transaction/jta -->
-        <version.lib.jakarta.cdi-api>4.0.1</version.lib.jakarta.cdi-api>
+        <version.lib.jakarta.cdi-api>4.1.0</version.lib.jakarta.cdi-api>
         <version.lib.jakarta.inject>2.0.1</version.lib.jakarta.inject>
         <!-- Needed by current implementation of JSON-Schema and JSON-RPC -->
-        <version.lib.jakarta.jsonb-api>3.0.1</version.lib.jakarta.jsonb-api>
+        <version.lib.jakarta.jsonb-api>3.0.3</version.lib.jakarta.jsonb-api>
         <version.lib.jakarta.jsonp-api>2.1.3</version.lib.jakarta.jsonp-api>
-        <version.lib.jakarta.persistence-api>3.1.0</version.lib.jakarta.persistence-api>
+        <version.lib.jakarta.persistence-api>3.2.0</version.lib.jakarta.persistence-api>
+        <version.lib.jakarta.resource-api>2.1.0</version.lib.jakarta.resource-api>
         <version.lib.jakarta.transaction-api>2.0.1</version.lib.jakarta.transaction-api>
         <!-- Check Hibernate when upgrading to ensure its supplied jaxb-runtime is compatible. -->
         <version.lib.jakarta.xml.bind-api>4.0.2</version.lib.jakarta.xml.bind-api>
-        <version.lib.jandex>3.3.0</version.lib.jandex>
-        <version.lib.jaxb-core>4.0.5</version.lib.jaxb-core>
-        <version.lib.jaxb-impl>4.0.5</version.lib.jaxb-impl>
-        <version.lib.jboss.logging>3.5.3.Final</version.lib.jboss.logging>
+        <version.lib.jboss.logging>3.6.3.Final</version.lib.jboss.logging>
         <version.lib.jaxb-runtime>4.0.5</version.lib.jaxb-runtime>
         <!-- Jetbrains annotations: dependency convergence requirement, we never use this directly -->
         <version.lib.jetbrains.annotations>17.0.0</version.lib.jetbrains.annotations>
+        <version.lib.jspecify>1.0.1</version.lib.jspecify>
         <version.lib.junit>5.12.2</version.lib.junit>
-        <version.lib.kafka>3.9.2</version.lib.kafka>
-        <!-- Kotlin: dependency convergence requirement, we never use this directly -->
-        <version.lib.kotlin>1.9.10</version.lib.kotlin>
-        <version.lib.log4j>2.25.4</version.lib.log4j>
-        <version.lib.micrometer>1.15.2</version.lib.micrometer>
-        <version.lib.micrometer-prometheus>1.15.2</version.lib.micrometer-prometheus>
-        <version.lib.mongodb>4.10.2</version.lib.mongodb>
+        <version.lib.log4j>2.26.1</version.lib.log4j>
+        <version.lib.micrometer>1.17.1</version.lib.micrometer>
+        <version.lib.micrometer-prometheus>1.17.1</version.lib.micrometer-prometheus>
+        <version.lib.mongodb>5.11.1</version.lib.mongodb>
         <version.lib.mysql-connector-j>8.2.0</version.lib.mysql-connector-j>
-        <version.lib.narayana>7.1.0.Final</version.lib.narayana>
+        <version.lib.narayana>7.3.4.Final</version.lib.narayana>
         <version.lib.ojdbc.family>23</version.lib.ojdbc.family>
         <version.lib.ojdbc>${version.lib.ojdbc.family}.26.1.0.0</version.lib.ojdbc>
-        <!-- Force upgrade of okio for dependency convergence -->
-        <version.lib.okio>3.6.0</version.lib.okio>
-        <!-- Force upgrade okhttp3 for dependency convergence -->
-        <version.lib.okhttp3>4.12.0</version.lib.okhttp3>
-        <version.lib.opentelemetry.semconv>1.37.0</version.lib.opentelemetry.semconv>
-        <version.lib.opentelemetry>1.58.0</version.lib.opentelemetry>
-        <version.lib.opentelemetry.instrumentation.annotations>2.24.0</version.lib.opentelemetry.instrumentation.annotations>
-        <version.lib.parsson>1.1.7</version.lib.parsson>
-        <version.lib.postgresql>42.7.2</version.lib.postgresql>
-        <version.lib.prometheus>0.16.0</version.lib.prometheus>
+        <version.lib.opentelemetry>1.66.0</version.lib.opentelemetry>
+        <version.lib.opentelemetry.semconv>1.44.0</version.lib.opentelemetry.semconv>
+        <version.lib.parsson>1.1.9</version.lib.parsson>
+        <version.lib.postgresql>42.7.13</version.lib.postgresql>
+        <version.lib.prometheus>1.9.0</version.lib.prometheus>
         <version.lib.reactivestreams>1.0.4</version.lib.reactivestreams>
-        <version.lib.slf4j>2.0.17</version.lib.slf4j>
-        <version.lib.snakeyaml>2.5</version.lib.snakeyaml>
+        <version.lib.slf4j>2.0.20</version.lib.slf4j>
+        <version.lib.smallrye.common>2.14.0</version.lib.smallrye.common>
+        <version.lib.snakeyaml>2.7</version.lib.snakeyaml>
         <version.lib.testcontainers>1.21.4</version.lib.testcontainers>
-        <version.lib.typesafe-config>1.4.4</version.lib.typesafe-config>
-        <version.lib.yasson>3.0.4</version.lib.yasson>
-        <version.lib.zookeeper>3.5.7</version.lib.zookeeper>
+        <version.lib.typesafe-config>1.4.9</version.lib.typesafe-config>
+        <version.lib.yasson>3.0.5</version.lib.yasson>
     </properties>
 
     <dependencyManagement>
@@ -161,17 +147,6 @@
                     </exclusion>
                 </exclusions>
             </dependency>
-            <!-- -->
-            <dependency>
-                <groupId>io.opentelemetry.instrumentation</groupId>
-                <artifactId>opentelemetry-instrumentation-annotations</artifactId>
-                <version>${version.lib.opentelemetry.instrumentation.annotations}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.opentelemetry.instrumentation</groupId>
-                <artifactId>opentelemetry-instrumentation-api</artifactId>
-                <version>${version.lib.opentelemetry}</version>
-            </dependency>
             <!--
                 "Jakarta XML Binding API". (See
                 https://github.com/jakartaee/jaxb-api/blob/d8a68e76a5391cb2462f540c9e4c5c81d0a91942/jaxb-api/pom.xml#L23-L25)
@@ -180,24 +155,6 @@
                 <groupId>jakarta.xml.bind</groupId>
                 <artifactId>jakarta.xml.bind-api</artifactId>
                 <version>${version.lib.jakarta.xml.bind-api}</version>
-            </dependency>
-            <!--
-                "Old JAXB Core". (See
-                https://github.com/eclipse-ee4j/jaxb-ri/blob/1120e83b8bac6dfd1636e19269a36a8ccaad94e4/jaxb-ri/bundles/core/pom.xml#L25-L30.)
-            -->
-            <dependency>
-                <groupId>com.sun.xml.bind</groupId>
-                <artifactId>jaxb-core</artifactId>
-                <version>${version.lib.jaxb-core}</version>
-            </dependency>
-            <!--
-                "Old JAXB Runtime". (See
-                https://github.com/eclipse-ee4j/jaxb-ri/blob/1120e83b8bac6dfd1636e19269a36a8ccaad94e4/jaxb-ri/bundles/runtime/pom.xml#L25-L30.)
-            -->
-            <dependency>
-                <groupId>com.sun.xml.bind</groupId>
-                <artifactId>jaxb-impl</artifactId>
-                <version>${version.lib.jaxb-impl}</version>
             </dependency>
             <!--
                 "JAXB Runtime"/"JAXB (JSR 222) Reference Implementation". (See
@@ -249,12 +206,7 @@
                 <version>${version.lib.parsson}</version>
             </dependency>
             <dependency>
-                <groupId>org.eclipse.parsson</groupId>
-                <artifactId>parsson-media</artifactId>
-                <version>${version.lib.parsson}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.eclipse</groupId>
+                <groupId>org.eclipse.yasson</groupId>
                 <artifactId>yasson</artifactId>
                 <version>${version.lib.yasson}</version>
             </dependency>
@@ -274,22 +226,6 @@
                 <groupId>org.yaml</groupId>
                 <artifactId>snakeyaml</artifactId>
                 <version>${version.lib.snakeyaml}</version>
-            </dependency>
-            <!-- Webserver related -->
-            <dependency>
-                <groupId>io.prometheus</groupId>
-                <artifactId>simpleclient</artifactId>
-                <version>${version.lib.prometheus}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.prometheus</groupId>
-                <artifactId>simpleclient_common</artifactId>
-                <version>${version.lib.prometheus}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.prometheus</groupId>
-                <artifactId>simpleclient_tracer_common</artifactId>
-                <version>${version.lib.prometheus}</version>
             </dependency>
             <dependency>
                 <groupId>net.bytebuddy</groupId>
@@ -321,19 +257,8 @@
             </dependency>
             <dependency>
                 <groupId>io.micrometer</groupId>
-                <artifactId>micrometer-registry-prometheus-simpleclient</artifactId>
-                <version>${version.lib.micrometer-prometheus}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.micrometer</groupId>
                 <artifactId>micrometer-registry-otlp</artifactId>
                 <version>${version.lib.micrometer}</version>
-            </dependency>
-
-            <dependency>
-                <groupId>io.smallrye</groupId>
-                <artifactId>jandex</artifactId>
-                <version>${version.lib.jandex}</version>
             </dependency>
 
             <!-- Integrations related -->
@@ -374,29 +299,20 @@
                 <version>${version.lib.dropwizard.metrics}</version>
             </dependency>
             <dependency>
-                <groupId>org.eclipse.persistence</groupId>
-                <artifactId>org.eclipse.persistence.core</artifactId>
-                <version>${version.lib.eclipselink}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.eclipse.persistence</groupId>
-                <artifactId>org.eclipse.persistence.jpa</artifactId>
-                <version>${version.lib.eclipselink}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.hibernate.orm</groupId>
-                <artifactId>hibernate-core</artifactId>
-                <version>${version.lib.hibernate}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.hibernate.validator</groupId>
-                <artifactId>hibernate-validator</artifactId>
-                <version>${version.lib.hibernate-validator}</version>
-            </dependency>
-            <dependency>
                 <groupId>org.jboss.narayana.jta</groupId>
                 <artifactId>narayana-jta</artifactId>
                 <version>${version.lib.narayana}</version>
+                <exclusions>
+                    <!-- The optional Infinispan store is unused; these JARs cannot load on the module path. -->
+                    <exclusion>
+                        <groupId>org.infinispan</groupId>
+                        <artifactId>infinispan-core</artifactId>
+                    </exclusion>
+                    <exclusion>
+                        <groupId>org.infinispan</groupId>
+                        <artifactId>infinispan-commons</artifactId>
+                    </exclusion>
+                </exclusions>
             </dependency>
             <dependency>
                 <groupId>org.jboss.logging</groupId>
@@ -423,27 +339,6 @@
                     </exclusion>
                 </exclusions>
             </dependency>
-            <!-- Kafka support -->
-            <dependency>
-                <groupId>org.apache.kafka</groupId>
-                <artifactId>kafka-clients</artifactId>
-                <version>${version.lib.kafka}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.jetbrains.kotlin</groupId>
-                <artifactId>kotlin-stdlib</artifactId>
-                <version>${version.lib.kotlin}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.jetbrains.kotlin</groupId>
-                <artifactId>kotlin-stdlib-common</artifactId>
-                <version>${version.lib.kotlin}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.jetbrains.kotlin</groupId>
-                <artifactId>kotlin-stdlib-jdk8</artifactId>
-                <version>${version.lib.kotlin}</version>
-            </dependency>
             <dependency>
                 <groupId>org.jetbrains</groupId>
                 <artifactId>annotations</artifactId>
@@ -460,17 +355,13 @@
                 <artifactId>reactive-streams</artifactId>
                 <version>${version.lib.reactivestreams}</version>
             </dependency>
-            <dependency>
-                <groupId>org.reactivestreams</groupId>
-                <artifactId>reactive-streams-tck</artifactId>
-                <version>${version.lib.reactivestreams}</version>
-            </dependency>
             <!-- END OF Section 1: direct third party dependencies -->
 
             <!-- Section 2: third party dependencies used by examples (obsolete) -->
             <!-- END OF Section 2: third party dependencies used by examples -->
 
             <!-- Section 3: transitive dependencies we manage the version of for convergence/upgrade -->
+            <!-- For dependency convergence -->
             <dependency>
                 <groupId>com.google.guava</groupId>
                 <artifactId>guava</artifactId>
@@ -488,44 +379,35 @@
                 <artifactId>commons-lang3</artifactId>
                 <version>${version.lib.commons-lang}</version>
             </dependency>
-            <dependency>
-                <!-- Force upgrade okhttp3 for dependency convergence -->
-                <groupId>com.squareup.okhttp3</groupId>
-                <artifactId>okhttp</artifactId>
-                <version>${version.lib.okhttp3}</version>
-            </dependency>
-            <dependency>
-                <!-- For dependency convergence -->
-                <groupId>com.squareup.okio</groupId>
-                <artifactId>okio</artifactId>
-                <version>${version.lib.okio}</version>
-            </dependency>
-            <dependency>
-            <!-- For dependency convergence -->
-                <groupId>com.squareup.okio</groupId>
-                <artifactId>okio-jvm</artifactId>
-                <version>${version.lib.okio}</version>
-            </dependency>
             <!-- For dependency convergence -->
             <dependency>
                 <groupId>com.google.errorprone</groupId>
                 <artifactId>error_prone_annotations</artifactId>
                 <version>${version.lib.google-error-prone-annotations}</version>
             </dependency>
-            <dependency>
-                <groupId>com.google.code.findbugs</groupId>
-                <artifactId>jsr305</artifactId>
-                <version>${version.lib.google-findbugs-jsr305}</version>
-            </dependency>
+            <!-- For dependency convergence -->
             <dependency>
                 <groupId>com.google.code.gson</groupId>
                 <artifactId>gson</artifactId>
                 <version>${version.lib.google-gson}</version>
             </dependency>
+            <!-- For dependency convergence -->
             <dependency>
                 <groupId>com.google.j2objc</groupId>
                 <artifactId>j2objc-annotations</artifactId>
                 <version>${version.lib.google-j2objc-annotations}</version>
+            </dependency>
+            <!-- Narayana dependency convergence -->
+            <dependency>
+                <groupId>jakarta.resource</groupId>
+                <artifactId>jakarta.resource-api</artifactId>
+                <version>${version.lib.jakarta.resource-api}</version>
+            </dependency>
+            <!-- Align Narayana and Micrometer annotations. -->
+            <dependency>
+                <groupId>org.jspecify</groupId>
+                <artifactId>jspecify</artifactId>
+                <version>${version.lib.jspecify}</version>
             </dependency>
             <!-- END OF Section 3: transitive dependencies we manage the version of for convergence/upgrade -->
 
@@ -552,11 +434,6 @@
             </dependency>
             <dependency>
                 <groupId>org.testcontainers</groupId>
-                <artifactId>mongodb</artifactId>
-                <version>${version.lib.testcontainers}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.testcontainers</groupId>
                 <artifactId>mysql</artifactId>
                 <version>${version.lib.testcontainers}</version>
             </dependency>
@@ -564,16 +441,6 @@
                 <groupId>org.testcontainers</groupId>
                 <artifactId>jdbc</artifactId>
                 <version>${version.lib.testcontainers}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.testcontainers</groupId>
-                <artifactId>oracle-xe</artifactId>
-                <version>${version.lib.testcontainers}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.slf4j</groupId>
-                <artifactId>slf4j-simple</artifactId>
-                <version>${version.lib.slf4j}</version>
             </dependency>
             <!-- END OF Section 4: Testing -->
 
@@ -637,6 +504,13 @@
                 <scope>import</scope>
             </dependency>
             <dependency>
+                <groupId>io.prometheus</groupId>
+                <artifactId>prometheus-metrics-bom</artifactId>
+                <version>${version.lib.prometheus}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
                 <groupId>org.apache.logging.log4j</groupId>
                 <artifactId>log4j-bom</artifactId>
                 <version>${version.lib.log4j}</version>
@@ -654,6 +528,14 @@
                 <groupId>org.junit</groupId>
                 <artifactId>junit-bom</artifactId>
                 <version>${version.lib.junit}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Align Narayana's SmallRye Common dependencies. -->
+            <dependency>
+                <groupId>io.smallrye.common</groupId>
+                <artifactId>smallrye-common-bom</artifactId>
+                <version>${version.lib.smallrye.common}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>

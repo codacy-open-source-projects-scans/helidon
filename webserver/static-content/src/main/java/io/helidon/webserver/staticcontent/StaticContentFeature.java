@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,10 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
     private final MemoryCache memoryCache;
     private final TemporaryStorage temporaryStorage;
     private final Map<String, MediaType> contentTypeMapping;
+    private final Map<String, String> preCompressedEncodings;
     private final boolean enabled;
+    private final boolean preCompressedEnabled;
+    private final boolean preCompressedCrossOriginSourcingEnabled;
     private final Set<String> sockets;
     private final Optional<String> welcome;
 
@@ -54,6 +57,10 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
         this.enabled = config.enabled() && !(config.classpath().isEmpty() && config.path().isEmpty());
         if (enabled) {
             this.contentTypeMapping = config.contentTypes();
+            this.preCompressedEnabled = config.preCompressedEnabled();
+            this.preCompressedCrossOriginSourcingEnabled = config.preCompressedCrossOriginSourcingEnabled();
+            this.preCompressedEncodings = StaticContentConfigSupport.normalizePreCompressedEncodings(
+                    config.preCompressedEncodings());
             this.memoryCache = config.memoryCache()
                         .orElseGet(MemoryCache::create);
             this.sockets = config.sockets();
@@ -71,14 +78,17 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
             this.memoryCache = null;
             this.temporaryStorage = null;
             this.contentTypeMapping = null;
+            this.preCompressedEnabled = false;
+            this.preCompressedCrossOriginSourcingEnabled = false;
+            this.preCompressedEncodings = Map.of();
         }
     }
 
     /**
-     * Create Access log support configured from {@link io.helidon.config.Config}.
+     * Create a static content feature configured from {@link io.helidon.config.Config}.
      *
-     * @param config to configure a new access log support instance
-     * @return a new access log support to be registered with WebServer routing
+     * @param config configuration for a new static content feature
+     * @return a new static content feature to be registered with WebServer routing
      */
     public static StaticContentFeature create(Config config) {
         return builder()
@@ -87,7 +97,7 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
     }
 
     /**
-     * A new fluent API builder to create Access log support instance.
+     * A new fluent API builder to create a static content feature.
      *
      * @return a new builder
      */
@@ -171,7 +181,7 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
             defaultSockets = new HashSet<>(this.sockets);
         }
 
-        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+        ClassLoader contextClassLoader = contextClassLoader();
 
         for (ClasspathHandlerConfig handlerConfig : config.classpath()) {
             if (!handlerConfig.enabled()) {
@@ -199,11 +209,18 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
                     continue;
                 }
 
+                ClasspathHandlerConfig sourceConfig = handlerConfig;
                 handlerConfig = ClasspathHandlerConfig.builder()
-                        .from(handlerConfig)
+                        .from(sourceConfig)
                         .memoryCache(handlerCache)
                         .temporaryStorage(handlerTmpStorage)
                         .update(it -> welcome.ifPresent(it::welcome))
+                        .preCompressedEnabled(sourceConfig.preCompressedEnabled().orElse(preCompressedEnabled))
+                        .preCompressedCrossOriginSourcingEnabled(
+                                sourceConfig.preCompressedCrossOriginSourcingEnabled()
+                                        .orElse(preCompressedCrossOriginSourcingEnabled))
+                        .preCompressedEncodings(sourceConfig.preCompressedEncodings()
+                                .orElse(preCompressedEncodings))
                         .classLoader(handlerClassLoader)
                         .contentTypes(contentTypeMap)
                         .build();
@@ -233,17 +250,25 @@ public class StaticContentFeature implements Weighted, ServerFeature, RuntimeTyp
                     continue;
                 }
 
+                FileSystemHandlerConfig sourceConfig = handlerConfig;
                 handlerConfig = FileSystemHandlerConfig.builder()
-                        .from(handlerConfig)
+                        .from(sourceConfig)
                         .memoryCache(handlerCache)
+                        .preCompressedEncodings(sourceConfig.preCompressedEncodings()
+                                .orElse(preCompressedEncodings))
                         .contentTypes(contentTypeMap)
                         .build();
 
-                HttpService service = createService(handlerConfig);
+                HttpService service = FileSystemContentHandler.create(handlerConfig, preCompressedEnabled);
                 featureContext.socket(handlerSocket)
                         .httpRouting()
                         .register(handlerConfig.context(), service);
             }
         }
+    }
+
+    private static ClassLoader contextClassLoader() {
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        return classLoader == null ? StaticContentFeature.class.getClassLoader() : classLoader;
     }
 }

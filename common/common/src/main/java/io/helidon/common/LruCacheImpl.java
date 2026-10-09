@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package io.helidon.common;
 
 import java.util.LinkedHashMap;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.SequencedMap;
 import java.util.concurrent.locks.Lock;
@@ -40,11 +41,15 @@ final class LruCacheImpl<K, V> implements LruCache<K, V> {
     private final int capacity;
 
     LruCacheImpl(int capacity) {
+        if (capacity < 0) {
+            throw new IllegalArgumentException("Capacity must not be negative");
+        }
         this.capacity = capacity;
     }
 
     @Override
     public Optional<V> get(K key) {
+        Objects.requireNonNull(key);
         readLock.lock();
         V value;
         try {
@@ -74,8 +79,20 @@ final class LruCacheImpl<K, V> implements LruCache<K, V> {
     }
 
     @Override
-    public Optional<V> remove(K key) {
+    public V peek(K key, V defaultValue) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(defaultValue);
+        readLock.lock();
+        try {
+            return backingMap.getOrDefault(key, defaultValue);
+        } finally {
+            readLock.unlock();
+        }
+    }
 
+    @Override
+    public Optional<V> remove(K key) {
+        Objects.requireNonNull(key);
         writeLock.lock();
         try {
             return Optional.ofNullable(backingMap.remove(key));
@@ -86,6 +103,8 @@ final class LruCacheImpl<K, V> implements LruCache<K, V> {
 
     @Override
     public Optional<V> put(K key, V value) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(value);
         writeLock.lock();
         try {
             V oldValue = backingMap.putLast(key, value);
@@ -96,15 +115,10 @@ final class LruCacheImpl<K, V> implements LruCache<K, V> {
         }
     }
 
-    private void reduceSize() {
-
-        while (backingMap.size() > capacity) {
-            backingMap.pollFirstEntry();
-        }
-    }
-
     @Override
     public Optional<V> computeValue(K key, Supplier<Optional<V>> valueSupplier) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(valueSupplier);
         // get is properly synchronized
         Optional<V> currentValue = get(key);
         if (currentValue.isPresent()) {
@@ -140,6 +154,13 @@ final class LruCacheImpl<K, V> implements LruCache<K, V> {
             backingMap.clear();
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    private void reduceSize() {
+
+        while (backingMap.size() > capacity) {
+            backingMap.pollFirstEntry();
         }
     }
 }

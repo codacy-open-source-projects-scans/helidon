@@ -15,7 +15,6 @@
  */
 package io.helidon.webserver.tests.jsonrpc;
 
-import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -25,13 +24,16 @@ import java.util.concurrent.TimeoutException;
 
 import io.helidon.common.media.type.MediaTypes;
 import io.helidon.http.sse.SseEvent;
+import io.helidon.json.JsonObject;
+import io.helidon.json.JsonParser;
+import io.helidon.webclient.api.HttpClient;
+import io.helidon.webclient.api.WebClient;
 import io.helidon.webclient.http1.Http1Client;
 import io.helidon.webclient.jsonrpc.JsonRpcClient;
 import io.helidon.webclient.sse.SseSource;
+import io.helidon.webserver.WebServer;
 import io.helidon.webserver.testing.junit5.ServerTest;
 
-import jakarta.json.Json;
-import jakarta.json.JsonObject;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.CoreMatchers.is;
@@ -47,40 +49,35 @@ class JsonRpcSseTest extends JsonRpcBaseTest {
                 "id": 1}
             """;
 
-    JsonRpcSseTest(Http1Client client, JsonRpcClient jsonRpcClient) {
+    private final String baseUri;
+
+    JsonRpcSseTest(WebServer server, Http1Client client, JsonRpcClient jsonRpcClient) {
         super(client, jsonRpcClient);
+        this.baseUri = "http://localhost:" + server.port();
     }
 
     @Test
     void testSse() throws ExecutionException, InterruptedException, TimeoutException {
-        CompletableFuture<List<String>> future = new CompletableFuture<>();
+        assertSseMethods(client());
+    }
 
-        try (var res = client().post("/rpc/sse")
-                .contentType(MediaTypes.APPLICATION_JSON)
-                .accept(MediaTypes.TEXT_EVENT_STREAM)
-                .submit(SSE_METHOD)) {
-            assertThat(res.status().code(), is(200));
+    @Test
+    void testSseCloseDoesNotPoisonConnectionCache() throws ExecutionException, InterruptedException, TimeoutException {
+        WebClient webClient = WebClient.builder()
+                .baseUri(baseUri)
+                .protocolPreference(List.of(Http1Client.PROTOCOL_ID))
+                .build();
+        try {
+            try (var res = webClient.post("/rpc/sse")
+                    .contentType(MediaTypes.APPLICATION_JSON)
+                    .accept(MediaTypes.TEXT_EVENT_STREAM)
+                    .submit(SSE_METHOD)) {
+                assertThat(res.status().code(), is(200));
+            }
 
-            res.source(SseSource.TYPE, new SseSource() {
-                private final List<String> methods = new ArrayList<>();
-
-                @Override
-                public void onEvent(SseEvent value) {
-                    String jsonRpc = value.data(String.class);
-                    JsonObject json = Json.createReader(new StringReader(jsonRpc)).readObject();
-                    methods.add(json.getString("method"));
-                }
-
-                @Override
-                public void onClose() {
-                    future.complete(methods);
-                }
-            });
-
-            List<String> methods = future.get(5, TimeUnit.SECONDS);
-            assertThat(methods.size(), is(2));
-            assertThat(methods.getFirst(), is("start"));
-            assertThat(methods.getLast(), is("stop"));
+            assertSseMethods(webClient);
+        } finally {
+            webClient.closeResource();
         }
     }
 
@@ -100,8 +97,8 @@ class JsonRpcSseTest extends JsonRpcBaseTest {
                 @Override
                 public void onEvent(SseEvent value) {
                     String jsonRpc = value.data(String.class);
-                    JsonObject json = Json.createReader(new StringReader(jsonRpc)).readObject();
-                    results.add(json.getString("result"));
+                    JsonObject json = JsonParser.create(jsonRpc).readJsonObject();
+                    results.add(json.stringValue("result").orElseThrow());
                 }
 
                 @Override
@@ -114,6 +111,38 @@ class JsonRpcSseTest extends JsonRpcBaseTest {
             assertThat(results.size(), is(2));
             assertThat(results.getFirst(), is("RUNNING"));
             assertThat(results.getLast(), is("RUNNING"));
+        }
+    }
+
+    private void assertSseMethods(HttpClient<?> client) throws ExecutionException, InterruptedException, TimeoutException {
+        CompletableFuture<List<String>> future = new CompletableFuture<>();
+
+        try (var res = client.post("/rpc/sse")
+                .contentType(MediaTypes.APPLICATION_JSON)
+                .accept(MediaTypes.TEXT_EVENT_STREAM)
+                .submit(SSE_METHOD)) {
+            assertThat(res.status().code(), is(200));
+
+            res.source(SseSource.TYPE, new SseSource() {
+                private final List<String> methods = new ArrayList<>();
+
+                @Override
+                public void onEvent(SseEvent value) {
+                    String jsonRpc = value.data(String.class);
+                    JsonObject json = JsonParser.create(jsonRpc).readJsonObject();
+                    methods.add(json.stringValue("method").orElseThrow());
+                }
+
+                @Override
+                public void onClose() {
+                    future.complete(methods);
+                }
+            });
+
+            List<String> methods = future.get(5, TimeUnit.SECONDS);
+            assertThat(methods.size(), is(2));
+            assertThat(methods.getFirst(), is("start"));
+            assertThat(methods.getLast(), is("stop"));
         }
     }
 }

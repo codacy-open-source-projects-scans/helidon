@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,9 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
+import io.helidon.common.Api;
 import io.helidon.common.Errors;
 import io.helidon.common.types.TypeName;
 
@@ -30,6 +32,7 @@ import io.helidon.common.types.TypeName;
  *
  * @see #builder()
  */
+@Api.Incubating
 public interface OptionProvider extends Prototype.Api {
 
     /**
@@ -59,11 +62,42 @@ public interface OptionProvider extends Prototype.Api {
     TypeName providerType();
 
     /**
+     * Configured provider identity.
+     * The compatibility default identifies providers by both type and name.
+     *
+     * @return configured provider identity
+     */
+    @Api.Internal
+    default Option.Provider.Identity providerIdentity() {
+        return Option.Provider.Identity.TYPE_AND_NAME;
+    }
+
+    /**
+     * Configured provider outer configuration form.
+     * The compatibility default derives the accepted form from the provider identity.
+     *
+     * @return configured provider outer configuration form
+     */
+    @Api.Internal
+    default Option.Provider.ConfigForm configForm() {
+        return Option.Provider.ConfigForm.AUTO;
+    }
+
+    /**
      * Whether to discover services by default.
      *
      * @return whether to discover services
      */
     boolean discoverServices();
+
+    /**
+     * Boolean builder getter that enables provider resolution, or empty for unconditional resolution.
+     *
+     * @return boolean builder getter name
+     */
+    default String enabledBy() {
+        return "";
+    }
 
     /**
      * Fluent API builder base for {@link io.helidon.builder.codegen.OptionProvider}.
@@ -75,6 +109,9 @@ public interface OptionProvider extends Prototype.Api {
             implements Prototype.Builder<BUILDER, PROTOTYPE> {
 
         private boolean discoverServices;
+        private String enabledBy = "";
+        private Option.Provider.ConfigForm configForm = Option.Provider.ConfigForm.AUTO;
+        private Option.Provider.Identity providerIdentity = Option.Provider.Identity.TYPE_AND_NAME;
         private TypeName providerType;
 
         /**
@@ -91,7 +128,10 @@ public interface OptionProvider extends Prototype.Api {
          */
         public BUILDER from(OptionProvider prototype) {
             providerType(prototype.providerType());
+            providerIdentity(prototype.providerIdentity());
+            configForm(prototype.configForm());
             discoverServices(prototype.discoverServices());
+            enabledBy(prototype.enabledBy());
             return self();
         }
 
@@ -103,7 +143,10 @@ public interface OptionProvider extends Prototype.Api {
          */
         public BUILDER from(BuilderBase<?, ?> builder) {
             builder.providerType().ifPresent(this::providerType);
+            providerIdentity(builder.providerIdentity());
+            configForm(builder.configForm());
             discoverServices(builder.discoverServices());
+            enabledBy(builder.enabledBy());
             return self();
         }
 
@@ -149,6 +192,34 @@ public interface OptionProvider extends Prototype.Api {
         }
 
         /**
+         * Configured provider identity.
+         *
+         * @param providerIdentity configured provider identity
+         * @return updated builder instance
+         * @see #providerIdentity()
+         */
+        @Api.Internal
+        public BUILDER providerIdentity(Option.Provider.Identity providerIdentity) {
+            Objects.requireNonNull(providerIdentity);
+            this.providerIdentity = providerIdentity;
+            return self();
+        }
+
+        /**
+         * Configured provider outer configuration form.
+         *
+         * @param configForm configured provider outer configuration form
+         * @return updated builder instance
+         * @see #configForm()
+         */
+        @Api.Internal
+        public BUILDER configForm(Option.Provider.ConfigForm configForm) {
+            Objects.requireNonNull(configForm);
+            this.configForm = configForm;
+            return self();
+        }
+
+        /**
          * Whether to discover services by default.
          *
          * @param discoverServices whether to discover services
@@ -157,6 +228,17 @@ public interface OptionProvider extends Prototype.Api {
          */
         public BUILDER discoverServices(boolean discoverServices) {
             this.discoverServices = discoverServices;
+            return self();
+        }
+
+        /**
+         * Boolean builder getter that enables provider resolution, or empty for unconditional resolution.
+         *
+         * @param enabledBy boolean builder getter name
+         * @return updated builder instance
+         */
+        public BUILDER enabledBy(String enabledBy) {
+            this.enabledBy = Objects.requireNonNull(enabledBy);
             return self();
         }
 
@@ -170,6 +252,26 @@ public interface OptionProvider extends Prototype.Api {
         }
 
         /**
+         * Configured provider identity.
+         *
+         * @return configured provider identity
+         */
+        @Api.Internal
+        public Option.Provider.Identity providerIdentity() {
+            return providerIdentity;
+        }
+
+        /**
+         * Configured provider outer configuration form.
+         *
+         * @return configured provider outer configuration form
+         */
+        @Api.Internal
+        public Option.Provider.ConfigForm configForm() {
+            return configForm;
+        }
+
+        /**
          * Whether to discover services by default.
          *
          * @return whether to discover services
@@ -178,11 +280,23 @@ public interface OptionProvider extends Prototype.Api {
             return discoverServices;
         }
 
+        /**
+         * Boolean builder getter that enables provider resolution, or empty for unconditional resolution.
+         *
+         * @return boolean builder getter name
+         */
+        public String enabledBy() {
+            return enabledBy;
+        }
+
         @Override
         public String toString() {
             return "OptionProviderBuilder{"
                     + "providerType=" + providerType + ","
-                    + "discoverServices=" + discoverServices
+                    + "providerIdentity=" + providerIdentity + ","
+                    + "configForm=" + configForm + ","
+                    + "discoverServices=" + discoverServices + ","
+                    + "enabledBy=" + enabledBy
                     + "}";
         }
 
@@ -209,6 +323,9 @@ public interface OptionProvider extends Prototype.Api {
         protected static class OptionProviderImpl implements OptionProvider {
 
             private final boolean discoverServices;
+            private final String enabledBy;
+            private final Option.Provider.ConfigForm configForm;
+            private final Option.Provider.Identity providerIdentity;
             private final TypeName providerType;
 
             /**
@@ -218,7 +335,10 @@ public interface OptionProvider extends Prototype.Api {
              */
             protected OptionProviderImpl(BuilderBase<?, ?> builder) {
                 this.providerType = builder.providerType().get();
+                this.providerIdentity = builder.providerIdentity();
+                this.configForm = builder.configForm();
                 this.discoverServices = builder.discoverServices();
+                this.enabledBy = builder.enabledBy();
             }
 
             @Override
@@ -227,15 +347,35 @@ public interface OptionProvider extends Prototype.Api {
             }
 
             @Override
+            @Api.Internal
+            public Option.Provider.Identity providerIdentity() {
+                return providerIdentity;
+            }
+
+            @Override
+            @Api.Internal
+            public Option.Provider.ConfigForm configForm() {
+                return configForm;
+            }
+
+            @Override
             public boolean discoverServices() {
                 return discoverServices;
+            }
+
+            @Override
+            public String enabledBy() {
+                return enabledBy;
             }
 
             @Override
             public String toString() {
                 return "OptionProvider{"
                         + "providerType=" + providerType + ","
-                        + "discoverServices=" + discoverServices
+                        + "providerIdentity=" + providerIdentity + ","
+                        + "configForm=" + configForm + ","
+                        + "discoverServices=" + discoverServices + ","
+                        + "enabledBy=" + enabledBy
                         + "}";
             }
 
@@ -248,12 +388,15 @@ public interface OptionProvider extends Prototype.Api {
                     return false;
                 }
                 return Objects.equals(providerType, other.providerType())
-                        && discoverServices == other.discoverServices();
+                        && Objects.equals(providerIdentity, other.providerIdentity())
+                        && Objects.equals(configForm, other.configForm())
+                        && discoverServices == other.discoverServices()
+                        && Objects.equals(enabledBy, other.enabledBy());
             }
 
             @Override
             public int hashCode() {
-                return Objects.hash(providerType, discoverServices);
+                return Objects.hash(providerType, providerIdentity, configForm, discoverServices, enabledBy);
             }
 
         }

@@ -17,6 +17,7 @@ package io.helidon.metrics.api;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -27,17 +28,6 @@ import io.helidon.metrics.spi.MetricsPublisherProvider;
 
 /**
  * Configuration settings for metrics.
- *
- * <h2>Scope handling configuration</h2>
- * Helidon allows developers to associate a scope with each meter. The {@value SCOPE_CONFIG_KEY} subsection of the
- * {@value METRICS_CONFIG_KEY} configuration controls
- * <ul>
- *     <li>the default scope value to use if a meter is registered without an explicit scope setting, and</li>
- *     <li>whether and how Helidon records each meter's scope as a tag in the underlying implementation meter registry.
- *     <p>
- *         Specifically, users can specify whether scope tags are used at all and, if so, what tag name to use.
- *     </li>
- * </ul>
  */
 @Prototype.Configured(MetricsConfigBlueprint.METRICS_CONFIG_KEY)
 @Prototype.Blueprint(decorator = MetricsConfigSupport.BuilderDecorator.class)
@@ -50,8 +40,11 @@ interface MetricsConfigBlueprint {
     String METRICS_CONFIG_KEY = "metrics";
 
     /**
-     * Config key for scope-related settings.
+     * Legacy scope configuration key retained for compatibility.
+     *
+     * @deprecated Core metrics ignores scope configuration, and this constant will be removed.
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     String SCOPE_CONFIG_KEY = "scoping";
 
     /**
@@ -65,30 +58,6 @@ interface MetricsConfigBlueprint {
     TimeUnit DEFAULT_JSON_UNITS_DEFAULT = TimeUnit.SECONDS;
 
     /**
-     * This method is internal and will be removed without replacement.
-     *
-     * @param globalTagExpression config node
-     * @return list of tags
-     * @deprecated this is an internal method used from the builder, will be removed without replacement
-     */
-    @Deprecated(forRemoval = true, since = "4.3.0")
-    static List<Tag> createTags(Config globalTagExpression) {
-        return createTags(globalTagExpression.asString().get());
-    }
-
-    /**
-     * This method is internal and will be removed without replacement.
-     *
-     * @param pairs tag pairs
-     * @return list of tags
-     * @deprecated this is an internal method used from the builder, will be removed without replacement
-     */
-    @Deprecated(forRemoval = true, since = "4.3.0")
-    static List<Tag> createTags(String pairs) {
-        return MetricsConfigSupport.createTags(pairs);
-    }
-
-    /**
      * Whether metrics functionality is enabled.
      *
      * @return if metrics are configured to be enabled
@@ -98,9 +67,22 @@ interface MetricsConfigBlueprint {
     boolean enabled();
 
     /**
-     * Whether to allow anybody to access the endpoint.
+     * Ordered settings for meters, selected by name pattern across all tags in this registry.
+     * The first pattern matching the entire meter name supplies all settings; matching entries are not merged.
+     * Unmatched meters retain their existing settings.
      *
-     * @return whether to permit access to metrics endpoint to anybody, defaults to {@code true}
+     * @return meter settings
+     * @since 28.0.0
+     */
+    @Option.Configured
+    @Option.Singular
+    List<MeterConfig> meters();
+
+    /**
+     * Whether to allow anybody to access the metrics endpoint when this config is used by a metrics observer.
+     * This setting has no effect in the top-level {@code metrics} config which controls the shared registry.
+     *
+     * @return whether to permit access to the observer's metrics endpoint to anybody, defaults to {@code true}
      * @see #roles()
      */
     @Option.Configured
@@ -108,9 +90,11 @@ interface MetricsConfigBlueprint {
     boolean permitAll();
 
     /**
-     * Hints for role names the user is expected to be in.
+     * Role names allowed to access the metrics endpoint when this config is used by a metrics observer and
+     * {@link #permitAll()} is {@code false}.
+     * This setting has no effect in the top-level {@code metrics} config which controls the shared registry.
      *
-     * @return list of hints
+     * @return allowed role names
      */
     @Option.Configured
     @Option.Default("observe")
@@ -150,11 +134,13 @@ interface MetricsConfigBlueprint {
     Optional<String> appTagName();
 
     /**
-     * Settings related to scoping management.
+     * Returns scope settings retained for compatibility; core metrics ignores them.
      *
-     * @return scoping settings
+     * @return configured scope settings
+     * @deprecated Core metrics ignores these settings, and this method will be removed.
      */
-    @Option.Configured
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    @Option.Configured(metadata = false)
     ScopingConfig scoping();
 
     /**
@@ -165,19 +151,6 @@ interface MetricsConfigBlueprint {
     @Option.Configured("rest-request.enabled")
     @Option.DefaultBoolean(false)
     boolean restRequestEnabled();
-
-    /**
-     * Whether automatic REST request metrics should be measured (as indicated by the deprecated config
-     * key {@code rest-request-enabled}, the config key using a hyphen instead of a dot separator).
-     *
-     * @return true/false
-     * @deprecated Use {@code rest-request.enabled} instead.
-     */
-    @Deprecated(since = "4.2.3", forRemoval = true)
-    @Option.Configured("rest-request-enabled")
-    @Option.Access("")
-    @Option.Decorator(MetricsConfigSupport.RestRequestEnabledDecorator.class)
-    Optional<Boolean> restRequestEnabledShadow();
 
     /**
      * Whether Helidon should expose meters related to virtual threads.
@@ -206,20 +179,6 @@ interface MetricsConfigBlueprint {
     Config config();
 
     /**
-     * Whether the {@code gc.time} meter should be registered as a gauge (vs. a counter).
-     * The {@code gc.time} meter is inspired by the MicroProfile Metrics spec, in which the meter was originally checked to
-     * be a counter but starting in 5.1 was checked be a gauge. For the duration of Helidon 4.x users can choose which
-     * type of meter Helidon registers for {@code gc.time}.
-     *
-     * @return the type of meter to use for registering {@code gc.time}
-     * @deprecated Provided for backward compatibility only; no replacement
-     */
-    @Deprecated(since = "4.1", forRemoval = true)
-    @Option.Configured
-    @Option.Default("COUNTER")
-    GcTimeType gcTimeType();
-
-    /**
      * Output format for built-in meter names.
      * <p>
      * {@link BuiltInMeterNameFormat#SNAKE} selects "snake_case" which does not conform to the MicroProfile
@@ -228,7 +187,7 @@ interface MetricsConfigBlueprint {
      * @return the output format for built-in meter names
      */
     @Option.Configured
-    @Option.Default(BuiltInMeterNameFormat.DEFAULT)
+    @Option.Default("CAMEL")
     BuiltInMeterNameFormat builtInMeterNameFormat();
 
     /**
@@ -258,7 +217,7 @@ interface MetricsConfigBlueprint {
 
     /**
      * Metrics publishers which make the metrics data available to external systems. Helidon's Micrometer-based
-     * metrics provider includes {@code micrometer-prometheus} (used by default) and {@code micrometer-otlp}.
+     * metrics provider includes publishers with the config keys {@code prometheus} (inferred by default) and {@code otlp}.
      * See the config reference entries for {@code io.helidon.metrics.providers.micrometer.PrometheusPublisher} and
      * {@code io.helidon.metrics.providers.micrometer.OtlpPublisher}.
      *
@@ -270,29 +229,62 @@ interface MetricsConfigBlueprint {
     List<MetricsPublisher> publishers();
 
     /**
-     * Reports whether the specified scope is enabled, according to any scope configuration that
-     * is part of this metrics configuration.
+     * Always returns {@code true} because core metrics does not apply scope filtering.
      *
-     * @param scope scope name
-     * @return true if the scope as a whole is enabled; false otherwise
+     * @param scope ignored; must not be {@code null}
+     * @return true
+     * @deprecated Core metrics does not apply scope filtering, and this method will be removed.
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     default boolean isScopeEnabled(String scope) {
-        var scopeConfig = scoping().scopes().get(scope);
-        return scopeConfig == null || scopeConfig.enabled();
+        Objects.requireNonNull(scope);
+        return true;
     }
 
     /**
-     * Determines whether the meter with the specified name and within the indicated scope is enabled.
+     * Finds the first configuration whose pattern matches the entire meter name, regardless of global enablement.
      *
-     * @param name  meter name
-     * @param scope scope name
+     * @param name meter name before exporter-specific naming conversion
+     * @return matching meter configuration, or empty if no pattern matches
+     * @since 28.0.0
+     */
+    default Optional<MeterConfig> meterConfig(String name) {
+        Objects.requireNonNull(name);
+        for (MeterConfig meter : meters()) {
+            if (meter.namePattern().matcher(name).matches()) {
+                return Optional.of(meter);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Determines whether the meter with the specified name is enabled.
+     * Globally disabled metrics take precedence; otherwise, the first matching meter configuration applies.
+     * Meters without a matching configuration are enabled.
+     *
+     * @param name meter name
      * @return whether the meter is enabled
      */
+    default boolean isMeterEnabled(String name) {
+        Objects.requireNonNull(name);
+        if (!enabled()) {
+            return false;
+        }
+        return meterConfig(name).map(MeterConfig::enabled).orElse(true);
+    }
+
+    /**
+     * Determines whether the meter with the specified name is enabled, ignoring the scope.
+     *
+     * @param name  meter name
+     * @param scope ignored; must not be {@code null}
+     * @return whether the meter is enabled
+     * @deprecated Use {@link #isMeterEnabled(String)}. Scope is ignored and this method will be removed.
+     */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     default boolean isMeterEnabled(String name, String scope) {
-        return enabled()
-                && isScopeEnabled(scope)
-                && (
-                scoping().scopes().get(scope) == null
-                        || scoping().scopes().get(scope).isMeterEnabled(name));
+        Objects.requireNonNull(scope);
+        return isMeterEnabled(name);
     }
 }

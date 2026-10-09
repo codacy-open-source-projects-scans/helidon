@@ -17,9 +17,12 @@
 package io.helidon.declarative.tests.http;
 
 import java.net.URI;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 
+import io.helidon.common.media.type.MediaTypes;
 import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
@@ -60,6 +63,7 @@ class DeclarativeHttpTest {
     @BeforeEach
     void beforeEach() {
         SomeEntryPointInterceptor.reset();
+        InheritedFtEndpoint.reset();
     }
 
     @Test
@@ -84,6 +88,38 @@ class DeclarativeHttpTest {
         var all = typedClient.greetings();
 
         assertThat(all, hasItem(is(new GreetingDto("Hello"))));
+    }
+
+    @Test
+    void testQuery() {
+        GreetServiceClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(GreetServiceClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        assertThat(typedClient.query("name = 'Ada'"), is("Result: name = 'Ada'"));
+    }
+
+    @Test
+    void testCaseDistinctCustomMethods() {
+        GreetServiceClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(GreetServiceClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        assertThat(typedClient.uppercaseCustomMethod(), is("CASE"));
+        assertThat(typedClient.lowercaseCustomMethod(), is("case"));
+    }
+
+    @Test
+    void testInheritedClientRetry() {
+        InheritedFtClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(InheritedFtClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        assertThat(typedClient.retry(), is("retried"));
+        assertThat(InheritedFtEndpoint.calls(), is(2));
     }
 
     @Test
@@ -169,6 +205,25 @@ class DeclarativeHttpTest {
     }
 
     @Test
+    void testQueryListAbsent() {
+        var response = client.get("/greet/query-list")
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Query parameter param is not present in the request."));
+    }
+
+    @Test
+    void testQueryListWithoutValue() {
+        var response = client.get()
+                .uri(URI.create("/greet/query-list?param"))
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("[]"));
+    }
+
+    @Test
     void testQueryOptionalListAbsent() {
         var response = client.get("/greet/query-optional-list")
                 .request(String.class);
@@ -218,6 +273,26 @@ class DeclarativeHttpTest {
     }
 
     @Test
+    void testServerResponseOutputStream() {
+        try (var response = client.get("/greet/output-stream").request()) {
+            assertThat(response.status(), is(Status.CREATED_201));
+            assertThat(response.headers().contentType().orElseThrow().text(), is("text/plain"));
+            assertThat(response.headers().get(HeaderNames.create("X-Stream")).get(), is("true"));
+            assertThat(response.entity().as(String.class), is("streamed"));
+        }
+    }
+
+    @Test
+    void testInputStreamServerResponseEcho() {
+        String entity = "echoed entity";
+        var response = client.post("/greet/input-stream-output-stream")
+                .submit(entity, String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is(entity));
+    }
+
+    @Test
     void testQueryParamEmptyStringPreserved() {
         try (var response = client.get("/greet/query-param")
                 .queryParam("param", "")
@@ -237,6 +312,349 @@ class DeclarativeHttpTest {
 
         assertThat(response.status(), is(Status.BAD_REQUEST_400));
         assertThat(response.entity(), is("Query parameter param has invalid value."));
+    }
+
+    @Test
+    void testRequestParams() {
+        var response = client.post("/request-params/grouped")
+                .header(HeaderValues.create(HeaderNames.create("X-CUSTOM"), "Expected-header"))
+                .header(HeaderValues.create(HeaderNames.COOKIE, "myCookie=Expected-cookie"))
+                .header(HeaderValues.CONTENT_TYPE_TEXT_PLAIN)
+                .queryParam("param", "first", "second")
+                .submit("Expected-entity", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("Expected-header|[first, second]|Expected-cookie|Expected-entity"));
+    }
+
+    @Test
+    void testRequestParamsMissingEntity() {
+        var response = client.post("/request-params/grouped")
+                .header(HeaderValues.create(HeaderNames.create("X-CUSTOM"), "Expected-header"))
+                .header(HeaderValues.create(HeaderNames.COOKIE, "myCookie=Expected-cookie"))
+                .header(HeaderValues.CONTENT_TYPE_TEXT_PLAIN)
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Entity entity is not present in the request."));
+    }
+
+    @Test
+    void testRequestParamsPath() {
+        var response = client.get("/request-params/path/Expected-path")
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("Expected-path"));
+    }
+
+    @Test
+    void testFormParam() {
+        var response = client.post("/request-params/form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=Expected+form&second=Second+form", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("Expected form|Second form"));
+    }
+
+    @Test
+    void testFormParamEmptyStringPreserved() {
+        var response = client.post("/request-params/form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=&second=Second+form", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("|Second form"));
+    }
+
+    @Test
+    void testMissingFormParam() {
+        var response = client.post("/request-params/form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=Expected+form", String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Form parameter second is not present in the request."));
+    }
+
+    @Test
+    void testMissingFormEntity() {
+        var response = client.post("/request-params/form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Form parameter first is not present in the request."));
+    }
+
+    @Test
+    void testInvalidFormEntity() {
+        var response = client.post("/request-params/form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=%zz&second=Second+form", String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Failed to read form parameters."));
+    }
+
+    @Test
+    void testMissingFormListParam() {
+        var response = client.post("/request-params/form-list")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("", String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Form parameter tag is not present in the request."));
+    }
+
+    @Test
+    void testFormListParam() {
+        var response = client.post("/request-params/form-list")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("tag=first&tag=second", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("[first, second]"));
+    }
+
+    @Test
+    void testGroupedFormParam() {
+        var response = client.post("/request-params/grouped-form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=Expected+form&second=Second+form", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("Expected form|Second form"));
+    }
+
+    @Test
+    void testGroupedFormParamEmptyStringPreserved() {
+        var response = client.post("/request-params/grouped-form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=&second=Second+form", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("|Second form"));
+    }
+
+    @Test
+    void testMissingGroupedFormParam() {
+        var response = client.post("/request-params/grouped-form")
+                .header(HeaderNames.CONTENT_TYPE, MediaTypes.APPLICATION_FORM_URLENCODED.text())
+                .submit("first=Expected+form", String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Form parameter second is not present in the request."));
+    }
+
+    @Test
+    void testRequestParamsClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        String response = typedClient.grouped(new CustomRequestParams("Expected-header",
+                                                                      Optional.of(List.of("first", "second")),
+                                                                      "Expected-cookie",
+                                                                      "Expected-entity"));
+        assertThat(response, is("Expected-header|[first, second]|Expected-cookie|Expected-entity"));
+    }
+
+    @Test
+    void testRequestParamsPathClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.path(new CustomPathParams("Expected-path")), is("Expected-path"));
+    }
+
+    @Test
+    void testFormParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.form("Expected form", "Second form"), is("Expected form|Second form"));
+    }
+
+    @Test
+    void testFormParamClientEmptyStringPreserved() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.form("", "Second form"), is("|Second form"));
+    }
+
+    @Test
+    void testFormListParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.formList(List.of("first", "second")), is("[first, second]"));
+    }
+
+    @Test
+    void testGroupedFormParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.groupedForm(new CustomFormParams("Expected form", "Second form")),
+                   is("Expected form|Second form"));
+    }
+
+    @Test
+    void testCookieParamsClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.cookies("Expected-first", "Expected-second"),
+                   is("Expected-first|Expected-second"));
+    }
+
+    @Test
+    void testCookieListParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.cookiesList(List.of("first", "second")), is("[first, second]"));
+    }
+
+    @Test
+    void testEmptyCookieListParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var thrown = assertThrows(IllegalArgumentException.class, () -> typedClient.cookiesList(List.of()));
+
+        assertThat(thrown.getMessage(), is("Cookie parameter tag has no values."));
+    }
+
+    @Test
+    void testCookieParamsClientMergesStaticCookieHeader() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        assertThat(typedClient.cookiesWithStatic("Expected-first", "Expected-second"),
+                   is("Expected-static|Expected-first|Expected-second"));
+    }
+
+    @Test
+    void testInvalidCookieParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var exception = assertThrows(IllegalArgumentException.class,
+                                     () -> typedClient.cookies("Expected-first; injected=true", "Expected-second"));
+        assertThat(exception.getMessage(), is("Cookie parameter first has invalid value."));
+    }
+
+    @Test
+    void testNullCookieParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var exception = assertThrows(NullPointerException.class,
+                                     () -> typedClient.cookies(null, "Expected-second"));
+        assertThat(exception.getMessage(), is("Cookie parameter first must not be null."));
+    }
+
+    @Test
+    void testNullFormParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var exception = assertThrows(NullPointerException.class,
+                                     () -> typedClient.form(null, "Second form"));
+        assertThat(exception.getMessage(), is("Form parameter first must not be null."));
+    }
+
+    @Test
+    void testNullListParamClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var exception = assertThrows(NullPointerException.class, () -> typedClient.formList(null));
+        assertThat(exception.getMessage(), is("Form parameter tag must not be null."));
+
+        exception = assertThrows(NullPointerException.class, () -> typedClient.cookiesList(null));
+        assertThat(exception.getMessage(), is("Cookie parameter tag must not be null."));
+
+        exception = assertThrows(NullPointerException.class, () -> typedClient.cookiesList(Arrays.asList("first", null)));
+        assertThat(exception.getMessage(), is("Cookie parameter tag must not be null."));
+    }
+
+    @Test
+    void testNullRequestParamsClient() {
+        RequestParamsClient typedClient = registry.get(Lookup.builder()
+                                                               .addContract(RequestParamsClient.class)
+                                                               .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                               .build());
+
+        var exception = assertThrows(NullPointerException.class, () -> typedClient.grouped(null));
+        assertThat(exception.getMessage(), is("@Http.RequestParams parameter params must not be null."));
+
+        exception = assertThrows(NullPointerException.class,
+                                 () -> typedClient.grouped(new CustomRequestParams(null,
+                                                                                   Optional.of(List.of("first")),
+                                                                                   "Expected-cookie",
+                                                                                   "Expected-entity")));
+        assertThat(exception.getMessage(), is("Header X-CUSTOM must not be null."));
+
+        exception = assertThrows(NullPointerException.class,
+                                 () -> typedClient.grouped(new CustomRequestParams("Expected-header",
+                                                                                   null,
+                                                                                   "Expected-cookie",
+                                                                                   "Expected-entity")));
+        assertThat(exception.getMessage(), is("Query parameter param must not be null."));
+
+        exception = assertThrows(NullPointerException.class, () -> typedClient.path(new CustomPathParams(null)));
+        assertThat(exception.getMessage(), is("Path parameter value must not be null."));
+    }
+
+    @Test
+    void testCookieListParam() {
+        var response = client.get("/request-params/cookies-list")
+                .header(HeaderValues.create(HeaderNames.COOKIE, "tag=first; tag=second"))
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("[first, second]"));
+    }
+
+    @Test
+    void testMissingCookieListParam() {
+        var response = client.get("/request-params/cookies-list")
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Cookie tag is not present in the request."));
     }
 
     @Test
@@ -283,6 +701,78 @@ class DeclarativeHttpTest {
     }
 
     @Test
+    void testClassLevelMediaTypes() {
+        JsonObject expected = JsonObject.builder()
+                .set("message", "default")
+                .build();
+
+        var defaultResponse = client.post("/media-type-defaults")
+                .accept(MediaTypes.APPLICATION_JSON)
+                .contentType(MediaTypes.APPLICATION_JSON)
+                .submit(expected, JsonObject.class);
+        assertThat(defaultResponse.status(), is(Status.OK_200));
+        assertThat(defaultResponse.headers().contentType().orElseThrow().mediaType(), is(MediaTypes.APPLICATION_JSON));
+        assertThat(defaultResponse.entity(), is(expected));
+
+        var overrideResponse = client.post("/media-type-defaults/override")
+                .accept(MediaTypes.TEXT_PLAIN)
+                .contentType(MediaTypes.TEXT_PLAIN)
+                .submit("override", String.class);
+        assertThat(overrideResponse.status(), is(Status.OK_200));
+        assertThat(overrideResponse.headers().contentType().orElseThrow().mediaType(), is(MediaTypes.TEXT_PLAIN));
+        assertThat(overrideResponse.entity(), is("override"));
+
+        try (var inheritedMediaResponse = client.post("/media-type-defaults/override")
+                .accept(MediaTypes.APPLICATION_JSON)
+                .contentType(MediaTypes.APPLICATION_JSON)
+                .submit(expected)) {
+            assertThat(inheritedMediaResponse.status(), is(Status.NOT_FOUND_404));
+        }
+
+        var noEntityResponse = client.get("/media-type-defaults/no-entity")
+                .accept(MediaTypes.APPLICATION_JSON)
+                .request(JsonObject.class);
+        assertThat(noEntityResponse.status(), is(Status.OK_200));
+        assertThat(noEntityResponse.entity().booleanValue("contentTypePresent").orElseThrow(), is(false));
+
+        var clearResponse = client.post("/media-type-defaults/clear")
+                .accept(MediaTypes.TEXT_PLAIN)
+                .contentType(MediaTypes.TEXT_PLAIN)
+                .submit("clear", String.class);
+        assertThat(clearResponse.status(), is(Status.OK_200));
+        assertThat(clearResponse.headers().contentType().orElseThrow().mediaType(), is(MediaTypes.TEXT_PLAIN));
+        assertThat(clearResponse.entity(), is("clear|true|false"));
+
+        MediaTypeDefaultsClient typedClient = registry.get(Lookup.builder()
+                                                                   .addContract(MediaTypeDefaultsClient.class)
+                                                                   .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                                   .build());
+
+        assertThat(typedClient.defaults(expected), is(expected));
+        assertThat(typedClient.override("override"), is("override"));
+        assertThat(typedClient.noEntity().booleanValue("contentTypePresent").orElseThrow(), is(false));
+
+        assertThat(typedClient.clear("clear"), is("clear|true|false"));
+    }
+
+    @Test
+    void testTypedClientNullParams() {
+        GreetServiceClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(GreetServiceClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        var exception = assertThrows(NullPointerException.class, () -> typedClient.failingFallback(null));
+        assertThat(exception.getMessage(), is("Header Host must not be null."));
+
+        exception = assertThrows(NullPointerException.class, () -> typedClient.timeout(null));
+        assertThat(exception.getMessage(), is("Query parameter sleepSeconds must not be null."));
+
+        exception = assertThrows(NullPointerException.class, () -> typedClient.getMessageHandler(null));
+        assertThat(exception.getMessage(), is("Path parameter name must not be null."));
+    }
+
+    @Test
     void testServerRequestInjection() {
         var response = client.post("/greet/server-request")
                 .queryParam("greet", "hello")
@@ -290,5 +780,102 @@ class DeclarativeHttpTest {
 
         assertThat(response.status(), is(Status.OK_200));
         assertThat(response.entity(), is("hello"));
+    }
+
+    @Test
+    void testTypedClientOptionalResponse() {
+        GreetServiceClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(GreetServiceClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        JsonObject expected = typedClient.getMessageHandler("optional");
+        var rawPresent = client.get("/greet/optional-present/optional").request(JsonObject.class);
+        assertThat(rawPresent.status(), is(Status.OK_200));
+        assertThat(rawPresent.entity(), is(expected));
+        Optional<JsonObject> present = typedClient.optionalMessage("optional");
+        assertThat(present.isPresent(), is(true));
+        assertThat(present.orElseThrow(), is(expected));
+
+        try (var rawEmpty = client.get("/greet/optional/empty").request()) {
+            assertThat(rawEmpty.status(), is(Status.NO_CONTENT_204));
+        }
+        Optional<JsonObject> empty = typedClient.optionalMessageEmpty();
+        assertThat(empty.isEmpty(), is(true));
+
+        try (var rawNotFound = client.get("/greet/optional/not-found").request()) {
+            assertThat(rawNotFound.status(), is(Status.NOT_FOUND_404));
+        }
+        Optional<JsonObject> notFound = typedClient.optionalMessageNotFound();
+        assertThat(notFound.isEmpty(), is(true));
+    }
+
+    @Test
+    void testTypedClientOptionalResponseCustomErrorHandler() {
+        GreetServiceClient typedClient = registry.get(Lookup.builder()
+                                                              .addContract(GreetServiceClient.class)
+                                                              .addQualifier(Qualifier.create(RestClient.Client.class))
+                                                              .build());
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                                                       typedClient::optionalMessageNotFoundHandled);
+        assertThat(exception.getMessage(), is("optional 404 handled"));
+    }
+
+    @Test
+    void testInputStreamEntityEcho() {
+        var response = client.post("/greet/input-stream")
+                .submit("hello", String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("hello"));
+    }
+
+    @Test
+    void testInputStreamEntityEmptyContentLengthFailure() {
+        var response = client.post("/greet/input-stream")
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.BAD_REQUEST_400));
+        assertThat(response.entity(), is("Entity inputStream is not present in the request."));
+    }
+
+    @Test
+    void testOptionalEntityEmptyContent() {
+        var response = client.post("/greet/optional-entity")
+                .request(String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("none"));
+    }
+
+    @Test
+    void testOptionalInputStreamEntity() {
+        var presentResponse = client.post("/greet/optional-input-stream")
+                .submit("hello", String.class);
+
+        assertThat(presentResponse.status(), is(Status.OK_200));
+        assertThat(presentResponse.entity(), is("hello"));
+
+        var emptyResponse = client.post("/greet/optional-input-stream")
+                .request(String.class);
+
+        assertThat(emptyResponse.status(), is(Status.OK_200));
+        assertThat(emptyResponse.entity(), is("none"));
+    }
+
+    @Test
+    void testOptionalByteArrayEntity() {
+        var presentResponse = client.post("/greet/optional-byte-array")
+                .submit("hello", String.class);
+
+        assertThat(presentResponse.status(), is(Status.OK_200));
+        assertThat(presentResponse.entity(), is("hello"));
+
+        var emptyResponse = client.post("/greet/optional-byte-array")
+                .request(String.class);
+
+        assertThat(emptyResponse.status(), is(Status.OK_200));
+        assertThat(emptyResponse.entity(), is("none"));
     }
 }

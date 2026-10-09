@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,12 +24,17 @@ import java.util.stream.Stream;
 import io.helidon.common.uri.UriFragment;
 import io.helidon.common.uri.UriPath;
 import io.helidon.common.uri.UriQuery;
+import io.helidon.http.DirectHandler;
 import io.helidon.http.HttpPrologue;
 import io.helidon.http.Method;
+import io.helidon.http.ServerResponseHeaders;
 import io.helidon.http.Status;
+import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.ReadableEntityBase;
 import io.helidon.webserver.CloseConnectionException;
 import io.helidon.webserver.ConnectionContext;
+import io.helidon.webserver.ErrorHandling;
+import io.helidon.webserver.ListenerConfig;
 import io.helidon.webserver.ListenerContext;
 
 import org.hamcrest.Matcher;
@@ -46,6 +51,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -120,7 +126,63 @@ class ErrorHandlersTest {
 
         testHandler(handlers, new TopRuntimeException(), "Top");
         testHandler(handlers, new ChildRuntimeException(), "Child");
-        testNoHandler(handlers, new OtherException(), "Other");
+        testNoHandler(handlers, new OtherException(), "Other", true);
+        testNoHandler(handlers, new OtherException(), "Internal Server Error", false);
+    }
+
+    @Test
+    void testNoHandlerWithIncludedEntity() {
+        ErrorHandlers handlers = ErrorHandlers.create(Map.of());
+
+        testNoHandler(handlers, new OtherException(), "Other", true);
+    }
+
+    @Test
+    void testCustomDirectHandlerEntityReturnedWithDefaultErrorHandling() {
+        ErrorHandlers handlers = ErrorHandlers.create(Map.of());
+        ConnectionContext ctx = mock(ConnectionContext.class);
+        RoutingRequest req = mock(RoutingRequest.class);
+        RoutingResponse res = mock(RoutingResponse.class);
+        ListenerContext listenerContext = mock(ListenerContext.class);
+
+        when(res.resetEntity()).thenReturn(true);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
+        when(req.prologue()).thenReturn(HttpPrologue.create("http/1.0",
+                                                            "http",
+                                                            "1.0",
+                                                            Method.GET,
+                                                            UriPath.create("/"),
+                                                            UriQuery.empty(),
+                                                            UriFragment.empty()));
+        when(req.content()).thenReturn(ReadableEntityBase.empty());
+        when(ctx.listenerContext()).thenReturn(listenerContext);
+        when(listenerContext.contentEncodingContext()).thenReturn(mock(ContentEncodingContext.class));
+        when(listenerContext.config()).thenReturn(ListenerConfig.builder()
+                                                  .errorHandling(ErrorHandling.builder()
+                                                                         .includeEntity(false)
+                                                                         .build())
+                                                  .build());
+        when(listenerContext.directHandlers()).thenReturn(DirectHandlers.builder()
+                                                           .addHandler(DirectHandler.EventType.INTERNAL_ERROR,
+                                                                       (request, eventType, status, headers, message) ->
+                                                                               DirectHandler.TransportResponse.builder()
+                                                                                       .status(status)
+                                                                                       .entity("Custom error response")
+                                                                                       .build())
+                                                           .build());
+
+        handlers.runWithErrorHandling(ctx, req, res, () -> {
+            throw new OtherException();
+        });
+
+        verify(res, never()).automaticContentEncoding(false);
+        var status = ArgumentCaptor.forClass(Status.class);
+        verify(res).status(status.capture());
+        assertThat(status.getValue(), is(Status.INTERNAL_SERVER_ERROR_500));
+
+        var sent = ArgumentCaptor.forClass(byte[].class);
+        verify(res).send(sent.capture());
+        assertThat(new String(sent.getValue(), StandardCharsets.UTF_8), is("Custom error response"));
     }
 
     @Test
@@ -128,7 +190,7 @@ class ErrorHandlersTest {
         ConnectionContext ctx = mock(ConnectionContext.class);
         RoutingRequest req = mock(RoutingRequest.class);
         RoutingResponse res = mock(RoutingResponse.class);
-        when(res.resetStream()).thenReturn(false);
+        when(res.resetEntity()).thenReturn(false);
         ErrorHandlers handlers = ErrorHandlers.create(Map.of(OtherException.class,
                 (request, response, t) -> res.send(t.getMessage())));
         try {
@@ -141,12 +203,12 @@ class ErrorHandlersTest {
         }
     }
 
-    private void testNoHandler(ErrorHandlers handlers, Exception e, String message) {
+    private void testNoHandler(ErrorHandlers handlers, Exception e, String message, boolean includeEntity) {
         ConnectionContext ctx = mock(ConnectionContext.class);
         RoutingRequest req = mock(RoutingRequest.class);
         RoutingResponse res = mock(RoutingResponse.class);
-        when(res.resetStream()).thenReturn(true);
-
+        when(res.resetEntity()).thenReturn(true);
+        when(res.headers()).thenReturn(ServerResponseHeaders.create());
         when(req.prologue()).thenReturn(HttpPrologue.create("http/1.0",
                                                             "http",
                                                             "1.0",
@@ -157,6 +219,12 @@ class ErrorHandlersTest {
         when(req.content()).thenReturn(ReadableEntityBase.empty());
         ListenerContext listenerContext = mock(ListenerContext.class);
         when(ctx.listenerContext()).thenReturn(listenerContext);
+        when(listenerContext.contentEncodingContext()).thenReturn(mock(ContentEncodingContext.class));
+        when(listenerContext.config()).thenReturn(ListenerConfig.builder()
+                                                  .errorHandling(ErrorHandling.builder()
+                                                                         .includeEntity(includeEntity)
+                                                                         .build())
+                                                  .build());
         when(listenerContext.directHandlers()).thenReturn(DirectHandlers.builder().build());
 
         handlers.runWithErrorHandling(ctx, req, res, () -> {
@@ -169,15 +237,18 @@ class ErrorHandlersTest {
 
         var sent = ArgumentCaptor.forClass(byte[].class);
         verify(res).send(sent.capture());
-        assertThat(sent.getValue(), is("Other".getBytes(StandardCharsets.UTF_8)));
+        assertThat(new String(sent.getValue(), StandardCharsets.UTF_8), is(message));
     }
 
     private void testHandler(ErrorHandlers handlers, Exception e, String message) {
         ConnectionContext ctx = mock(ConnectionContext.class);
         RoutingRequest req = mock(RoutingRequest.class);
         RoutingResponse res = mock(RoutingResponse.class);
+        ListenerContext listenerContext = mock(ListenerContext.class);
         when(res.isSent()).thenReturn(true);
-        when(res.resetStream()).thenReturn(true);
+        when(res.resetEntity()).thenReturn(true);
+        when(ctx.listenerContext()).thenReturn(listenerContext);
+        when(listenerContext.contentEncodingContext()).thenReturn(mock(ContentEncodingContext.class));
 
         handlers.runWithErrorHandling(ctx, req, res, () -> {
             throw e;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,10 @@ package io.helidon.webclient.api;
 import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
+import io.helidon.common.Api;
 import io.helidon.common.tls.Tls;
 import io.helidon.http.Method;
 
@@ -103,11 +105,52 @@ public interface FullClientRequest<T extends ClientRequest<T>> extends ClientReq
     Tls tls();
 
     /**
+     * Request-level SNI configuration.
+     *
+     * @return SNI configuration if configured
+     */
+    default Optional<SniConfig> sni() {
+        return Optional.empty();
+    }
+
+    /**
      * Proxy configuration (may be no-proxy).
      *
      * @return proxy
      */
     Proxy proxy();
+
+    /**
+     * Effective proxy route already selected during the current top-level request invocation.
+     * The route may be shared with protocol fallbacks and other internal handoffs in that invocation.
+     *
+     * @return selected proxy route, or empty when this request still needs route selection
+     */
+    @Api.Internal
+    default Optional<ProxyRoute> selectedProxyRoute() {
+        return Optional.empty();
+    }
+
+    /**
+     * Retain an effective proxy route while handing a request between protocol implementations in the current
+     * top-level request invocation.
+     * The default implementation validates and otherwise ignores the route.
+     *
+     * @param proxyRoute selected proxy route
+     */
+    @Api.Internal
+    default void selectedProxyRoute(ProxyRoute proxyRoute) {
+        Objects.requireNonNull(proxyRoute, "proxyRoute");
+    }
+
+    /**
+     * Clear retained route state after the current top-level request invocation, or when it no longer matches a
+     * finalized request target.
+     * The default implementation has no effect.
+     */
+    @Api.Internal
+    default void clearSelectedProxyRoute() {
+    }
 
     /**
      * Whether to use keep-alive connection (if relevant for the used HTTP version).

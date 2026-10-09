@@ -16,11 +16,11 @@
 
 package io.helidon.http;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -76,32 +76,97 @@ public interface Headers extends Iterable<Header> {
      * @return {@code true} if all expected tokens are present, ignoring case and surrounding whitespace
      */
     default boolean containsToken(Header value) {
-        List<String> actualValues = values(value.headerName());
+        List<String> actualValues = all(value.headerName(), List::of);
         if (actualValues.isEmpty()) {
             return false;
         }
 
         for (String expectedValue : value.allValues()) {
-            for (String expectedToken : Utils.tokenize(',', "\"", true, expectedValue)) {
-                String trimmedExpected = expectedToken.trim();
-                if (trimmedExpected.isEmpty()) {
-                    continue;
-                }
-
-                boolean matched = false;
-                for (String actualValue : actualValues) {
-                    if (actualValue.trim().equalsIgnoreCase(trimmedExpected)) {
-                        matched = true;
-                        break;
-                    }
-                }
-                if (!matched) {
-                    return false;
-                }
+            if (!containsTokens(actualValues, expectedValue)) {
+                return false;
             }
         }
 
         return true;
+    }
+
+    private static boolean containsTokens(List<String> actualValues, String expectedValue) {
+        int tokenStart = 0;
+        boolean quoted = false;
+        int length = expectedValue.length();
+        for (int i = 0; i < length; i++) {
+            char ch = expectedValue.charAt(i);
+            if (ch == '"') {
+                quoted = !quoted;
+            } else if (ch == ',' && !quoted) {
+                if (!containsToken(actualValues, expectedValue, tokenStart, i)) {
+                    return false;
+                }
+                tokenStart = i + 1;
+            }
+        }
+        return containsToken(actualValues, expectedValue, tokenStart, length);
+    }
+
+    private static boolean containsToken(List<String> actualValues,
+                                         String expectedValue,
+                                         int expectedStart,
+                                         int expectedEnd) {
+        while (expectedStart < expectedEnd && expectedValue.charAt(expectedStart) <= ' ') {
+            expectedStart++;
+        }
+        while (expectedEnd > expectedStart && expectedValue.charAt(expectedEnd - 1) <= ' ') {
+            expectedEnd--;
+        }
+        if (expectedStart == expectedEnd) {
+            return true;
+        }
+
+        for (String actualValue : actualValues) {
+            if (containsToken(actualValue, expectedValue, expectedStart, expectedEnd)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsToken(String actualValue,
+                                         String expectedValue,
+                                         int expectedStart,
+                                         int expectedEnd) {
+        int tokenStart = 0;
+        boolean quoted = false;
+        int length = actualValue.length();
+        for (int i = 0; i < length; i++) {
+            char ch = actualValue.charAt(i);
+            if (ch == '"') {
+                quoted = !quoted;
+            } else if (ch == ',' && !quoted) {
+                if (tokenEquals(actualValue, tokenStart, i, expectedValue, expectedStart, expectedEnd)) {
+                    return true;
+                }
+                tokenStart = i + 1;
+            }
+        }
+        return tokenEquals(actualValue, tokenStart, length, expectedValue, expectedStart, expectedEnd);
+    }
+
+    private static boolean tokenEquals(String actualValue,
+                                       int actualStart,
+                                       int actualEnd,
+                                       String expectedValue,
+                                       int expectedStart,
+                                       int expectedEnd) {
+        while (actualStart < actualEnd && actualValue.charAt(actualStart) <= ' ') {
+            actualStart++;
+        }
+        while (actualEnd > actualStart && actualValue.charAt(actualEnd - 1) <= ' ') {
+            actualEnd--;
+        }
+
+        int length = actualEnd - actualStart;
+        return length == expectedEnd - expectedStart
+                && actualValue.regionMatches(true, actualStart, expectedValue, expectedStart, length);
     }
 
     /**
@@ -199,10 +264,40 @@ public interface Headers extends Iterable<Header> {
      * @see HeaderNames#CONTENT_LENGTH
      */
     default OptionalLong contentLength() {
-        if (contains(HeaderNameEnum.CONTENT_LENGTH)) {
-            return OptionalLong.of(get(HeaderNameEnum.CONTENT_LENGTH).get(long.class));
+        if (!contains(HeaderNameEnum.CONTENT_LENGTH)) {
+            return OptionalLong.empty();
         }
-        return OptionalLong.empty();
+
+        Header contentLengthHeader = get(HeaderNames.CONTENT_LENGTH);
+        if (contentLengthHeader.valueCount() != 1) {
+            throw new IllegalArgumentException("Content-Length header must have exactly one value.");
+        }
+
+        String contentLengthValue = contentLengthHeader.get();
+        if (contentLengthValue.indexOf(',') != -1) {
+            throw new IllegalArgumentException("Content-Length header must have exactly one value.");
+        }
+
+        int start = 0;
+        int end = contentLengthValue.length();
+        while (start < end && (contentLengthValue.charAt(start) == ' ' || contentLengthValue.charAt(start) == '\t')) {
+            start++;
+        }
+        while (end > start && (contentLengthValue.charAt(end - 1) == ' '
+                || contentLengthValue.charAt(end - 1) == '\t')) {
+            end--;
+        }
+        if (start == end) {
+            throw new NumberFormatException("Content length is not a number");
+        }
+        for (int i = start; i < end; i++) {
+            char c = contentLengthValue.charAt(i);
+            if (c < '0' || c > '9') {
+                throw new NumberFormatException("Content length is not a number");
+            }
+        }
+
+        return OptionalLong.of(Long.parseLong(contentLengthValue.substring(start, end)));
     }
 
     /**
@@ -255,7 +350,7 @@ public interface Headers extends Iterable<Header> {
      */
     @Deprecated
     default Map<String, List<String>> toMap() {
-        Map<String, List<String>> headers = new HashMap<>();
+        Map<String, List<String>> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
         forEach(it -> headers.put(it.name(), it.allValues()));
 

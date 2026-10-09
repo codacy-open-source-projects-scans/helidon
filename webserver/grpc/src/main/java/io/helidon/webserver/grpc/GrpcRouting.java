@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,23 +19,35 @@ package io.helidon.webserver.grpc;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
 
+import io.helidon.common.Api;
+import io.helidon.common.HelidonServiceLoader;
 import io.helidon.config.Config;
+import io.helidon.config.ConfigBuilderSupport;
+import io.helidon.config.ConfigSources;
+import io.helidon.config.MergedConfig;
 import io.helidon.grpc.core.InterceptorWeights;
 import io.helidon.grpc.core.WeightedBag;
 import io.helidon.http.HttpPrologue;
 import io.helidon.http.PathMatchers;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.service.registry.ServiceRegistry;
 import io.helidon.service.registry.Services;
 import io.helidon.webserver.Routing;
 import io.helidon.webserver.grpc.spi.GrpcServerService;
+import io.helidon.webserver.grpc.spi.GrpcServerServiceProvider;
 
 import com.google.protobuf.Descriptors;
 import io.grpc.BindableService;
 import io.grpc.ServerInterceptor;
-import io.grpc.ServerMethodDefinition;
 import io.grpc.ServerServiceDefinition;
 import io.grpc.stub.ServerCalls;
 
@@ -43,16 +55,31 @@ import io.grpc.stub.ServerCalls;
  * gRPC specific routing.
  */
 public class GrpcRouting implements Routing {
-    private static final GrpcRouting EMPTY = GrpcRouting.builder().build();
+    private static final GrpcRouting EMPTY;
+    private static final String SERVER_PROTOCOL_CONFIG_KEY = "server.protocols." + GrpcProtocolProvider.CONFIG_NAME;
+    private static final Config DISCOVERY_DISABLED_CONFIG = Config.just(ConfigSources.create(
+            Map.of("grpc-services-discover-services", "false")));
+    private static final Supplier<MeterRegistry> DEFAULT_METER_REGISTRY = () -> Services.get(MeterRegistry.class);
+
+    static {
+        WeightedBag<ServerInterceptor> interceptors = WeightedBag.create(InterceptorWeights.USER);
+        interceptors.add(ContextSettingServerInterceptor.instance());
+        EMPTY = new GrpcRouting(List.of(), interceptors, Map.of(), DEFAULT_METER_REGISTRY);
+    }
 
     private final ArrayList<GrpcRoute> routes;
     private final WeightedBag<ServerInterceptor> interceptors;
     private final ArrayList<GrpcServiceDescriptor> services;
+    private final Supplier<MeterRegistry> meterRegistry;
 
-    private GrpcRouting(Builder builder) {
-        this.routes = new ArrayList<>(builder.routes);
-        this.interceptors = builder.interceptors;
-        this.services = new ArrayList<>(builder.services.values());
+    private GrpcRouting(List<GrpcRoute> routes,
+                        WeightedBag<ServerInterceptor> interceptors,
+                        Map<String, GrpcServiceDescriptor> services,
+                        Supplier<MeterRegistry> meterRegistry) {
+        this.routes = new ArrayList<>(routes);
+        this.interceptors = interceptors;
+        this.services = new ArrayList<>(services.values());
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -127,29 +154,288 @@ public class GrpcRouting implements Routing {
         return routes;
     }
 
+    MeterRegistry meterRegistry() {
+        return meterRegistry.get();
+    }
+
     /**
      * Fluent API builder for {@link GrpcRouting}.
      */
     public static class Builder implements io.helidon.common.Builder<Builder, GrpcRouting> {
-        private final List<GrpcRoute> routes = new LinkedList<>();
+        private final List<RouteRegistration> routeRegistrations = new LinkedList<>();
         private final WeightedBag<ServerInterceptor> interceptors = WeightedBag.create(InterceptorWeights.USER);
         private final Map<String, GrpcServiceDescriptor> services = new LinkedHashMap<>();
+        private final Set<String> excludedServiceNames = new LinkedHashSet<>();
+
+        private Config config;
+        private Optional<ServiceRegistry> serviceRegistry = Optional.empty();
+        private Supplier<MeterRegistry> meterRegistry = DEFAULT_METER_REGISTRY;
 
         private Builder() {
-            // always add the context setting interceptor
-            interceptors.add(ContextSettingServerInterceptor.instance());
-
-            // add all the interceptors from server services SPI
-            Config config = Services.get(Config.class);
-            GrpcConfig grpcConfig = GrpcConfig.create(config.get(GrpcProtocolProvider.CONFIG_NAME));
-            for (GrpcServerService serverService : grpcConfig.grpcServices()) {
-                interceptors.merge(serverService.interceptors());
-            }
         }
 
         @Override
         public GrpcRouting build() {
-            return new GrpcRouting(this);
+            Config routingConfig = config;
+            if (routingConfig == null) {
+                routingConfig = serviceRegistry
+                        .map(registry -> registry.get(Config.class))
+                        .orElseGet(() -> Services.get(Config.class));
+            }
+            WeightedBag<ServerInterceptor> configuredInterceptors = WeightedBag.create(InterceptorWeights.USER);
+            List<GrpcRoute> routes = new LinkedList<>();
+
+            configuredInterceptors.add(ContextSettingServerInterceptor.instance());
+            Map<String, GrpcServerService> configuredServices = new LinkedHashMap<>();
+            if (routingConfig.key().isRoot()) {
+                Config legacyConfig = routingConfig.get(SERVER_PROTOCOL_CONFIG_KEY);
+                Config grpcConfig = routingConfig.get(GrpcProtocolProvider.CONFIG_NAME);
+                ConfiguredGrpcServices legacyServices = configuredServices(legacyConfig);
+                ConfiguredGrpcServices grpcServices = configuredServices(grpcConfig);
+
+                // first use the undocumented config key (backward compatibility)
+                addConfiguredGrpcServices(legacyConfig, excludedServiceNames, configuredServices);
+                // then the documented one, which should be the one that wins
+                configuredServices.values().removeIf(service -> grpcServices.identities().contains(
+                        new GrpcServerServiceIdentity(service.type(), service.name())));
+                addConfiguredGrpcServices(grpcConfig, excludedServiceNames, configuredServices);
+
+                boolean discoverServices = grpcConfig.get("grpc-services-discover-services")
+                        .asBoolean()
+                        .orElseGet(() -> legacyConfig.get("grpc-services-discover-services")
+                                .asBoolean()
+                                .orElse(true));
+                if (discoverServices) {
+                    Set<String> configuredProviderTypes = new LinkedHashSet<>(legacyServices.providerTypes());
+                    configuredProviderTypes.addAll(grpcServices.providerTypes());
+                    addDiscoveredGrpcServices(grpcConfig,
+                                              configuredProviderTypes,
+                                              excludedServiceNames,
+                                              configuredServices);
+                }
+            } else {
+                ConfiguredGrpcServices configuredServiceInfo = configuredServices(routingConfig);
+                addConfiguredGrpcServices(routingConfig, excludedServiceNames, configuredServices);
+                if (routingConfig.get("grpc-services-discover-services").asBoolean().orElse(true)) {
+                    addDiscoveredGrpcServices(routingConfig,
+                                              configuredServiceInfo.providerTypes(),
+                                              excludedServiceNames,
+                                              configuredServices);
+                }
+            }
+            Set<String> programmaticServerServiceTypes = new LinkedHashSet<>();
+            interceptors.stream()
+                    .filter(GrpcServerService.class::isInstance)
+                    .map(GrpcServerService.class::cast)
+                    .map(GrpcServerService::type)
+                    .forEach(programmaticServerServiceTypes::add);
+            for (GrpcServerService serverService : configuredServices.values()) {
+                if (!programmaticServerServiceTypes.contains(serverService.type())) {
+                    WeightedBag<ServerInterceptor> serviceInterceptors = serviceRegistry
+                            .map(serverService::interceptors)
+                            .orElseGet(serverService::interceptors);
+                    configuredInterceptors.merge(serviceInterceptors);
+                }
+            }
+            WeightedBag<ServerInterceptor> routingInterceptors = configuredInterceptors.copyMe();
+            routingInterceptors.merge(interceptors);
+            routeRegistrations.forEach(registration -> registration.register(routes, routingInterceptors));
+            return new GrpcRouting(routes, routingInterceptors, services, meterRegistry);
+        }
+
+        Builder meterRegistry(Supplier<MeterRegistry> meterRegistry) {
+            this.meterRegistry = Objects.requireNonNull(meterRegistry);
+            return this;
+        }
+
+        Builder serviceRegistry(ServiceRegistry serviceRegistry) {
+            this.serviceRegistry = Optional.of(Objects.requireNonNull(serviceRegistry));
+            return this;
+        }
+
+        private static ConfiguredGrpcServices configuredServices(Config config) {
+            Set<String> configuredProviderTypes = new LinkedHashSet<>();
+            Set<GrpcServerServiceIdentity> configuredServices = new LinkedHashSet<>();
+            Config grpcServices = config.get("grpc-services");
+            boolean isList = grpcServices.isList();
+            for (Config serviceConfig : grpcServices.asNodeList().orElseGet(List::of)) {
+                String serviceType;
+                String serviceName;
+                if (isList) {
+                    serviceType = serviceConfig.get("type").asString().orElse(null);
+                    serviceName = serviceConfig.get("name").asString().orElse(serviceType);
+                    if (serviceType == null) {
+                        List<Config> configs = serviceConfig.asNodeList().orElseGet(List::of);
+                        if (configs.size() == 1) {
+                            Config usedConfig = configs.getFirst();
+                            serviceName = usedConfig.name();
+                            serviceType = usedConfig.get("type").asString().orElse(serviceName);
+                        }
+                    }
+                } else {
+                    serviceName = serviceConfig.name();
+                    serviceType = serviceConfig.get("type").asString().orElse(serviceName);
+                }
+                if (serviceType != null) {
+                    configuredProviderTypes.add(serviceType);
+                    configuredServices.add(new GrpcServerServiceIdentity(serviceType, serviceName));
+                }
+            }
+            return new ConfiguredGrpcServices(configuredProviderTypes, configuredServices);
+        }
+
+        private void addConfiguredGrpcServices(Config config,
+                                               Set<String> excludedServiceNames,
+                                               Map<String, GrpcServerService> configuredServices) {
+            Config configuredOnly = MergedConfig.create(DISCOVERY_DISABLED_CONFIG, config);
+            if (excludedServiceNames.isEmpty()) {
+                for (GrpcServerService serverService : discoverConfiguredGrpcServices(configuredOnly, List.of())) {
+                    configuredServices.put(serverService.name(), serverService);
+                }
+                return;
+            }
+
+            Set<String> providerTypes = new LinkedHashSet<>();
+            grpcServerServiceProviders()
+                    .forEach(provider -> providerTypes.add(provider.configKey()));
+            Config grpcServices = config.get("grpc-services");
+            List<GrpcServerService> ignoredServices = new ArrayList<>(excludedServiceNames.size() * 2);
+            for (String excludedServiceName : excludedServiceNames) {
+                ignoredServices.add(new ExcludedGrpcServerService(excludedServiceName, excludedServiceName));
+                // Provider-key exclusions must not suppress a differently typed service with the same configured name.
+                if (!providerTypes.contains(excludedServiceName)) {
+                    if (grpcServices.isList()) {
+                        for (Config serviceConfig : grpcServices.asNodeList().orElseGet(List::of)) {
+                            String serviceType = serviceConfig.get("type").asString().orElse(null);
+                            String serviceName = serviceConfig.get("name").asString().orElse(serviceType);
+                            if (serviceType == null) {
+                                List<Config> configs = serviceConfig.asNodeList().orElseGet(List::of);
+                                if (configs.size() == 1) {
+                                    Config usedConfig = configs.getFirst();
+                                    serviceName = usedConfig.name();
+                                    serviceType = usedConfig.get("type").asString().orElse(serviceName);
+                                }
+                            }
+                            if (excludedServiceName.equals(serviceName)) {
+                                ignoredServices.add(new ExcludedGrpcServerService(serviceType, serviceName));
+                            }
+                        }
+                    } else {
+                        String serviceType = grpcServices.get(excludedServiceName)
+                                .get("type")
+                                .asString()
+                                .orElse(excludedServiceName);
+                        ignoredServices.add(new ExcludedGrpcServerService(serviceType, excludedServiceName));
+                    }
+                }
+            }
+
+            for (GrpcServerService serverService : discoverConfiguredGrpcServices(configuredOnly, ignoredServices)) {
+                configuredServices.put(serverService.name(), serverService);
+            }
+        }
+
+        private void addDiscoveredGrpcServices(Config config,
+                                               Set<String> configuredProviderTypes,
+                                               Set<String> excludedServiceNames,
+                                               Map<String, GrpcServerService> configuredServices) {
+            grpcServerServiceProviders().forEach(provider -> {
+                String type = provider.configKey();
+                if (configuredProviderTypes.contains(type) || excludedServiceNames.contains(type)) {
+                    return;
+                }
+                GrpcServerService service = create(provider, config.get("grpc-services").get(type), type);
+                if (!excludedServiceNames.contains(service.name())) {
+                    configuredServices.putIfAbsent(service.name(), service);
+                }
+            });
+        }
+
+        private List<GrpcServerService> discoverConfiguredGrpcServices(Config config,
+                                                                        List<GrpcServerService> ignoredServices) {
+            if (serviceRegistry.isPresent()) {
+                return ConfigBuilderSupport.discoverServices(config,
+                                                             "grpc-services",
+                                                             serviceRegistry,
+                                                             GrpcServerServiceProvider.class,
+                                                             GrpcServerService.class,
+                                                             false,
+                                                             ignoredServices);
+            }
+            return ConfigBuilderSupport.discoverServices(config,
+                                                         "grpc-services",
+                                                         GrpcServerServiceProvider.class,
+                                                         GrpcServerService.class,
+                                                         false,
+                                                         ignoredServices);
+        }
+
+        private List<GrpcServerServiceProvider> grpcServerServiceProviders() {
+            return serviceRegistry
+                    .map(registry -> registry.all(GrpcServerServiceProvider.class))
+                    .orElseGet(() -> HelidonServiceLoader.create(GrpcServerServiceProvider.class).asList());
+        }
+
+        private GrpcServerService create(GrpcServerServiceProvider provider, Config config, String name) {
+            return serviceRegistry
+                    .map(registry -> provider.create(config, name, registry))
+                    .orElseGet(() -> provider.create(config, name));
+        }
+
+        private record ExcludedGrpcServerService(String type, String name) implements GrpcServerService {
+            @Override
+            public WeightedBag<ServerInterceptor> interceptors() {
+                return WeightedBag.create();
+            }
+        }
+
+        private record GrpcServerServiceIdentity(String type, String name) {
+        }
+
+        private record ConfiguredGrpcServices(Set<String> providerTypes, Set<GrpcServerServiceIdentity> identities) {
+        }
+
+        /**
+         * Configuration instance to use to configure this routing.
+         *
+         * @param config configuration to use
+         * @return updated builder
+         */
+        public Builder config(Config config) {
+            this.config = Objects.requireNonNull(config);
+            return this;
+        }
+
+        /**
+         * Configured gRPC server service names to exclude.
+         * <p>
+         * These named services will not be loaded through the standard gRPC server service provider configuration.
+         *
+         * @param excludedServiceNames configured gRPC server service names to exclude
+         * @return updated builder
+         */
+        @Api.Internal
+        public Builder excludedServiceNames(Set<String> excludedServiceNames) {
+            Set<String> newExcludedServiceNames = new LinkedHashSet<>();
+            Objects.requireNonNull(excludedServiceNames)
+                    .forEach(name -> newExcludedServiceNames.add(Objects.requireNonNull(name)));
+            this.excludedServiceNames.clear();
+            this.excludedServiceNames.addAll(newExcludedServiceNames);
+            return this;
+        }
+
+        /**
+         * Add a configured gRPC server service name to exclude.
+         * <p>
+         * This named service will not be loaded through the standard gRPC server service provider configuration.
+         *
+         * @param excludedServiceName configured gRPC server service name to exclude
+         * @return updated builder
+         */
+        @Api.Internal
+        public Builder addExcludedServiceName(String excludedServiceName) {
+            this.excludedServiceNames.add(Objects.requireNonNull(excludedServiceName));
+            return this;
         }
 
         /**
@@ -159,7 +445,9 @@ public class GrpcRouting implements Routing {
          * @return updated builder
          */
         public Builder service(GrpcService service) {
-            routes.add(GrpcServiceRoute.create(service, interceptors));
+            GrpcService grpcService = Objects.requireNonNull(service);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcServiceRoute.create(grpcService, interceptors)));
             return this;
         }
 
@@ -170,7 +458,9 @@ public class GrpcRouting implements Routing {
          * @return updated builder
          */
         public Builder service(BindableService service) {
-            routes.add(GrpcServiceRoute.create(service, interceptors));
+            BindableService bindableService = Objects.requireNonNull(service);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcServiceRoute.create(bindableService, interceptors)));
             return this;
         }
 
@@ -182,9 +472,13 @@ public class GrpcRouting implements Routing {
          * @return updated builder
          */
         public Builder service(Descriptors.FileDescriptor proto, BindableService service) {
-            for (ServerMethodDefinition<?, ?> method : service.bindService().getMethods()) {
-                routes.add(GrpcRouteHandler.methodDefinition(method, proto, interceptors));
-            }
+            Descriptors.FileDescriptor serviceProto = Objects.requireNonNull(proto);
+            BindableService bindableService = Objects.requireNonNull(service);
+            routeRegistrations.add((routes, interceptors) -> bindableService.bindService()
+                    .getMethods()
+                    .forEach(method -> routes.add(GrpcRouteHandler.methodDefinition(method,
+                                                                                    serviceProto,
+                                                                                    interceptors))));
             return this;
         }
 
@@ -195,24 +489,25 @@ public class GrpcRouting implements Routing {
          * @return updated builder
          */
         public Builder service(GrpcServiceDescriptor service) {
-            String name = service.name();
+            GrpcServiceDescriptor serviceDescriptor = Objects.requireNonNull(service);
+            String name = serviceDescriptor.fullName();
             if (services.containsKey(name)) {
                 throw new IllegalArgumentException("Attempted to register service name " + name + " multiple times");
             }
-            services.put(name, service);
+            services.put(name, serviceDescriptor);
 
-            // compute a final bag of interceptors for this route
-            WeightedBag<ServerInterceptor> routeInterceptors;
-            WeightedBag<ServerInterceptor> serviceInterceptors = service.interceptors();
-            if (!serviceInterceptors.isEmpty()) {
-                routeInterceptors = WeightedBag.create();
-                routeInterceptors.merge(serviceInterceptors);
-                routeInterceptors.merge(interceptors);
-            } else {
-                routeInterceptors = interceptors;
-            }
-
-            routes.add(GrpcServiceRoute.create(service, routeInterceptors));
+            WeightedBag<ServerInterceptor> serviceInterceptors = serviceDescriptor.interceptors();
+            routeRegistrations.add((routes, interceptors) -> {
+                WeightedBag<ServerInterceptor> routeInterceptors;
+                if (!serviceInterceptors.isEmpty()) {
+                    routeInterceptors = WeightedBag.create();
+                    routeInterceptors.merge(serviceInterceptors);
+                    routeInterceptors.merge(interceptors);
+                } else {
+                    routeInterceptors = interceptors;
+                }
+                routes.add(GrpcServiceRoute.create(serviceDescriptor, routeInterceptors));
+            });
             return this;
         }
 
@@ -223,9 +518,9 @@ public class GrpcRouting implements Routing {
          * @return updated builder
          */
         public Builder service(ServerServiceDefinition service) {
-            for (ServerMethodDefinition<?, ?> method : service.getMethods()) {
-                routes.add(GrpcRouteHandler.methodDefinition(method, null, interceptors));
-            }
+            ServerServiceDefinition serviceDefinition = Objects.requireNonNull(service);
+            routeRegistrations.add((routes, interceptors) -> serviceDefinition.getMethods()
+                    .forEach(method -> routes.add(GrpcRouteHandler.methodDefinition(method, null, interceptors))));
             return this;
         }
 
@@ -242,7 +537,7 @@ public class GrpcRouting implements Routing {
          * @return this builder to allow fluent method chaining
          */
         public Builder intercept(ServerInterceptor... interceptors) {
-            this.interceptors.addAll(Arrays.asList(interceptors));
+            this.interceptors.addAll(Arrays.asList(Objects.requireNonNull(interceptors)));
             return this;
         }
 
@@ -257,7 +552,7 @@ public class GrpcRouting implements Routing {
          * @return this builder to allow fluent method chaining
          */
         public Builder intercept(int weight, ServerInterceptor... interceptors) {
-            this.interceptors.addAll(Arrays.asList(interceptors), weight);
+            this.interceptors.addAll(Arrays.asList(Objects.requireNonNull(interceptors)), weight);
             return this;
         }
 
@@ -276,7 +571,16 @@ public class GrpcRouting implements Routing {
                                           String serviceName,
                                           String methodName,
                                           ServerCalls.UnaryMethod<ReqT, ResT> method) {
-            routes.add(GrpcRouteHandler.unary(proto, serviceName, methodName, method, interceptors));
+            Descriptors.FileDescriptor routeProto = Objects.requireNonNull(proto);
+            String routeServiceName = Objects.requireNonNull(serviceName);
+            String routeMethodName = Objects.requireNonNull(methodName);
+            ServerCalls.UnaryMethod<ReqT, ResT> routeMethod = Objects.requireNonNull(method);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcRouteHandler.unary(routeProto,
+                                                                             routeServiceName,
+                                                                             routeMethodName,
+                                                                             routeMethod,
+                                                                             interceptors)));
             return this;
         }
 
@@ -295,7 +599,16 @@ public class GrpcRouting implements Routing {
                                          String serviceName,
                                          String methodName,
                                          ServerCalls.BidiStreamingMethod<ReqT, ResT> method) {
-            routes.add(GrpcRouteHandler.bidi(proto, serviceName, methodName, method, interceptors));
+            Descriptors.FileDescriptor routeProto = Objects.requireNonNull(proto);
+            String routeServiceName = Objects.requireNonNull(serviceName);
+            String routeMethodName = Objects.requireNonNull(methodName);
+            ServerCalls.BidiStreamingMethod<ReqT, ResT> routeMethod = Objects.requireNonNull(method);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcRouteHandler.bidi(routeProto,
+                                                                            routeServiceName,
+                                                                            routeMethodName,
+                                                                            routeMethod,
+                                                                            interceptors)));
             return this;
         }
 
@@ -314,7 +627,16 @@ public class GrpcRouting implements Routing {
                                                  String serviceName,
                                                  String methodName,
                                                  ServerCalls.ServerStreamingMethod<ReqT, ResT> method) {
-            routes.add(GrpcRouteHandler.serverStream(proto, serviceName, methodName, method, interceptors));
+            Descriptors.FileDescriptor routeProto = Objects.requireNonNull(proto);
+            String routeServiceName = Objects.requireNonNull(serviceName);
+            String routeMethodName = Objects.requireNonNull(methodName);
+            ServerCalls.ServerStreamingMethod<ReqT, ResT> routeMethod = Objects.requireNonNull(method);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcRouteHandler.serverStream(routeProto,
+                                                                                    routeServiceName,
+                                                                                    routeMethodName,
+                                                                                    routeMethod,
+                                                                                    interceptors)));
             return this;
         }
 
@@ -333,8 +655,21 @@ public class GrpcRouting implements Routing {
                                                  String serviceName,
                                                  String methodName,
                                                  ServerCalls.ClientStreamingMethod<ReqT, ResT> method) {
-            routes.add(GrpcRouteHandler.clientStream(proto, serviceName, methodName, method, interceptors));
+            Descriptors.FileDescriptor routeProto = Objects.requireNonNull(proto);
+            String routeServiceName = Objects.requireNonNull(serviceName);
+            String routeMethodName = Objects.requireNonNull(methodName);
+            ServerCalls.ClientStreamingMethod<ReqT, ResT> routeMethod = Objects.requireNonNull(method);
+            routeRegistrations.add((routes, interceptors) ->
+                                           routes.add(GrpcRouteHandler.clientStream(routeProto,
+                                                                                    routeServiceName,
+                                                                                    routeMethodName,
+                                                                                    routeMethod,
+                                                                                    interceptors)));
             return this;
+        }
+
+        private interface RouteRegistration {
+            void register(List<GrpcRoute> routes, WeightedBag<ServerInterceptor> interceptors);
         }
     }
 }

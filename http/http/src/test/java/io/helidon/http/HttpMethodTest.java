@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,12 +24,16 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.CoreMatchers.notNullValue;
+import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class HttpMethodTest {
     private static final Class<Method> CLASS = Method.class;
@@ -47,6 +51,69 @@ class HttpMethodTest {
             .filter(it -> it.getType().equals(String.class))
             .map(Field::getName)
             .collect(Collectors.toSet());
+
+    @Test
+    void testQueryMethod() {
+        MethodPredicate predicate = Method.predicate(Method.QUERY);
+
+        assertAll(
+                () -> assertThat(Method.create("QUERY"), sameInstance(Method.QUERY)),
+                () -> assertThat(Method.create("query").text(), is("query")),
+                () -> assertThat(Method.create("query"), not(sameInstance(Method.QUERY))),
+                () -> assertThat(predicate.test(Method.QUERY), is(true)),
+                () -> assertThat(predicate.test(Method.create("query")), is(false)),
+                () -> assertThat(predicate.test(Method.POST), is(false))
+        );
+    }
+
+    @Test
+    void canonicalMethodUsesKnownInstance() {
+        assertThat(Method.create(Method.DELETE_NAME), sameInstance(Method.DELETE));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"delete", "Delete", "dElEtE"})
+    void methodNamesAreCaseSensitive(String methodName) {
+        Method method = Method.create(methodName);
+
+        assertAll(
+                () -> assertThat(method.text(), is(methodName)),
+                () -> assertThat(method, not(sameInstance(Method.DELETE)))
+        );
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void caseSensitiveFactoryUsesKnownInstances() {
+        for (String methodName : METHOD_CONSTANTS) {
+            assertThat(methodName, Method.createCaseSensitive(methodName), sameInstance(Method.create(methodName)));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"delete", "Delete", "dElEtE", "CUSTOM", "custom", "Custom"})
+    @SuppressWarnings("removal")
+    void caseSensitiveFactoryPreservesMethodText(String methodName) {
+        Method method = Method.createCaseSensitive(methodName);
+
+        assertAll(
+                () -> assertThat(method.text(), is(methodName)),
+                () -> assertThat(method, is(Method.create(methodName)))
+        );
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "GET POST", "GET\t", "G\u00c9T", "GET/"})
+    @SuppressWarnings("removal")
+    void caseSensitiveFactoryRejectsInvalidTokens(String methodName) {
+        assertThrows(IllegalArgumentException.class, () -> Method.createCaseSensitive(methodName));
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void caseSensitiveFactoryRejectsNull() {
+        assertThrows(NullPointerException.class, () -> Method.createCaseSensitive(null));
+    }
 
     @Test
     void testAllMethodConstantsAreValid() throws NoSuchFieldException, IllegalAccessException {

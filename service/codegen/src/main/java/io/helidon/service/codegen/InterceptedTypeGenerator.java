@@ -25,6 +25,7 @@ import java.util.stream.Collectors;
 import io.helidon.codegen.CodegenUtil;
 import io.helidon.codegen.classmodel.ClassModel;
 import io.helidon.codegen.classmodel.Constructor;
+import io.helidon.codegen.classmodel.TypeArgument;
 import io.helidon.common.types.AccessModifier;
 import io.helidon.common.types.Annotation;
 import io.helidon.common.types.Annotations;
@@ -85,7 +86,7 @@ class InterceptedTypeGenerator {
             classModel.addField(methodField -> methodField
                     .accessModifier(AccessModifier.PRIVATE)
                     .isFinal(true)
-                    .type(invokerType(interceptedMethod.info().typeName()))
+                    .type(invokerType(interceptedMethod.info()))
                     .name(interceptedMethod.invokerName()));
         }
     }
@@ -100,6 +101,10 @@ class InterceptedTypeGenerator {
                     .accessModifier(info.accessModifier())
                     .name(info.elementName())
                     .returnType(info.typeName())
+                    .update(it -> info.typeParameters()
+                            .stream()
+                            .map(TypeArgument::create)
+                            .forEach(it::addGenericArgument))
                     .update(it -> info.parameterArguments().forEach(arg -> it.addParameter(param -> param.type(arg.typeName())
                             .name(arg.elementName()))))
                     .update(it -> {
@@ -114,13 +119,21 @@ class InterceptedTypeGenerator {
                         String invokeLine = invoker
                                 + ".invoke("
                                 + info.parameterArguments()
-                                .stream().map(TypedElementInfo::elementName)
+                                .stream()
+                                .map(InterceptedTypeGenerator::invokerArgument)
                                 .collect(Collectors.joining(", "))
                                 + ");";
                         // body of the method
-                        it.addContentLine("try {")
-                                .addContent(interceptedMethod.isVoid() ? "" : "return ")
-                                .addContentLine(invokeLine)
+                        it.addContentLine("try {");
+                        if (!interceptedMethod.isVoid()) {
+                            it.addContent("return ");
+                            if (!info.typeName().equals(erasedMethodType(info, info.typeName()))) {
+                                it.addContent("(")
+                                        .addContent(info.typeName().fqName())
+                                        .addContent(") ");
+                            }
+                        }
+                        it.addContentLine(invokeLine)
                                 .addContent("}");
                         for (TypeName exceptionType : interceptedMethod.exceptionTypes()) {
                             it.addContent(" catch (")
@@ -147,6 +160,46 @@ class InterceptedTypeGenerator {
 
                     }));
 
+        }
+    }
+
+    static void generateDelegateMethods(ClassModel.Builder classModel, List<MethodDefinition> interceptedMethods) {
+        for (MethodDefinition interceptedMethod : interceptedMethods) {
+            TypedElementInfo info = interceptedMethod.info();
+
+            classModel.addMethod(method -> method
+                    .accessModifier(AccessModifier.PACKAGE_PRIVATE)
+                    .name(interceptedMethod.delegateName())
+                    .returnType(info.typeName())
+                    .update(it -> info.typeParameters()
+                            .stream()
+                            .map(TypeArgument::create)
+                            .forEach(it::addGenericArgument))
+                    .update(it -> info.parameterArguments().forEach(arg -> it.addParameter(param -> param.type(arg.typeName())
+                            .name(arg.elementName()))))
+                    .update(it -> {
+                        if (!interceptedMethod.exceptionTypes().isEmpty()) {
+                            for (TypeName exceptionType : interceptedMethod.exceptionTypes()) {
+                                it.addThrows(exceptionType, "thrown by intercepted method");
+                            }
+                        }
+                    })
+                    .update(it -> {
+                        String invokeLine = "super."
+                                + info.elementName()
+                                + "("
+                                + info.parameterArguments()
+                                .stream()
+                                .map(TypedElementInfo::elementName)
+                                .collect(Collectors.joining(", "))
+                                + ");";
+                        if (interceptedMethod.isVoid()) {
+                            it.addContentLine(invokeLine);
+                        } else {
+                            it.addContent("return ")
+                                    .addContentLine(invokeLine);
+                        }
+                    }));
         }
     }
 
@@ -210,7 +263,8 @@ class InterceptedTypeGenerator {
             List<TypedElementInfo> args = interceptedMethod.info().parameterArguments();
             for (int i = 0; i < args.size(); i++) {
                 TypedElementInfo arg = args.get(i);
-                allArgs.add("(" + arg.typeName().resolvedName() + ") helidonInject__params[" + i + "]");
+                allArgs.add("(" + erasedMethodType(interceptedMethod.info(), arg.typeName()).resolvedName()
+                                    + ") helidonInject__params[" + i + "]");
                 if (!arg.typeName().typeArguments().isEmpty()) {
                     hasGenericType = true;
                 }
@@ -258,15 +312,68 @@ class InterceptedTypeGenerator {
 
         generateConstructor(classModel);
 
+        generateDelegateMethods(classModel, interceptedMethods);
         generateInterceptedMethods(classModel, interceptedMethods);
 
         return classModel;
     }
 
-    private static TypeName invokerType(TypeName type) {
+    private static TypeName invokerType(TypedElementInfo method) {
         return TypeName.builder(INTERCEPT_INVOKER)
-                .addTypeArgument(type.boxed())
+                .addTypeArgument(erasedMethodType(method, method.typeName()).boxed())
                 .build();
+    }
+
+    private static TypeName erasedMethodType(TypedElementInfo method, TypeName type) {
+        Set<String> methodTypeParameters = method.typeParameters()
+                .stream()
+                .map(TypeName::className)
+                .collect(Collectors.toUnmodifiableSet());
+        return erasedMethodType(type, methodTypeParameters);
+    }
+
+    private static TypeName erasedMethodType(TypeName type, Set<String> methodTypeParameters) {
+        if (type.array() && type.componentType().isPresent()) {
+            TypeName componentType = erasedMethodType(type.componentType().orElseThrow(), methodTypeParameters);
+            return TypeName.builder(componentType)
+                    .array(true)
+                    .vararg(type.vararg())
+                    .componentType(componentType)
+                    .build();
+        }
+        if (type.generic() && methodTypeParameters.contains(type.className())) {
+            return type.upperBounds()
+                    .stream()
+                    .findFirst()
+                    .map(it -> erasedMethodType(it, methodTypeParameters))
+                    .orElse(TypeNames.OBJECT);
+        }
+        if (type.typeArguments()
+                .stream()
+                .anyMatch(it -> usesMethodTypeParameter(it, methodTypeParameters))) {
+            return TypeName.builder(type)
+                    .typeArguments(List.of())
+                    .generic(false)
+                    .build();
+        }
+        return type;
+    }
+
+    private static boolean usesMethodTypeParameter(TypeName type, Set<String> methodTypeParameters) {
+        if (type.generic() && methodTypeParameters.contains(type.className())) {
+            return true;
+        }
+        return type.typeArguments().stream().anyMatch(it -> usesMethodTypeParameter(it, methodTypeParameters))
+                || type.lowerBounds().stream().anyMatch(it -> usesMethodTypeParameter(it, methodTypeParameters))
+                || type.upperBounds().stream().anyMatch(it -> usesMethodTypeParameter(it, methodTypeParameters))
+                || type.componentType().map(it -> usesMethodTypeParameter(it, methodTypeParameters)).orElse(false);
+    }
+
+    private static String invokerArgument(TypedElementInfo arg) {
+        if (arg.typeName().array()) {
+            return "(Object) " + arg.elementName();
+        }
+        return arg.elementName();
     }
 
     private void generateConstructor(ClassModel.Builder classModel) {
@@ -329,13 +436,8 @@ class InterceptedTypeGenerator {
             for (int i = 0; i < sortedMethods.size(); i++) {
                 TypedElements.ElementMeta elementMeta = sortedMethods.get(i);
 
-                List<Annotation> elementAnnotations = new ArrayList<>(elementMeta.element().annotations());
-                addInterfaceAnnotations(elementAnnotations, elementMeta.abstractMethods());
-
-                TypedElementInfo typedElementInfo = TypedElementInfo.builder()
-                        .from(elementMeta.element())
-                        .annotations(elementAnnotations)
-                        .build();
+                TypedElementInfo typedElementInfo = TypedElements.mergeAbstractMethods(elementMeta.element(),
+                                                                                       elementMeta.abstractMethods());
 
                 String constantName = "METHOD_" + toConstantName(ctx.uniqueName(typeInfo, elementMeta.element()));
                 String invokerName = typedElementInfo.elementName() + "_" + i + "_invoker";
@@ -350,21 +452,9 @@ class InterceptedTypeGenerator {
             return result;
         }
 
-        private static void addInterfaceAnnotations(List<Annotation> elementAnnotations,
-                                                    List<TypedElements.DeclaredElement> declaredElements) {
-
-            for (TypedElements.DeclaredElement declaredElement : declaredElements) {
-                declaredElement.element()
-                        .annotations()
-                        .forEach(it -> addInterfaceAnnotation(elementAnnotations, it));
-            }
+        String delegateName() {
+            return "helidonInject__" + invokerName.substring(0, invokerName.length() - "_invoker".length());
         }
 
-        private static void addInterfaceAnnotation(List<Annotation> elementAnnotations, Annotation annotation) {
-            // only add if not already there
-            if (!elementAnnotations.contains(annotation)) {
-                elementAnnotations.add(annotation);
-            }
-        }
     }
 }

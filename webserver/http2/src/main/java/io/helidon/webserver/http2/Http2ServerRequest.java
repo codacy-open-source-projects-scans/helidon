@@ -31,6 +31,8 @@ import io.helidon.common.socket.PeerInfo;
 import io.helidon.common.uri.UriInfo;
 import io.helidon.common.uri.UriQuery;
 import io.helidon.http.Header;
+import io.helidon.http.HeaderNames;
+import io.helidon.http.HeaderValues;
 import io.helidon.http.HttpPrologue;
 import io.helidon.http.RequestedUriDiscoveryContext;
 import io.helidon.http.RoutedPath;
@@ -43,6 +45,7 @@ import io.helidon.http.media.ReadableEntityBase;
 import io.helidon.webserver.ConnectionContext;
 import io.helidon.webserver.ListenerContext;
 import io.helidon.webserver.ProxyProtocolData;
+import io.helidon.webserver.SniContext;
 import io.helidon.webserver.http.HttpSecurity;
 import io.helidon.webserver.http.RoutingRequest;
 
@@ -75,6 +78,7 @@ class Http2ServerRequest implements RoutingRequest {
     private boolean continueSent;
     private UnaryOperator<InputStream> streamFilter = UnaryOperator.identity();
     private String matchingPattern;
+    private Supplier<Optional<String>> matchingPatternSupplier;
 
     Http2ServerRequest(ConnectionContext ctx,
                        HttpSecurity security,
@@ -85,14 +89,23 @@ class Http2ServerRequest implements RoutingRequest {
                        boolean hasEntity,
                        Supplier<BufferData> entitySupplier,
                        LimitAlgorithm.Outcome limitOutcome,
+                       long maxPayloadSize,
                        long maxBufferedEntitySize) {
         this.ctx = ctx;
         this.security = security;
         this.originalPrologue = prologue;
         this.http2Headers = headers;
-        this.headers = ServerRequestHeaders.create(headers.httpHeaders());
         this.requestId = requestId;
-        this.authority = headers.authority();
+        WritableHeaders<?> requestHeaders = WritableHeaders.create(headers.httpHeaders());
+        String authority = headers.authority();
+        if (authority == null || authority.isEmpty()) {
+            authority = requestHeaders.first(HeaderNames.HOST).orElse(null);
+        }
+        if (authority != null && !authority.isEmpty()) {
+            requestHeaders.set(HeaderValues.create(HeaderNames.HOST, authority));
+        }
+        this.authority = authority;
+        this.headers = ServerRequestHeaders.create(requestHeaders);
         this.limitOutcome = limitOutcome;
 
         if (hasEntity) {
@@ -102,6 +115,7 @@ class Http2ServerRequest implements RoutingRequest {
                                                                                  NO_OP_RUNNABLE,
                                                                                  this.headers,
                                                                                  ctx.listenerContext().mediaContext(),
+                                                                                 maxPayloadSize,
                                                                                  maxBufferedEntitySize));
         } else {
             this.entity = LazyValue.create(ReadableEntityBase.empty());
@@ -119,6 +133,7 @@ class Http2ServerRequest implements RoutingRequest {
                                      boolean hasEntity,
                                      Supplier<BufferData> entitySupplier,
                                      LimitAlgorithm.Outcome limitOutcome,
+                                     long maxPayloadSize,
                                      long maxBufferedEntitySize) {
         return new Http2ServerRequest(ctx,
                                       security,
@@ -129,6 +144,7 @@ class Http2ServerRequest implements RoutingRequest {
                                       hasEntity,
                                       entitySupplier,
                                       limitOutcome,
+                                      maxPayloadSize,
                                       maxBufferedEntitySize);
     }
 
@@ -219,11 +235,25 @@ class Http2ServerRequest implements RoutingRequest {
     @Override
     public RoutingRequest matchingPattern(String matchingPattern) {
         this.matchingPattern = matchingPattern;
+        this.matchingPatternSupplier = null;
+        return this;
+    }
+
+    @Override
+    public RoutingRequest matchingPattern(Supplier<Optional<String>> matchingPattern) {
+        Objects.requireNonNull(matchingPattern, "Parameter 'matchingPattern' is null!");
+        this.matchingPatternSupplier = LazyValue.create(() -> Objects.requireNonNull(matchingPattern.get(),
+                                                                                     "Matching pattern supplier returned null"));
+        this.matchingPattern = null;
         return this;
     }
 
     @Override
     public Optional<String> matchingPattern() {
+        Supplier<Optional<String>> matchingPatternSupplier = this.matchingPatternSupplier;
+        if (matchingPatternSupplier != null) {
+            return matchingPatternSupplier.get();
+        }
         return Optional.ofNullable(matchingPattern);
     }
 
@@ -271,6 +301,16 @@ class Http2ServerRequest implements RoutingRequest {
     @Override
     public Optional<ProxyProtocolData> proxyProtocolData() {
         return ctx.proxyProtocolData();
+    }
+
+    @Override
+    public Optional<String> sniRequestedHost() {
+        return ctx.sniContext().flatMap(SniContext::presentedHost);
+    }
+
+    @Override
+    public Optional<String> sniMatchedHost() {
+        return ctx.sniContext().flatMap(SniContext::matchedHost);
     }
 
     private UriInfo createUriInfo() {

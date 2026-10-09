@@ -24,6 +24,7 @@ import java.net.UnixDomainSocketAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,8 +39,19 @@ import io.helidon.config.ConfigException;
 import io.helidon.http.RequestedUriDiscoveryContext;
 import io.helidon.webserver.http.HttpRouting;
 import io.helidon.webserver.spi.ServerFeature;
+import io.helidon.webserver.spi.TransportBindingFactory;
 
 class WebServerConfigSupport {
+    private static final String KEY_BINDINGS = "bindings";
+    private static final String KEY_SERVICE_ENABLED = "enabled";
+
+    static class MaxTcpConnectionsDecorator
+            implements Prototype.OptionDecorator<ListenerConfig.BuilderBase<?, ?>, Integer> {
+        @Override
+        public void decorate(ListenerConfig.BuilderBase<?, ?> builder, Integer maxTcpConnections) {
+            builder.maxConnections(maxTcpConnections);
+        }
+    }
 
     static class CustomMethods {
 
@@ -74,7 +86,7 @@ class WebServerConfigSupport {
         }
     }
 
-    public static class ServerConfigDecorator implements Prototype.BuilderDecorator<WebServerConfig.BuilderBase<?, ?>> {
+    static class ServerConfigDecorator implements Prototype.BuilderDecorator<WebServerConfig.BuilderBase<?, ?>> {
         private static final System.Logger LOGGER = System.getLogger(ServerConfigDecorator.class.getName());
 
         @Override
@@ -86,6 +98,24 @@ class WebServerConfigSupport {
             if (target.namedRoutings().containsKey(WebServer.DEFAULT_SOCKET_NAME)) {
                 throw new ConfigException("Default routing must be configured directly on server config node, or through"
                                                   + " \"ServerConfig.Builder\", not as a named routing.");
+            }
+
+            Map<String, ListenerConfig> sockets = target.sockets();
+            Map<String, ListenerConfig> namedSockets = new LinkedHashMap<>();
+            boolean socketNamesUpdated = false;
+            for (Map.Entry<String, ListenerConfig> entry : sockets.entrySet()) {
+                String socketName = entry.getKey();
+                ListenerConfig socketConfig = entry.getValue();
+                if (!socketName.equals(socketConfig.name())) {
+                    socketConfig = ListenerConfig.builder(socketConfig)
+                            .name(socketName)
+                            .buildPrototype();
+                    socketNamesUpdated = true;
+                }
+                namedSockets.put(socketName, socketConfig);
+            }
+            if (socketNamesUpdated) {
+                target.sockets(namedSockets);
             }
 
             List<ServerFeature> features = target.features();
@@ -127,7 +157,9 @@ class WebServerConfigSupport {
 
     static class ListenerConfigDecorator implements Prototype.BuilderDecorator<ListenerConfig.BuilderBase<?, ?>> {
         @Override
+        @SuppressWarnings("removal")
         public void decorate(ListenerConfig.BuilderBase<?, ?> target) {
+            target.maxTcpConnections(target.maxConnections());
             if (target.bindAddress().isPresent()) {
                 if (target.address().isEmpty()) {
                     target.address(InetAddress.getLoopbackAddress());
@@ -143,6 +175,64 @@ class WebServerConfigSupport {
             name = target.name();
             if (name == null) {
                 target.name(WebServer.DEFAULT_SOCKET_NAME);
+            }
+            if (target.bindAddress().orElse(null) instanceof UnixDomainSocketAddress) {
+                throw new ConfigException("Listener " + target.name()
+                                                  + " uses a Unix domain socket as bind-address. Listener bind-address "
+                                                  + "configures TCP endpoints only. Configure the explicit UDS transport "
+                                                  + "binding instead: use bindings.uds.socket=/path/to/server.sock; "
+                                                  + "for a UDS-only listener also set bindings.tcp.enabled=false. "
+                                                  + "With the builder, add a disabled TcpTransportConfig and a "
+                                                  + "UdsTransportConfig with "
+                                                  + "socket(UnixDomainSocketAddress.of(path)).");
+            }
+
+            Optional<Config> listenerConfig = target.config();
+            if (listenerConfig.isPresent()) {
+                Config tcpConfig = listenerConfig.get()
+                        .get(KEY_BINDINGS)
+                        .get(TransportBindingTypes.TCP);
+                if (tcpConfig.exists()
+                        && !tcpConfig.get(KEY_SERVICE_ENABLED).asBoolean().orElse(true)) {
+                    boolean hasTcpBinding = false;
+                    for (TransportBindingFactory binding : target.bindings()) {
+                        if (TransportBindingTypes.TCP.equals(binding.type())) {
+                            hasTcpBinding = true;
+                            break;
+                        }
+                    }
+                    if (!hasTcpBinding) {
+                        TcpTransportConfig tcpBindingConfig = TcpTransportConfig.builder()
+                                .enabled(false)
+                                .buildPrototype();
+                        target.addBinding(TcpTransportBindingFactory.create(tcpBindingConfig));
+                    }
+                }
+            }
+
+            List<TransportBindingFactory> bindings = target.bindings();
+            Map<String, TransportBindingFactory> bindingsByType = new LinkedHashMap<>();
+            boolean hasTcpBinding = false;
+            for (TransportBindingFactory binding : bindings) {
+                String type = binding.type();
+                if (type == null) {
+                    throw new ConfigException("Transport binding factory type must not be null");
+                }
+                TransportBindingFactory existing = bindingsByType.putIfAbsent(type, binding);
+                if (existing != null) {
+                    throw new ConfigException("Multiple transport binding factories of type \"" + type
+                                                      + "\" are configured for listener \"" + target.name()
+                                                      + "\". A listener can have only one transport binding per type.");
+                }
+                if (TransportBindingTypes.TCP.equals(type)) {
+                    hasTcpBinding = true;
+                }
+            }
+            if (!hasTcpBinding) {
+                List<TransportBindingFactory> normalizedBindings = new ArrayList<>(bindings.size() + 1);
+                normalizedBindings.add(TcpTransportBindingFactory.create(TcpTransportConfig.create()));
+                normalizedBindings.addAll(bindings);
+                target.bindings(normalizedBindings);
             }
 
             if (target.connectionOptions().isEmpty()) {
@@ -161,12 +251,35 @@ class WebServerConfigSupport {
                     target.putListenerSocketOption(StandardSocketOptions.SO_REUSEADDR, true);
                 }
             }
+            Optional<ProxyProtocolConfig> proxyProtocol = target.proxyProtocol();
+            if (target.enableProxyProtocol()) {
+                if (proxyProtocol.isEmpty()) {
+                    throw new ConfigException("The deprecated \"enable-proxy-protocol\" option cannot enable PROXY protocol"
+                                                      + " support by itself. Configure \"proxy-protocol.trusted-proxies\""
+                                                      + " for the listener.");
+                }
+                if (!proxyProtocol.get().enabled()) {
+                    throw new ConfigException("\"enable-proxy-protocol\" and \"proxy-protocol.enabled\" conflict for"
+                                                      + " listener \"" + target.name() + "\".");
+                }
+            }
+            if (proxyProtocol.filter(ProxyProtocolConfig::enabled).isPresent()) {
+                if (proxyProtocol.get().trustedProxies().isEmpty()) {
+                    throw new ConfigException("PROXY protocol support for listener \"" + target.name()
+                                                      + "\" requires explicit trusted proxy configuration. Configure"
+                                                      + " \"proxy-protocol.trusted-proxies\" using allow and/or deny"
+                                                      + " settings. If all peers are trusted, explicitly set"
+                                                      + " \"proxy-protocol.trusted-proxies.allow.all\" to true.");
+                }
+                target.enableProxyProtocol(true);
+            }
             if (target.requestedUriDiscoveryContext().isEmpty()) {
                 target.requestedUriDiscoveryContext(RequestedUriDiscoveryContext.builder()
                                                             .socketId(target.name())
                                                             .build());
             }
         }
+
     }
 
     static class ListenerCustomMethods {
@@ -183,16 +296,38 @@ class WebServerConfigSupport {
             builder.routing(routingBuilder);
         }
 
+        /**
+         * Add a TCP transport binding from configuration.
+         *
+         * @param builder listener config builder
+         * @param config TCP transport binding configuration
+         */
+        @Prototype.BuilderMethod
+        @Prototype.Annotated("io.helidon.common.Api.Incubating")
+        static void addBinding(ListenerConfig.BuilderBase<?, ?> builder, TcpTransportConfig config) {
+            builder.addBinding(TcpTransportBindingFactory.create(config));
+        }
+
+        /**
+         * Add a Unix domain socket transport binding from configuration.
+         *
+         * @param builder listener config builder
+         * @param config Unix domain socket transport binding configuration
+         */
+        @Prototype.BuilderMethod
+        @Prototype.Annotated("io.helidon.common.Api.Incubating")
+        static void addBinding(ListenerConfig.BuilderBase<?, ?> builder, UdsTransportConfig config) {
+            builder.addBinding(UdsTransportBindingFactory.create(config));
+        }
+
         @Prototype.ConfigFactoryMethod("bindAddress")
         static SocketAddress createBindAddress(Config config) {
             String address = config.asString().get();
-            // unix:/path/to/socket
-            if (address.startsWith("unix:")) {
-                String path = address.substring(7);
-                return UnixDomainSocketAddress.of(path);
+            if (address.startsWith("unix:/")) {
+                return UnixDomainSocketAddress.of(address.substring("unix:".length()));
             }
-            // must be localhost:8080 or similar
             int col = address.indexOf(':');
+            // must be localhost:8080 or similar
             String host;
             int port;
             if (col == 0) {

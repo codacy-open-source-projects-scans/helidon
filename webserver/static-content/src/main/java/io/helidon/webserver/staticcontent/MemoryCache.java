@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,11 @@
 package io.helidon.webserver.staticcontent;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -37,9 +39,12 @@ public class MemoryCache implements RuntimeType.Api<MemoryCacheConfig> {
     private final long maxSize;
     // cache is Map<instance of handler -> Map<resource path -> CachedHandlerInMemory>>
     private final Map<StaticContentHandler, Map<String, CachedHandlerInMemory>> cache = new IdentityHashMap<>();
+    private final Map<CachedHandlerInMemory, Integer> handlerReferences = new IdentityHashMap<>();
     private final ReadWriteLock cacheLock = new ReentrantReadWriteLock();
 
+    // Mutations that affect currentSize take sizeLock before cacheLock to keep currentSize in sync with cache entries.
     private final ReentrantLock sizeLock = new ReentrantLock();
+    private final Map<StaticContentHandler, Set<Reservation>> reservations = new IdentityHashMap<>();
     private long currentSize;
 
     private MemoryCache(MemoryCacheConfig config) {
@@ -100,10 +105,25 @@ public class MemoryCache implements RuntimeType.Api<MemoryCacheConfig> {
 
     void clear(StaticContentHandler staticContentHandler) {
         try {
+            sizeLock.lock();
             cacheLock.writeLock().lock();
-            cache.remove(staticContentHandler);
+            Set<Reservation> removedReservations = reservations.remove(staticContentHandler);
+            if (removedReservations != null) {
+                for (Reservation reservation : removedReservations) {
+                    currentSize -= reservation.size;
+                }
+            }
+            Map<String, CachedHandlerInMemory> removed = cache.remove(staticContentHandler);
+            if (removed != null) {
+                long released = 0;
+                for (CachedHandlerInMemory cached : removed.values()) {
+                    released += removeReference(cached);
+                }
+                currentSize -= released;
+            }
         } finally {
             cacheLock.writeLock().unlock();
+            sizeLock.unlock();
         }
     }
 
@@ -115,32 +135,52 @@ public class MemoryCache implements RuntimeType.Api<MemoryCacheConfig> {
      * @return if there is space in the cache for the number of bytes requested
      */
     boolean available(int bytes) {
-        return maxSize != 0 && (currentSize + bytes) <= maxSize;
+        try {
+            sizeLock.lock();
+            return maxSize != 0 && (currentSize + bytes) <= maxSize;
+        } finally {
+            sizeLock.unlock();
+        }
     }
 
     Optional<CachedHandlerInMemory> cache(StaticContentHandler handler,
                                           String resource,
                                           int size,
                                           Supplier<CachedHandlerInMemory> handlerSupplier) {
+        Reservation reservation = reserve(handler, size);
+        if (reservation == null) {
+            return Optional.empty();
+        }
+
+        CachedHandlerInMemory cachedHandlerInMemory;
         try {
-            sizeLock.lock();
-            if (maxSize == 0 || currentSize + size > maxSize) {
-                // either we are not enabled, or the size would be bigger than maximal size
-                return Optional.empty();
-            }
-            // increase current size
-            currentSize += size;
-        } finally {
-            sizeLock.unlock();
+            cachedHandlerInMemory = handlerSupplier.get();
+        } catch (RuntimeException | Error e) {
+            releaseReservation(reservation);
+            throw e;
         }
         try {
-            cacheLock.writeLock().lock();
-            CachedHandlerInMemory cachedHandlerInMemory = handlerSupplier.get();
-            cache.computeIfAbsent(handler, k -> new HashMap<>())
-                    .put(resource, cachedHandlerInMemory);
-            return Optional.of(cachedHandlerInMemory);
+            sizeLock.lock();
+            if (!removeReservation(reservation)) {
+                return Optional.empty();
+            }
+            try {
+                cacheLock.writeLock().lock();
+                Map<String, CachedHandlerInMemory> resourceCache = cache.computeIfAbsent(handler, k -> new HashMap<>());
+                CachedHandlerInMemory previous = resourceCache.get(resource);
+                long updatedSize = currentSize - reservation.size + sizeDelta(previous, cachedHandlerInMemory);
+                if (updatedSize > maxSize) {
+                    currentSize -= reservation.size;
+                    return Optional.empty();
+                }
+                resourceCache.put(resource, cachedHandlerInMemory);
+                updateReferences(previous, cachedHandlerInMemory, updatedSize);
+                return Optional.of(cachedHandlerInMemory);
+            } finally {
+                cacheLock.writeLock().unlock();
+            }
         } finally {
-            cacheLock.writeLock().unlock();
+            sizeLock.unlock();
         }
     }
 
@@ -148,19 +188,13 @@ public class MemoryCache implements RuntimeType.Api<MemoryCacheConfig> {
     void cache(StaticContentHandler handler, String resource, CachedHandlerInMemory inMemoryHandler) {
         try {
             sizeLock.lock();
-            if (maxSize != 0) {
-                // only increase current size if enabled, otherwise it does not matter
-                currentSize += inMemoryHandler.contentLength();
-            }
-        } finally {
-            sizeLock.unlock();
-        }
-        try {
             cacheLock.writeLock().lock();
-            cache.computeIfAbsent(handler, k -> new HashMap<>())
+            CachedHandlerInMemory previous = cache.computeIfAbsent(handler, k -> new HashMap<>())
                     .put(resource, inMemoryHandler);
+            updateReferences(previous, inMemoryHandler, currentSize + sizeDelta(previous, inMemoryHandler));
         } finally {
             cacheLock.writeLock().unlock();
+            sizeLock.unlock();
         }
     }
 
@@ -174,6 +208,99 @@ public class MemoryCache implements RuntimeType.Api<MemoryCacheConfig> {
             return Optional.ofNullable(resourceCache.get(resource));
         } finally {
             cacheLock.readLock().unlock();
+        }
+    }
+
+    private Reservation reserve(StaticContentHandler handler, int size) {
+        if (maxSize == 0 || size < 0) {
+            return null;
+        }
+        try {
+            sizeLock.lock();
+            if (currentSize + size > maxSize) {
+                return null;
+            }
+            Reservation reservation = new Reservation(handler, size);
+            currentSize += size;
+            reservations.computeIfAbsent(handler, _ -> new HashSet<>()).add(reservation);
+            return reservation;
+        } finally {
+            sizeLock.unlock();
+        }
+    }
+
+    private void releaseReservation(Reservation reservation) {
+        try {
+            sizeLock.lock();
+            if (removeReservation(reservation)) {
+                currentSize -= reservation.size;
+            }
+        } finally {
+            sizeLock.unlock();
+        }
+    }
+
+    private boolean removeReservation(Reservation reservation) {
+        Set<Reservation> handlerReservations = reservations.get(reservation.handler);
+        if (handlerReservations == null || !handlerReservations.remove(reservation)) {
+            return false;
+        }
+        if (handlerReservations.isEmpty()) {
+            reservations.remove(reservation.handler);
+        }
+        return true;
+    }
+
+    private long sizeDelta(CachedHandlerInMemory previous, CachedHandlerInMemory next) {
+        if (previous == next) {
+            return 0;
+        }
+
+        long result = 0;
+        if (previous != null && handlerReferences.getOrDefault(previous, 0) == 1) {
+            result -= previous.contentLength();
+        }
+        if (handlerReferences.getOrDefault(next, 0) == 0) {
+            result += next.contentLength();
+        }
+        return result;
+    }
+
+    private void updateReferences(CachedHandlerInMemory previous, CachedHandlerInMemory next, long updatedSize) {
+        if (previous != next) {
+            removeReference(previous);
+            addReference(next);
+        }
+        currentSize = updatedSize;
+    }
+
+    private void addReference(CachedHandlerInMemory handler) {
+        handlerReferences.merge(handler, 1, Integer::sum);
+    }
+
+    private long removeReference(CachedHandlerInMemory handler) {
+        if (handler == null) {
+            return 0;
+        }
+        Integer count = handlerReferences.get(handler);
+        if (count == null) {
+            return 0;
+        }
+        if (count == 1) {
+            handlerReferences.remove(handler);
+            return handler.contentLength();
+        }
+        handlerReferences.put(handler, count - 1);
+        return 0;
+    }
+
+    private static final class Reservation {
+        private final StaticContentHandler handler;
+        private final long size;
+
+        private Reservation(StaticContentHandler handler, long size) {
+            this.handler = handler;
+            this.size = size;
         }
     }
 }

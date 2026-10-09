@@ -44,6 +44,22 @@ interface GreetService {
     @Http.Path("/all")
     List<GreetingDto> greetings();
 
+    @Http.QUERY
+    @Http.Path("/query")
+    @Http.Consumes(MediaTypes.TEXT_PLAIN_VALUE)
+    @Http.Produces(MediaTypes.TEXT_PLAIN_VALUE)
+    String query(@Http.Entity String query);
+
+    @Http.HttpMethod("CASE")
+    @Http.Path("/method-case")
+    @Http.Produces(MediaTypes.TEXT_PLAIN_VALUE)
+    String uppercaseCustomMethod();
+
+    @Http.HttpMethod("case")
+    @Http.Path("/method-case")
+    @Http.Produces(MediaTypes.TEXT_PLAIN_VALUE)
+    String lowercaseCustomMethod();
+
     @Http.GET
     @Http.Path("/ft/retry")
     String retriable();

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -140,27 +140,6 @@ public interface Span {
      * @return current scope
      */
     Scope activate();
-
-    /**
-     * Sets a baggage item in the Span (and its SpanContext) as a key/value pair.
-     *
-     * @param key String Key
-     * @param value String Value
-     * @return current Span instance
-     * @deprecated Use {@link #baggage()} and then {@link io.helidon.tracing.WritableBaggage#set(String, String)}}.
-     */
-    @Deprecated(since = "4.0.5", forRemoval = true)
-    Span baggage(String key, String value);
-
-    /**
-     * Get Baggage Item by key.
-     *
-     * @param key String key
-     * @return {@link Optional} of the value of the baggage item
-     * @deprecated Use {@link #baggage()} and then {@link Baggage#get(String)}.
-     */
-    @Deprecated(since = "4.0.5", forRemoval = true)
-    Optional<String> baggage(String key);
 
     /**
      * Returns writable baggage associated with this span.

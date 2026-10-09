@@ -16,90 +16,78 @@
 
 package io.helidon.webserver;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
-import java.net.SocketException;
-import java.net.StandardProtocolFamily;
-import java.net.UnixDomainSocketAddress;
-import java.nio.channels.AsynchronousCloseException;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
-import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.ServiceLoader;
+import java.util.Objects;
+import java.util.OptionalInt;
+import java.util.Set;
 import java.util.Timer;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
-import javax.net.ssl.SSLParameters;
-
-import io.helidon.common.HelidonServiceLoader;
-import io.helidon.common.LazyValue;
 import io.helidon.common.concurrency.limits.FixedLimit;
 import io.helidon.common.concurrency.limits.Limit;
-import io.helidon.common.concurrency.limits.LimitAlgorithm;
+import io.helidon.common.concurrency.limits.Limit.InitializationContext;
 import io.helidon.common.context.Context;
-import io.helidon.common.socket.SocketOptions;
-import io.helidon.common.task.HelidonTaskExecutor;
 import io.helidon.common.tls.Tls;
+import io.helidon.common.tls.TlsMaterial;
+import io.helidon.http.HttpTransportObserver;
 import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.MediaContext;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.metrics.api.Tag;
+import io.helidon.service.registry.Services;
+import io.helidon.webserver.HttpTransportObserverSupport.ObserverLifecycle;
 import io.helidon.webserver.http.DirectHandlers;
+import io.helidon.webserver.spi.PortTransportBinding;
 import io.helidon.webserver.spi.ProtocolConfig;
-import io.helidon.webserver.spi.ServerConnection;
-import io.helidon.webserver.spi.ServerConnectionSelector;
-import io.helidon.webserver.spi.ServerConnectionSelectorProvider;
+import io.helidon.webserver.spi.TransportBinding;
+import io.helidon.webserver.spi.TransportBindingFactory;
 
 import static java.lang.System.Logger.Level.DEBUG;
-import static java.lang.System.Logger.Level.ERROR;
-import static java.lang.System.Logger.Level.INFO;
-import static java.lang.System.Logger.Level.TRACE;
-import static java.lang.System.Logger.Level.WARNING;
 
-class ServerListener implements ListenerContext {
+class ServerListener implements TransportBindingContext, ListenerContext {
     private static final System.Logger LOGGER = System.getLogger(ServerListener.class.getName());
+    // TransportBinding.stop receives the graceful period and may need time after it expires to run forced cleanup.
+    private static final long BINDING_FORCE_STOP_COMPLETION_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(1);
 
-    @SuppressWarnings("rawtypes")
-    private static final LazyValue<List<ServerConnectionSelectorProvider>> SELECTOR_PROVIDERS = LazyValue.create(() ->
-            HelidonServiceLoader.create(ServiceLoader.load(ServerConnectionSelectorProvider.class)).asList());
-
-    private final ConnectionProviders connectionProviders;
     private final String socketName;
     private final ListenerConfig listenerConfig;
     private final Router router;
-    private final HelidonTaskExecutor readerExecutor;
     private final ExecutorService sharedExecutor;
     private final DirectHandlers directHandlers;
     private final Tls tls;
-    private final SocketOptions connectionOptions;
+    private final VirtualHostRegistry virtualHosts;
     private final SocketAddress configuredAddress;
     private final Duration gracePeriod;
+    private final Timer idleConnectionTimer;
+    private final FatalListenerFailureHandler fatalListenerFailureHandler;
+    private final List<TransportBinding> transportBindings;
+    private final List<ObserverLifecycle> httpTransportObserverLifecycles;
 
     private final MediaContext mediaContext;
     private final ContentEncodingContext contentEncodingContext;
     private final Context context;
     private final Limit connectionLimit;
     private final Limit requestLimit;
-    private final Map<String, ServerConnection> activeConnections = new ConcurrentHashMap<>();
 
-    private volatile boolean running;
-    private volatile boolean inCheckpoint;
-    private volatile int connectedPort;
-    private volatile ServerSocketChannel serverSocket;
-    private volatile Thread serverThread;
-    private volatile CompletableFuture<Void> closeFuture;
+    private final AtomicBoolean lifecycleStarted = new AtomicBoolean();
+    private volatile HttpTransportObserver httpTransportObserver = HttpTransportObserver.noop();
+    private List<ObserverLifecycle> startedHttpTransportObservers = List.of();
 
-    @SuppressWarnings("unchecked")
     ServerListener(String socketName,
                    ListenerConfig listenerConfig,
                    Router router,
@@ -107,34 +95,37 @@ class ServerListener implements ListenerContext {
                    Timer idleConnectionTimer,
                    MediaContext defaultMediaContext,
                    ContentEncodingContext defaultContentEncodingContext,
-                   DirectHandlers defaultDirectHandlers) {
+                   DirectHandlers defaultDirectHandlers,
+                   List<ObserverLifecycle> httpTransportObserverLifecycles,
+                   FatalListenerFailureHandler fatalListenerFailureHandler) {
+        this(socketName,
+             listenerConfig,
+             router,
+             serverContext,
+             idleConnectionTimer,
+             defaultMediaContext,
+             defaultContentEncodingContext,
+             defaultDirectHandlers,
+             () -> Services.get(MetricsFactory.class),
+             () -> Services.get(MeterRegistry.class),
+             httpTransportObserverLifecycles,
+             fatalListenerFailureHandler);
+    }
 
-        ProtocolConfigs protocols = ProtocolConfigs.create(listenerConfig.protocols());
-        List<ServerConnectionSelector> selectors = new ArrayList<>(listenerConfig.connectionSelectors());
+    ServerListener(String socketName,
+                   ListenerConfig listenerConfig,
+                   Router router,
+                   Context serverContext,
+                   Timer idleConnectionTimer,
+                   MediaContext defaultMediaContext,
+                   ContentEncodingContext defaultContentEncodingContext,
+                   DirectHandlers defaultDirectHandlers,
+                   Supplier<MetricsFactory> metricsFactory,
+                   Supplier<MeterRegistry> meterRegistry,
+                   List<ObserverLifecycle> httpTransportObserverLifecycles,
+                   FatalListenerFailureHandler fatalListenerFailureHandler) {
 
-        // for each discovered selector provider, add a selector for each configuration of that provider
-        SELECTOR_PROVIDERS.get()
-                .forEach(provider -> {
-                    List<ProtocolConfig> configurations = protocols.config(provider.protocolType(),
-                                                                           provider.protocolConfigType());
-                    for (ProtocolConfig configuration : configurations) {
-                        selectors.add(provider.create(socketName, configuration, protocols));
-                    }
-                });
-
-        // this instance is the only one waiting on this limit, so queue of 1 is enough
-        // 5 minutes is long enough not to have busy waits
-        if (listenerConfig.maxTcpConnections() == -1 || listenerConfig.maxTcpConnections() == 0) {
-            // unlimited, no need to queue, as we never block
-            this.connectionLimit = FixedLimit.create();
-        } else {
-            this.connectionLimit = FixedLimit.builder()
-                    .queueLength(1)
-                    .queueTimeout(Duration.ofMinutes(5))
-                    .permits(listenerConfig.maxTcpConnections())
-                    .build();
-        }
-
+        List<ProtocolConfig> protocolConfigs = listenerConfig.protocols();
         if (listenerConfig.maxConcurrentRequests() == -1) {
             this.requestLimit = listenerConfig.concurrencyLimit()
                     .orElseGet(FixedLimit::create); // unlimited unless configured
@@ -144,14 +135,23 @@ class ServerListener implements ListenerContext {
                     .build();
         }
 
-        this.connectionLimit.init(socketName);
-        this.requestLimit.init(socketName);
+        InitializationContext limitContext = limitContext(socketName, metricsFactory, meterRegistry);
+        if (listenerConfig.maxConnections() == -1 || listenerConfig.maxConnections() == 0) {
+            this.connectionLimit = FixedLimit.create();
+        } else {
+            this.connectionLimit = FixedLimit.builder()
+                    .queueLength(Math.max(1, listenerConfig.bindings().size()))
+                    .queueTimeout(Duration.ofMinutes(5))
+                    .permits(listenerConfig.maxConnections())
+                    .build();
+        }
+        this.connectionLimit.init(limitContext);
+        this.requestLimit.init(limitContext);
 
-        this.connectionProviders = ConnectionProviders.create(selectors);
         this.socketName = socketName;
         this.listenerConfig = listenerConfig;
         this.tls = listenerConfig.tls().orElseGet(() -> Tls.builder().enabled(false).build());
-        this.connectionOptions = listenerConfig.connectionOptions();
+        this.virtualHosts = VirtualHostRegistry.create(socketName, listenerConfig, tls);
         this.directHandlers = listenerConfig.directHandlers().orElse(defaultDirectHandlers);
         this.mediaContext = listenerConfig.mediaContext().orElse(defaultMediaContext);
         this.contentEncodingContext = listenerConfig.contentEncoding().orElse(defaultContentEncodingContext);
@@ -160,11 +160,6 @@ class ServerListener implements ListenerContext {
                 .parent(serverContext)
                 .build());
         this.gracePeriod = listenerConfig.shutdownGracePeriod();
-
-        initServerThread();
-
-        // to read requests and execute tasks
-        this.readerExecutor = ExecutorsFactory.newServerListenerReaderExecutor();
 
         // to do anything else (writers etc.)
         this.sharedExecutor = ExecutorsFactory.newServerListenerSharedExecutor();
@@ -179,21 +174,21 @@ class ServerListener implements ListenerContext {
                 });
 
         this.router = router;
-
-        // handle idle connection timeout
-        IdleTimeoutHandler ith = new IdleTimeoutHandler(idleConnectionTimer,
-                                                        listenerConfig,
-                                                        this::activeConnections);
-        ith.start();
-    }
-
-    private void initServerThread() {
-        this.closeFuture = new CompletableFuture<>();
-        this.serverThread = Thread.ofPlatform()
-                .inheritInheritableThreadLocals(true)
-                .daemon(false)
-                .name("server-" + socketName + "-listener")
-                .unstarted(this::listen);
+        this.idleConnectionTimer = idleConnectionTimer;
+        this.httpTransportObserverLifecycles = List.copyOf(httpTransportObserverLifecycles);
+        this.fatalListenerFailureHandler = Objects.requireNonNull(fatalListenerFailureHandler, "fatalListenerFailureHandler");
+        this.transportBindings = planTransportBindings(protocolConfigs);
+        int maxConnections = listenerConfig.maxConnections();
+        long idlePermitBindingCount = transportBindings.stream()
+                .filter(TransportBinding::holdsIdleConnectionPermit)
+                .count();
+        if (maxConnections > 0 && idlePermitBindingCount > maxConnections) {
+            throw new IllegalArgumentException("Listener " + socketName + " has max-connections=" + maxConnections
+                                                       + ", but " + idlePermitBindingCount
+                                                       + " active transport bindings each reserve an idle connection "
+                                                       + "permit. Configure max-connections to at least "
+                                                       + idlePermitBindingCount + " or leave it unlimited.");
+        }
     }
 
     @Override
@@ -227,152 +222,134 @@ class ServerListener implements ListenerContext {
     }
 
     @Override
+    public ListenerContext listenerContext() {
+        return this;
+    }
+
+    public String name() {
+        return socketName;
+    }
+
+    @Override
+    public Router router() {
+        return router;
+    }
+
+    Timer idleConnectionTimer() {
+        return idleConnectionTimer;
+    }
+
+    @Override
+    public Limit requestLimit() {
+        return requestLimit;
+    }
+
+    @Override
+    public Limit connectionLimit() {
+        return connectionLimit;
+    }
+
+    @Override
+    public ListenerTlsContext listenerTls() {
+        return virtualHosts;
+    }
+
+    @Override
     public String toString() {
         return socketName + " (" + configuredAddress + ")";
     }
 
     int port() {
-        return connectedPort;
+        return boundPort().orElse(-1);
     }
 
-    Router router() {
-        return router;
+    @Override
+    public OptionalInt boundPort() {
+        List<TransportBinding> localTransportBindings = transportBindings;
+        if (localTransportBindings == null) {
+            return OptionalInt.empty();
+        }
+        for (TransportBinding binding : localTransportBindings) {
+            if (binding instanceof PortTransportBinding portBinding) {
+                int port = portBinding.port();
+                if (port != -1) {
+                    return OptionalInt.of(port);
+                }
+            }
+        }
+        return OptionalInt.empty();
     }
 
-    SocketAddress configuredAddress() {
+    @Override
+    public SocketAddress configuredAddress() {
         return configuredAddress;
     }
 
-    void stop() {
-        if (!running) {
-            return;
-        }
-        running = false;
-        suspend(true);
-        router.afterStop();
+    @Override
+    public void fatalBindingFailure(TransportBinding binding, Throwable cause) {
+        Objects.requireNonNull(binding, "binding");
+        Objects.requireNonNull(cause, "cause");
+        fatalListenerFailureHandler.handle(this,
+                                           new IllegalStateException("Fatal failure in transport binding type \""
+                                                                             + binding.type() + "\" at "
+                                                                             + binding.configuredEndpoint(),
+                                                                     cause));
     }
 
-    private void suspend(boolean shutdownExecutors) {
-        try {
-            // Stop listening for connections
-            serverSocket.close();
-            if (configuredAddress instanceof UnixDomainSocketAddress udsa) {
-                try {
-                    // UNIX socket files are created automatically, but they are not deleted when the channel is closed
-                    Files.deleteIfExists(udsa.getPath());
-                } catch (IOException e) {
-                    LOGGER.log(WARNING, "Failed to delete UNIX socket file " + udsa.getPath().toAbsolutePath(), e);
-                }
-            }
-            // Stop handling any new requests on all active connections
-            activeConnections().forEach(connection -> connection.close(false));
-            if (shutdownExecutors) {
-                // Shutdown reader executor
-                readerExecutor.terminate(gracePeriod.toMillis(), TimeUnit.MILLISECONDS);
-                if (!readerExecutor.isTerminated()) {
-                    LOGGER.log(DEBUG, "Some tasks in reader executor did not terminate gracefully");
-                    readerExecutor.forceTerminate();
-                }
-
-                // Shutdown shared executor
-                try {
-                    sharedExecutor.shutdown();
-                    boolean done = sharedExecutor.awaitTermination(gracePeriod.toMillis(), TimeUnit.MILLISECONDS);
-                    if (!done) {
-                        List<Runnable> running = sharedExecutor.shutdownNow();
-                        if (!running.isEmpty()) {
-                            LOGGER.log(DEBUG, running.size() + " tasks in shared executor did not terminate gracefully");
-                        }
-                    }
-                } catch (InterruptedException e) {
-                    // falls through
-                }
-            }
-            // Interrupt and close any active connections
-            activeConnections().forEach(connection -> connection.close(true));
-        } catch (IOException e) {
-            LOGGER.log(INFO, "Exception thrown on socket close", e);
+    void stop() {
+        if (!lifecycleStarted.compareAndSet(true, false)) {
+            return;
         }
-        serverThread.interrupt();
-        closeFuture.join();
+        long stopAtNanos = stopAtNanos(gracePeriod);
+        Throwable failure = stopResources(transportBindings, stopAtNanos);
+        failure = LifecycleFailures.add(failure, stopHttpTransportObservers(stopAtNanos));
+        try {
+            router.afterStop();
+        } catch (RuntimeException | Error e) {
+            failure = LifecycleFailures.add(failure, e);
+        }
+        LifecycleFailures.throwIfFailed(failure, "Failed to stop listener " + socketName);
     }
 
     void start() {
-        router.beforeStart();
-        startIt();
+        start(() -> false);
     }
 
-    private void startIt() {
+    void start(BooleanSupplier cancelled) {
+        boolean beforeStartSucceeded = false;
+        List<TransportBinding> startAttemptedBindings = new ArrayList<>();
         try {
-            if (configuredAddress instanceof UnixDomainSocketAddress) {
-                serverSocket = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
-            } else {
-                serverSocket = ServerSocketChannel.open();
+            checkCancelledStartup(cancelled);
+            router.beforeStart();
+            beforeStartSucceeded = true;
+            lifecycleStarted.set(true);
+            List<HttpTransportObserver> observers = new ArrayList<>();
+            List<ObserverLifecycle> started = new ArrayList<>();
+            for (ObserverLifecycle lifecycle : httpTransportObserverLifecycles) {
+                HttpTransportObserver observer = lifecycle.start();
+                started.add(lifecycle);
+                startedHttpTransportObservers = List.copyOf(started);
+                observers.add(Objects.requireNonNull(observer, "HTTP transport observer"));
             }
-            if (tls.enabled()) {
-                // basic validation of the configuration
-                tls.newEngine();
-            }
-            listenerConfig.configureSocket(serverSocket);
-
-            serverSocket.bind(configuredAddress, listenerConfig.backlog());
-            this.connectedPort = serverSocket.getLocalAddress() instanceof InetSocketAddress ias ? ias.getPort() : -1;
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to start server", e);
+            httpTransportObserver = HttpTransportObserver.compose(observers);
+            checkCancelledStartup(cancelled);
+            startIt(cancelled, startAttemptedBindings);
+        } catch (RuntimeException | Error e) {
+            rollbackFailedStart(e, beforeStartSucceeded, startAttemptedBindings);
+            throw e;
         }
-
-        String serverChannelId = "0x" + HexFormat.of().toHexDigits(System.identityHashCode(serverSocket));
-
-        running = true;
-
-        if (LOGGER.isLoggable(INFO)) {
-            if (configuredAddress instanceof InetSocketAddress inetAddress) {
-                String format;
-                if (tls.enabled()) {
-                    format = "[%s] https://%s:%s bound for socket '%s'";
-                } else {
-                    format = "[%s] http://%s:%s bound for socket '%s'";
-                }
-                LOGGER.log(INFO, String.format(format,
-                                               serverChannelId,
-                                               inetAddress.getHostString(),
-                                               connectedPort,
-                                               socketName));
-            } else {
-                String format;
-                if (tls.enabled()) {
-                    format = "[%s] %s bound for secure socket '%s'";
-                } else {
-                    format = "[%s] %s bound for socket '%s'";
-                }
-                LOGGER.log(INFO, String.format(format,
-                                               serverChannelId,
-                                               configuredAddress,
-                                               socketName));
-            }
-
-
-            if (LOGGER.isLoggable(TRACE)) {
-                if (listenerConfig.writeQueueLength() <= 1) {
-                    LOGGER.log(System.Logger.Level.TRACE, "[" + serverChannelId + "] direct writes");
-                } else {
-                    LOGGER.log(System.Logger.Level.TRACE,
-                               "[" + serverChannelId + "] async writes, queue length: " + listenerConfig.writeQueueLength());
-                }
-                if (tls.enabled()) {
-                    debugTls(serverChannelId, tls);
-                }
-            }
-        }
-
-        serverThread.start();
     }
 
     boolean hasTls() {
         return tls.enabled();
     }
 
+    HttpTransportObserver httpTransportObserver() {
+        return httpTransportObserver;
+    }
+
     void reloadTls(Tls tls) {
+        Objects.requireNonNull(tls, "tls");
         if (!this.tls.enabled()) {
             throw new IllegalArgumentException("TLS is not enabled on the socket " + socketName
                                                        + " and therefore cannot be reloaded");
@@ -383,125 +360,500 @@ class ServerListener implements ListenerContext {
         this.tls.reload(tls);
     }
 
-    private void debugTls(String serverChannelId, Tls tls) {
-        SSLParameters sslParameters = tls.newEngine()
-                .getSSLParameters();
-
-        String message = "[" + serverChannelId + "] TLS configuration of socket " + socketName + '\n'
-                + "Protocols: " + Arrays.toString(sslParameters.getProtocols()) + '\n'
-                + "Cipher Suites: " + Arrays.toString(sslParameters.getCipherSuites()) + '\n'
-                + "Endpoint identification algorithm: " + sslParameters.getEndpointIdentificationAlgorithm() + '\n'
-                + "Need client auth: " + sslParameters.getNeedClientAuth() + '\n'
-                + "Want client auth: " + sslParameters.getWantClientAuth();
-
-        LOGGER.log(TRACE, message);
-    }
-
-    private void listen() {
-        String serverChannelId = "0x" + HexFormat.of().toHexDigits(System.identityHashCode(serverSocket));
-
-        while (running) {
-            try {
-                // this must be done before we accept, and the semaphore must be released when connection is finished
-                var outcome = connectionLimit.tryAcquireOutcome(true);
-                if (outcome.disposition() == LimitAlgorithm.Outcome.Disposition.ACCEPTED) {
-                    LimitAlgorithm.Token token = ((LimitAlgorithm.Outcome.Accepted) outcome).token();
-
-                    // if accept fails itself, we consider it end of story, the listener is broken
-                    SocketChannel socket = serverSocket.accept();
-
-                    try {
-                        connectionOptions.configureSocket(socket);
-                        ConnectionHandler handler = new ConnectionHandler(this,
-                                                                          token,
-                                                                          requestLimit,
-                                                                          connectionProviders,
-                                                                          activeConnections,
-                                                                          socket,
-                                                                          serverChannelId,
-                                                                          router,
-                                                                          tls);
-                        readerExecutor.execute(handler);
-                    } catch (RejectedExecutionException e) {
-                        LOGGER.log(ERROR, "Executor rejected handler for new connection", e);
-
-                        // the socket was never handled
-                        try {
-                            socket.close();
-                        } catch (IOException ex) {
-                            LOGGER.log(TRACE, "Failed to close socket that was rejected for execution", e);
-                        }
-
-                        // we never started the handler, so we must release the semaphore here
-                        token.dropped();
-                    } catch (Exception e) {
-                        // we may get an SSL handshake errors, which should only fail one socket, not the listener
-                        LOGGER.log(TRACE, "Failed to handle accepted socket", e);
-                        // the socket was never handled
-                        try {
-                            socket.close();
-                        } catch (IOException ex) {
-                            LOGGER.log(TRACE,
-                                       "Failed to close socket that failed start execution (see previous trace for reason)",
-                                       e);
-                        }
-
-                        // we never started the handler, so we must release the semaphore here
-                        token.ignore();
-                    }
-                }
-            } catch (AsynchronousCloseException e) {
-                if (inCheckpoint) {
-                    break;
-                } else if (running) {
-                    stop();
-                }
-            } catch (SocketException e) {
-                if (!e.getMessage().contains("Socket closed")) {
-                    LOGGER.log(ERROR, "Got a socket exception while listening, this server socket is terminating now", e);
-                }
-                if (inCheckpoint) {
-                    break;
-                } else if (running) {
-                    stop();
-                }
-            } catch (Throwable e) {
-                LOGGER.log(ERROR, "Got a throwable while listening, this server socket is terminating now", e);
-                if (inCheckpoint) {
-                    break;
-                } else if (running) {
-                    stop();
-                }
-            }
+    void reloadTls(TlsMaterial material) {
+        Objects.requireNonNull(material, "material");
+        if (!tls.enabled()) {
+            throw new IllegalArgumentException("TLS is not enabled on the socket " + socketName
+                                                       + " and therefore cannot be reloaded");
         }
-
-        LOGGER.log(INFO, String.format("[%s] %s socket closed.", serverChannelId, socketName));
-        closeFuture.complete(null);
+        tls.reload(material);
     }
 
-    private List<ServerConnection> activeConnections() {
-        return new ArrayList<>(activeConnections.values());
-    }
-
-    // Intended for testing.
-    Thread serverThreads() {
-        return serverThread;
+    void reloadVirtualHostTls(TlsMaterial material, String host) {
+        Objects.requireNonNull(material, "material");
+        Objects.requireNonNull(host, "host");
+        if (!tls.enabled()) {
+            throw new IllegalArgumentException("TLS is not enabled on the socket " + socketName
+                                                       + " and therefore cannot be reloaded");
+        }
+        virtualHosts.reloadTls(material, host);
     }
 
     void suspend() {
-        inCheckpoint = true;
-        // Checkpoint suspend is expected to stop the listener thread. The connection-limit wait path
-        // converts interrupts into a rejected outcome, so clear the loop condition first to avoid
-        // re-entering the wait after the interrupt is consumed.
-        running = false;
-        suspend(false);
-        serverThread = null;
-        closeFuture = null;
+        Throwable failure = null;
+        for (TransportBinding binding : transportBindings) {
+            try {
+                binding.suspend();
+            } catch (RuntimeException | Error e) {
+                failure = LifecycleFailures.add(failure, e);
+            }
+        }
+        throwIfCheckpointSuspendFailed(failure);
     }
 
     void resume() {
-        initServerThread();
-        startIt();
-        inCheckpoint = false;
+        for (TransportBinding binding : transportBindings) {
+            binding.resume();
+        }
     }
+
+    private static InitializationContext limitContext(String socketName,
+                                                      Supplier<MetricsFactory> metricsFactory,
+                                                      Supplier<MeterRegistry> meterRegistry) {
+        if (WebServer.DEFAULT_SOCKET_NAME.equals(socketName)) {
+            return InitializationContext.create(socketName, List.of(), meterRegistry);
+        }
+        Tag socketNameTag = metricsFactory.get().tagCreate("socketName", socketName);
+        return InitializationContext.create(socketName, List.of(socketNameTag), meterRegistry);
+    }
+
+    private List<TransportBinding> planTransportBindings(List<ProtocolConfig> protocolConfigs) {
+        BindingPlanContext planContext = new ListenerBindingPlanContext();
+        List<TransportBinding> activeBindings = new ArrayList<>();
+        Set<String> factoryTypes = new LinkedHashSet<>();
+
+        for (TransportBindingFactory factory : listenerConfig.bindings()) {
+            String factoryType = Objects.requireNonNull(factory.type(), "Transport binding factory returned null type");
+            String factoryName = Objects.requireNonNull(factory.name(), "Transport binding factory returned null name");
+            if (!factoryType.equals(factoryName)) {
+                throw new IllegalArgumentException("Transport binding factory type \"" + factoryType
+                                                           + "\" does not match its provider key \"" + factoryName
+                                                           + "\" on listener " + socketName);
+            }
+            if (!factoryTypes.add(factoryType)) {
+                throw new IllegalArgumentException("Duplicate transport binding factory type \"" + factoryType
+                                                           + "\" on listener " + socketName);
+            }
+            if (!factory.enabled()) {
+                continue;
+            }
+            if (!factory.canBind(planContext)) {
+                if (factory.required()) {
+                    throw new IllegalArgumentException("Listener " + socketName
+                                                               + " requires transport binding type \"" + factoryType
+                                                               + "\", but this binding cannot bind with the listener "
+                                                               + "configuration");
+                }
+                continue;
+            }
+
+            TransportBinding binding = Objects.requireNonNull(factory.create(this),
+                                                              "Transport binding factory returned null");
+            String bindingType = Objects.requireNonNull(binding.type(), "Transport binding returned null type");
+            if (!factoryType.equals(bindingType)) {
+                throw new IllegalArgumentException("Transport binding factory type \"" + factoryType
+                                                           + "\" created binding type \"" + bindingType
+                                                           + "\" on listener " + socketName);
+            }
+            activeBindings.add(binding);
+        }
+
+        if (activeBindings.isEmpty()) {
+            throw new IllegalArgumentException("Listener " + socketName + " has no active transport bindings");
+        }
+
+        validateBindingCapabilities(activeBindings);
+        validateProtocolTransportBindings(protocolConfigs, activeBindings);
+
+        return List.copyOf(activeBindings);
+    }
+
+    private void validateBindingCapabilities(List<TransportBinding> bindings) {
+        for (TransportBinding binding : bindings) {
+            TransportBinding.Security security = Objects.requireNonNull(binding.security(),
+                                                                        "Transport binding returned null security");
+            if (tls.enabled() && security == TransportBinding.Security.UNPROTECTED) {
+                throw new IllegalArgumentException("Listener " + socketName
+                                                           + " has TLS enabled, but transport binding type \""
+                                                           + binding.type()
+                                                           + "\" at " + binding.configuredEndpoint()
+                                                           + " is unprotected");
+            }
+            if (!tls.enabled() && security == TransportBinding.Security.TLS) {
+                throw new IllegalArgumentException("Listener " + socketName
+                                                           + " does not have TLS enabled, but transport binding type \""
+                                                           + binding.type()
+                                                           + "\" at " + binding.configuredEndpoint()
+                                                           + " requires listener TLS");
+            }
+            if (virtualHosts.virtualHostsEnabled() && security != TransportBinding.Security.TLS) {
+                throw new IllegalArgumentException("Listener " + socketName
+                                                           + " has TLS virtual hosts configured, but transport binding type \""
+                                                           + binding.type()
+                                                           + "\" at " + binding.configuredEndpoint()
+                                                           + " does not use listener TLS");
+            }
+        }
+    }
+
+    private void validateProtocolTransportBindings(List<ProtocolConfig> protocolConfigs,
+                                                   List<TransportBinding> bindings) {
+        Set<String> activeTypes = new LinkedHashSet<>();
+        for (TransportBinding binding : bindings) {
+            activeTypes.add(binding.type());
+        }
+        for (ProtocolConfig protocolConfig : protocolConfigs) {
+            if (!protocolConfig.enabled()) {
+                continue;
+            }
+            Set<String> requiredTypes = protocolConfig.transportBindingTypes();
+            if (requiredTypes.isEmpty()) {
+                continue;
+            }
+            if (activeTypes.stream().noneMatch(requiredTypes::contains)) {
+                throw new IllegalArgumentException("Listener " + socketName
+                                                           + " protocol " + protocolConfig.type()
+                                                           + "/" + protocolConfig.name()
+                                                           + " requires transport binding type(s) " + requiredTypes
+                                                           + ", active binding type(s) " + activeTypes);
+            }
+        }
+    }
+
+    private Throwable stopResources(List<TransportBinding> bindings, long stopAtNanos) {
+        Throwable failure = null;
+        List<BindingStop> bindingStops = new ArrayList<>();
+
+        // Stop listening for connections
+        for (TransportBinding binding : bindings) {
+            try {
+                Future<TransportBinding.ShutdownResult> stopFuture = sharedExecutor.submit(() -> stopBinding(binding));
+                bindingStops.add(new BindingStop(binding, stopFuture));
+            } catch (RuntimeException e) {
+                failure = LifecycleFailures.add(failure, stopBindingInline(binding));
+            } catch (Error e) {
+                failure = LifecycleFailures.add(failure, stopBindingInline(binding));
+                failure = LifecycleFailures.add(failure, bindingFailure("stop", binding, e));
+            }
+        }
+        BindingStopResult bindingStopResult = awaitBindingStops(bindingStops, gracePeriod, stopAtNanos);
+        failure = LifecycleFailures.add(failure, bindingStopResult.failure());
+
+        if (bindingStopResult.forceSharedExecutorShutdown()) {
+            try {
+                forceShutdownSharedExecutor();
+            } catch (RuntimeException | Error e) {
+                failure = LifecycleFailures.add(failure, e);
+            }
+        }
+
+        if (!bindingStopResult.forceSharedExecutorShutdown()) {
+            try {
+                // Shutdown shared executor
+                shutdownSharedExecutor(remainingNanos(stopAtNanos));
+            } catch (RuntimeException | Error e) {
+                failure = LifecycleFailures.add(failure, e);
+            }
+        }
+
+        return failure;
+    }
+
+    private TransportBinding.ShutdownResult stopBinding(TransportBinding binding) {
+        return Objects.requireNonNull(binding.stop(gracePeriod), "Transport binding stop result must not be null");
+    }
+
+    private Throwable stopBindingInline(TransportBinding binding) {
+        try {
+            stopBinding(binding);
+            return null;
+        } catch (RuntimeException | Error e) {
+            return bindingFailure("stop", binding, e);
+        }
+    }
+
+    private void startIt(BooleanSupplier cancelled, List<TransportBinding> startAttemptedBindings) {
+        for (TransportBinding binding : transportBindings) {
+            checkCancelledStartup(cancelled);
+            startAttemptedBindings.add(binding);
+            binding.start();
+        }
+    }
+
+    private void checkCancelledStartup(BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) {
+            throw new IllegalStateException("Listener startup cancelled " + socketName);
+        }
+    }
+
+    private void rollbackFailedStart(Throwable startupFailure,
+                                     boolean beforeStartSucceeded,
+                                     List<TransportBinding> startAttemptedBindings) {
+        long stopAtNanos = stopAtNanos(gracePeriod);
+        suppressCleanupFailure(startupFailure, () ->
+                LifecycleFailures.throwIfFailed(stopResources(startAttemptedBindings, stopAtNanos),
+                                                "Failed to roll back listener " + socketName));
+        suppressCleanupFailure(startupFailure, () ->
+                LifecycleFailures.throwIfFailed(stopHttpTransportObservers(stopAtNanos),
+                                                "Failed to stop HTTP transport observers for listener " + socketName));
+        if (beforeStartSucceeded && lifecycleStarted.compareAndSet(true, false)) {
+            suppressCleanupFailure(startupFailure, router::afterStop);
+        }
+    }
+
+    private static void suppressCleanupFailure(Throwable startupFailure, Runnable cleanup) {
+        try {
+            cleanup.run();
+        } catch (RuntimeException | Error e) {
+            LifecycleFailures.add(startupFailure, e);
+        }
+    }
+
+    private Throwable stopHttpTransportObservers(long stopAtNanos) {
+        httpTransportObserver = HttpTransportObserver.noop();
+        List<ObserverLifecycle> started = startedHttpTransportObservers;
+        startedHttpTransportObservers = List.of();
+        List<Future<Void>> completions = new ArrayList<>(started.size());
+        Throwable result = null;
+        for (int i = started.size() - 1; i >= 0; i--) {
+            try {
+                CompletionStage<Void> completion = Objects.requireNonNull(started.get(i).stop(),
+                                                                          "HTTP transport observer stop completion");
+                completions.add(Objects.requireNonNull(completion.toCompletableFuture(),
+                                                       "HTTP transport observer stop future"));
+            } catch (Throwable failure) {
+                result = LifecycleFailures.add(result, failure);
+            }
+        }
+        boolean interrupted = false;
+        for (Future<Void> future : completions) {
+            boolean done = false;
+            while (!done) {
+                try {
+                    if (future.isDone()) {
+                        future.get();
+                        done = true;
+                        continue;
+                    }
+                    long remainingNanos = remainingNanos(stopAtNanos);
+                    if (remainingNanos == 0) {
+                        result = LifecycleFailures.add(result,
+                                                       new IllegalStateException(
+                                                               "Timed out stopping HTTP transport observers for listener "
+                                                                       + socketName,
+                                                               new TimeoutException()));
+                        done = true;
+                        continue;
+                    }
+                    future.get(remainingNanos, TimeUnit.NANOSECONDS);
+                    done = true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    result = LifecycleFailures.add(result,
+                                                   new IllegalStateException(
+                                                           "Interrupted while stopping HTTP transport observers for listener "
+                                                                   + socketName,
+                                                           e));
+                } catch (TimeoutException e) {
+                    result = LifecycleFailures.add(result,
+                                                   new IllegalStateException(
+                                                           "Timed out stopping HTTP transport observers for listener "
+                                                                   + socketName,
+                                                           e));
+                    done = true;
+                } catch (ExecutionException e) {
+                    result = LifecycleFailures.add(result, e.getCause() == null ? e : e.getCause());
+                    done = true;
+                } catch (RuntimeException | Error e) {
+                    result = LifecycleFailures.add(result, e);
+                    done = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return result;
+    }
+
+    private void shutdownSharedExecutor(long timeoutNanos) {
+        Throwable failure = null;
+        sharedExecutor.shutdown();
+        try {
+            boolean done = sharedExecutor.awaitTermination(timeoutNanos, TimeUnit.NANOSECONDS);
+            if (!done) {
+                forceShutdownSharedExecutor();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            IllegalStateException interrupted =
+                    new IllegalStateException("Interrupted while shutting down listener executor for " + socketName, e);
+            try {
+                forceShutdownSharedExecutor();
+            } catch (RuntimeException | Error shutdownFailure) {
+                interrupted.addSuppressed(shutdownFailure);
+            }
+            failure = LifecycleFailures.add(failure, interrupted);
+        }
+        LifecycleFailures.throwIfFailed(failure, "Failed to shut down listener executor for " + socketName);
+    }
+
+    private void forceShutdownSharedExecutor() {
+        List<Runnable> running = sharedExecutor.shutdownNow();
+        if (!running.isEmpty()) {
+            LOGGER.log(DEBUG, running.size() + " tasks in shared executor did not terminate gracefully");
+        }
+    }
+
+    private static void throwIfCheckpointSuspendFailed(Throwable failure) {
+        if (failure == null) {
+            return;
+        }
+        Throwable unwrapped = LifecycleFailures.unwrap(failure);
+        if (unwrapped instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        }
+        if (unwrapped instanceof Error error) {
+            throw error;
+        }
+        throw new IllegalStateException("Failed to suspend listener for checkpoint", unwrapped);
+    }
+
+    private static BindingStopResult awaitBindingStops(List<BindingStop> bindingStops,
+                                                       Duration gracefulPeriod,
+                                                       long stopAtNanos) {
+        if (bindingStops.isEmpty()) {
+            return new BindingStopResult(null, false);
+        }
+        Throwable failure = null;
+        boolean forceSharedExecutorShutdown = false;
+        boolean interrupted = false;
+
+        for (BindingStop bindingStop : bindingStops) {
+            boolean done = false;
+            while (!done) {
+                try {
+                    if (bindingStop.future().isDone()) {
+                        forceSharedExecutorShutdown |= forceSharedExecutorShutdown(bindingStop.future().get());
+                        done = true;
+                        continue;
+                    }
+                    long remainingNanos = stopAtNanos - System.nanoTime();
+                    if (remainingNanos <= 0) {
+                        bindingStop.future().cancel(true);
+                        forceSharedExecutorShutdown = true;
+                        failure = LifecycleFailures.add(failure,
+                                                        bindingFailure("stop", bindingStop.binding(),
+                                                                       timedOutBindingStop(bindingStop.binding(),
+                                                                                           gracefulPeriod,
+                                                                                           new TimeoutException())));
+                        done = true;
+                        continue;
+                    }
+                    forceSharedExecutorShutdown |= forceSharedExecutorShutdown(
+                            bindingStop.future().get(remainingNanos, TimeUnit.NANOSECONDS));
+                    done = true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    failure = LifecycleFailures.add(failure,
+                                                    bindingFailure("stop", bindingStop.binding(),
+                                                                   interruptedBindingStop(bindingStop.binding(), e)));
+                } catch (TimeoutException e) {
+                    bindingStop.future().cancel(true);
+                    forceSharedExecutorShutdown = true;
+                    failure = LifecycleFailures.add(failure,
+                                                    bindingFailure("stop", bindingStop.binding(),
+                                                                   timedOutBindingStop(bindingStop.binding(),
+                                                                                       gracefulPeriod,
+                                                                                       e)));
+                    done = true;
+                } catch (CancellationException e) {
+                    failure = LifecycleFailures.add(failure, bindingFailure("stop", bindingStop.binding(), e));
+                    done = true;
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause() == null ? e : e.getCause();
+                    failure = LifecycleFailures.add(failure, bindingFailure("stop", bindingStop.binding(), cause));
+                    done = true;
+                } catch (RuntimeException | Error e) {
+                    failure = LifecycleFailures.add(failure, bindingFailure("stop", bindingStop.binding(), e));
+                    done = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return new BindingStopResult(failure, forceSharedExecutorShutdown);
+    }
+
+    private static boolean forceSharedExecutorShutdown(TransportBinding.ShutdownResult shutdownResult) {
+        return shutdownResult == TransportBinding.ShutdownResult.FORCED;
+    }
+
+    private static long remainingNanos(long stopAtNanos) {
+        if (stopAtNanos == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(0, stopAtNanos - System.nanoTime());
+    }
+
+    private static Throwable bindingFailure(String action, TransportBinding binding, Throwable cause) {
+        if (cause instanceof Error) {
+            return cause;
+        }
+        return new IllegalStateException("Failed to " + action + " transport binding type \"" + binding.type()
+                                                 + "\" at "
+                                                 + binding.configuredEndpoint(),
+                                         cause);
+    }
+
+    private static IllegalStateException interruptedBindingStop(TransportBinding binding, InterruptedException cause) {
+        return new IllegalStateException("Interrupted while waiting for transport binding type \"" + binding.type()
+                                                 + "\" at " + binding.configuredEndpoint() + " to stop",
+                                         cause);
+    }
+
+    private static IllegalStateException timedOutBindingStop(TransportBinding binding,
+                                                            Duration gracefulPeriod,
+                                                            TimeoutException cause) {
+        return new IllegalStateException("Timed out waiting for transport binding type \"" + binding.type()
+                                                 + "\" at " + binding.configuredEndpoint()
+                                                 + " to stop after " + gracefulPeriod,
+                                         cause);
+    }
+
+    private static long stopAtNanos(Duration gracefulPeriod) {
+        long timeoutNanos = bindingStopTimeoutNanos(gracefulPeriod);
+        long now = System.nanoTime();
+        long stopAtNanos = now + timeoutNanos;
+        return stopAtNanos < now ? Long.MAX_VALUE : stopAtNanos;
+    }
+
+    private static long bindingStopTimeoutNanos(Duration gracefulPeriod) {
+        long timeoutNanos = timeoutNanos(gracefulPeriod);
+        if (timeoutNanos > Long.MAX_VALUE - BINDING_FORCE_STOP_COMPLETION_TIMEOUT_NANOS) {
+            return Long.MAX_VALUE;
+        }
+        return timeoutNanos + BINDING_FORCE_STOP_COMPLETION_TIMEOUT_NANOS;
+    }
+
+    private static long timeoutNanos(Duration gracefulPeriod) {
+        if (gracefulPeriod.isNegative()) {
+            return 0;
+        }
+        try {
+            return gracefulPeriod.toNanos();
+        } catch (ArithmeticException _) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    @FunctionalInterface
+    interface FatalListenerFailureHandler {
+        void handle(ServerListener listener, Throwable cause);
+    }
+
+    private final class ListenerBindingPlanContext implements BindingPlanContext {
+        @Override
+        public ListenerConfig listenerConfig() {
+            return listenerConfig;
+        }
+    }
+
+    private record BindingStop(TransportBinding binding, Future<TransportBinding.ShutdownResult> future) {
+    }
+
+    private record BindingStopResult(Throwable failure, boolean forceSharedExecutorShutdown) {
+    }
+
 }

@@ -17,50 +17,43 @@
 package io.helidon.webserver.staticcontent;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.URL;
 import java.net.URLConnection;
 import java.time.Instant;
+import java.util.Optional;
 
 import io.helidon.common.LruCache;
 import io.helidon.common.media.type.MediaType;
-import io.helidon.http.Method;
-import io.helidon.webserver.http.ServerRequest;
-import io.helidon.webserver.http.ServerResponse;
 
-record CachedHandlerUrlStream(MediaType mediaType, URL url) implements CachedHandler {
+record CachedHandlerUrlStream(URL url,
+                              StaticContentMetadata metadata,
+                              SidecarCache sidecarCache) implements CachedHandler {
     private static final System.Logger LOGGER = System.getLogger(CachedHandlerUrlStream.class.getName());
 
-    @Override
-    public boolean handle(LruCache<String, CachedHandler> cache,
-                          Method method,
-                          ServerRequest request,
-                          ServerResponse response,
-                          String requestedResource) throws IOException {
+    static CachedHandlerUrlStream create(MediaType mediaType, URL url) throws IOException {
+        URLConnection urlConnection = ResourceConnections.openConnection(url);
+        long lastModified = urlConnection.getLastModified();
+        long contentLength = urlConnection.getContentLengthLong();
+        StaticContentMetadata metadata = lastModified == 0
+                ? StaticContentMetadata.create(mediaType, contentLength)
+                : StaticContentMetadata.create(mediaType, Instant.ofEpochMilli(lastModified), contentLength);
+        return new CachedHandlerUrlStream(url, metadata, SidecarCache.create());
+    }
 
+    @Override
+    public Optional<PreparedContent> prepare(LruCache<String, CachedHandler> cache,
+                                             String requestedResource) throws IOException {
         if (LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
             LOGGER.log(System.Logger.Level.DEBUG, "Sending static content using stream from classpath: " + url);
         }
 
-        URLConnection urlConnection = url.openConnection();
-        long lastModified = urlConnection.getLastModified();
+        return Optional.of(new PreparedContent(metadata,
+                                               null,
+                                               () -> PreparedContent.stream(ResourceConnections.openStream(url))));
+    }
 
-        if (lastModified != 0) {
-            StaticContentHandler.processEtag(String.valueOf(lastModified), request.headers(), response.headers());
-            StaticContentHandler.processModifyHeaders(Instant.ofEpochMilli(lastModified), request.headers(), response.headers());
-        }
-
-        response.headers().contentType(mediaType);
-
-        if (method == Method.HEAD) {
-            response.send();
-            return true;
-        }
-
-        try (InputStream in = url.openStream(); OutputStream outputStream = response.outputStream()) {
-            in.transferTo(outputStream);
-        }
-        return true;
+    @Override
+    public SidecarCache sidecarCache() {
+        return sidecarCache;
     }
 }

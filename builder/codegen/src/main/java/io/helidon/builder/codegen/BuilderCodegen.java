@@ -98,7 +98,7 @@ class BuilderCodegen implements CodegenExtension {
     }
 
     /**
-     *
+     * Generates custom prototype methods.
      * @param classModel     prototype class model builder
      * @param customMethods  custom methods to code generate
      * @param implementation true for implementation, false for prototype
@@ -126,12 +126,13 @@ class BuilderCodegen implements CodegenExtension {
         ctx.logger().log(Level.DEBUG, "Processing builder codegen round.");
         Collection<TypeInfo> blueprints = roundContext.annotatedTypes(Types.PROTOTYPE_BLUEPRINT);
 
-        List<TypeInfo> blueprintInterfaces = blueprints.stream()
-                .filter(it -> it.kind() == ElementKind.INTERFACE)
-                .toList();
-
-        for (TypeInfo blueprintInterface : blueprintInterfaces) {
-            process(roundContext, blueprintInterface);
+        for (TypeInfo blueprint : blueprints) {
+            if (blueprint.kind() != ElementKind.INTERFACE) {
+                throw new CodegenException("@Prototype.Blueprint can only be used on interfaces: "
+                                                   + blueprint.typeName().fqName(),
+                                           blueprint);
+            }
+            process(roundContext, blueprint);
         }
     }
 
@@ -387,7 +388,7 @@ class BuilderCodegen implements CodegenExtension {
         existingOptions = new ArrayList<>(existingOptions);
         existingOptions.addAll(existingDiscoverServicesOptions);
         configOption(prototypeInfo, newOptions, existingOptions);
-        serviceRegistryOption(prototypeInfo, newOptions);
+        serviceRegistryOption(roundContext, prototypeInfo, newOptions);
 
         /*
         We may have new options that override existing option's:
@@ -448,10 +449,13 @@ class BuilderCodegen implements CodegenExtension {
         generatePrototype(roundContext, extensions, prototypeInfo, optionHandlers, newDefaults);
     }
 
-    private void serviceRegistryOption(PrototypeInfo prototypeInfo, List<OptionInfo> newOptions) {
+    private void serviceRegistryOption(RoundContext ctx, PrototypeInfo prototypeInfo, List<OptionInfo> newOptions) {
         boolean registrySupport = prototypeInfo.registrySupport() || hasRegistryService(newOptions);
 
         if (!registrySupport) {
+            return;
+        }
+        if (FactoryPrototypeInfo.inheritedServiceRegistryAccessor(ctx, prototypeInfo.blueprint()).isPresent()) {
             return;
         }
 
@@ -569,6 +573,10 @@ class BuilderCodegen implements CodegenExtension {
                             .builderOptionOnly(true)
                             .declaredType(TypeNames.PRIMITIVE_BOOLEAN)
                             .interfaceMethod(it.interfaceMethod())
+                            .annotations(it.annotations()
+                                                 .stream()
+                                                 .filter(FactoryPrototypeInfo::isApiAnnotation)
+                                                 .toList())
                             .defaultValue(defaultConsumer -> defaultConsumer.addContent(String.valueOf(defaultValue)))
                             .update(optionBuilder -> copyConfiguredForDiscoverServices(it, optionBuilder))
                             .update(optionBuilder -> it.deprecation().ifPresent(optionBuilder::deprecation))
@@ -652,8 +660,12 @@ class BuilderCodegen implements CodegenExtension {
 
         typeArguments.forEach(classModel::addGenericArgument);
 
-        if (prototypeInfo.configured().isPresent()) {
-            var schemaGen = new SchemaGenerator(this.ctx);
+        if (prototypeInfo.configured().isPresent()
+                && prototypeInfo.blueprint()
+                        .findAnnotation(Types.PROTOTYPE_CONFIGURED)
+                        .flatMap(it -> it.booleanValue("metadata"))
+                        .orElse(true)) {
+            var schemaGen = new SchemaGenerator(this.ctx, ctx);
             classModel.addAnnotation(schemaGen.type(prototypeInfo, options));
         }
 
@@ -709,23 +721,27 @@ class BuilderCodegen implements CodegenExtension {
         // re-create all blueprint methods to have correct javadoc references
         generatePrototypeMethods(classModel, options);
 
-        List<OptionInfo> optionList = options.stream()
-                .map(OptionHandler::option)
-                .collect(Collectors.toUnmodifiableList());
-
+        List<OptionInfo> optionList = Utils.options(options);
         // abstract class BuilderBase...
-        GenerateAbstractBuilder.generate(extensions,
-                                         classModel,
-                                         prototypeInfo,
-                                         typeArguments,
-                                         typeGenericArguments,
-                                         options,
-                                         newDefaults);
+        TypeName implementationType = GenerateAbstractBuilder.generate(
+                ctx,
+                extensions,
+                classModel,
+                prototypeInfo,
+                new GenerateAbstractBuilder.TypeArguments(typeArguments, typeGenericArguments),
+                options,
+                newDefaults);
+
+        if (blueprint.hasAnnotation(Types.PROTOTYPE_SEALED)) {
+            classModel.sealed(true)
+                    .addPermittedSubclass(implementationType);
+        }
 
         // class Builder extends BuilderBase ...
         GenerateBuilder.generate(extensions,
                                  classModel,
                                  prototypeInfo,
+                                 implementationType,
                                  typeArguments,
                                  typeGenericArguments,
                                  options);

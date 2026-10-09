@@ -20,8 +20,11 @@
 module io.helidon.metrics.provider.tests {
 
     requires io.helidon.config;
+    requires io.helidon.http;
+    requires io.helidon.http.metrics;
     requires io.helidon.metrics.api;
     requires io.helidon.common.testing.junit5;
+    requires io.helidon.testing.junit5;
     requires org.junit.jupiter.api;
     requires hamcrest.all;
     requires org.junit.jupiter.params;

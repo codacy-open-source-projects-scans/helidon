@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,123 +23,64 @@ import io.helidon.common.testing.junit5.OptionalMatcher;
 import io.helidon.metrics.api.Counter;
 import io.helidon.metrics.api.Meter;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
 import io.helidon.metrics.api.MetricsConfig;
 import io.helidon.metrics.api.MetricsFactory;
 import io.helidon.metrics.api.ScopingConfig;
-import io.helidon.metrics.api.SystemTagsManager;
 import io.helidon.metrics.api.Timer;
+import io.helidon.service.registry.Services;
 
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.allOf;
-import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.emptyIterable;
 import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.sameInstance;
 
 class TestScopeManagement {
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testExplicitScopeOnMetersWithNoDefaultScope(boolean scopeTagEnabled) {
-        MetricsConfig metricsConfig = MetricsConfig.builder()
-                .scoping(ScopingConfig.builder()
-                                 .clearDefaultValue())
-                .build();
-        MeterRegistry reg = MetricsFactory.getInstance().globalRegistry();
-        SystemTagsManager.instance(metricsConfig);
-
-        // We explicitly set the scope for the counter and not for the timer.
-        // With no default scope set in the config used to initialBuilders the MeterRegistry, only the counter will have a scope.
-
-        Counter c1 = reg.getOrCreate(Counter.builder("c1")
-                                             .scope("app"));
-        Timer t1 = reg.getOrCreate(Timer.builder("t1"));
-
-        List<Meter> scopedMeters = new ArrayList<>();
-        reg.meters(Set.of("app")).forEach(scopedMeters::add);
-
-        // Expect to see the counter but not the timer.
-        assertThat("Scope-qualified fetch: just app",
-                   scopedMeters,
-                   allOf(
-                           hasItem((Meter) c1),
-                           not(hasItem((Meter) t1))
-                   ));
-
-        scopedMeters.clear();
-        reg.meters(Set.of("app", "def-scope")).forEach(scopedMeters::add);
-
-        // Again, expect the counter but not the timer. (def-scope could have been anything; the timer has no scope)
-        assertThat("Scope-qualified fetch: app and def-scope",
-                   scopedMeters,
-                   allOf(
-                           hasItem((Meter) c1),
-                           not(hasItem((Meter) t1))
-                   ));
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testExplicitScopeOnMetersWithDefaultScope(boolean scopeTagEnabled) {
-        MetricsConfig metricsConfig = MetricsConfig.builder()
-                .scoping(ScopingConfig.builder()
-                                 .defaultValue("def-scope"))
-                .build();
-        MeterRegistry reg = MetricsFactory.getInstance().createMeterRegistry(metricsConfig);
-        SystemTagsManager.instance(metricsConfig);
-
-        // The config sets a default scope value of def-scope. So the counter gets its explicit setting
-        // and the timer gets the default scope value because it has no explicit setting.
-
-        Counter c1 = reg.getOrCreate(Counter.builder("c1")
-                                             .scope("app"));
-        Timer t1 = reg.getOrCreate(Timer.builder("t1"));
-
-        List<Meter> scopedMeters = new ArrayList<>();
-        reg.meters(Set.of("app")).forEach(scopedMeters::add);
-
-        // Fetch of "app" should give just the counter.
-        assertThat("Scope-qualified fetch: app",
-                   scopedMeters,
-                   allOf(
-                           hasItem((Meter) c1),
-                           not(hasItem((Meter) t1))
-                   ));
-
-        scopedMeters.clear();
-        reg.meters(Set.of("def-scope")).forEach(scopedMeters::add);
-
-        // Fetch of "def-scope" should give just the timer.
-        assertThat("Scope-qualified fetch: def-scope",
-                   scopedMeters,
-                   allOf(
-                           not(hasItem((Meter) c1)),
-                           hasItem((Meter) t1)
-                   ));
-
-        scopedMeters.clear();
-        reg.meters(Set.of("app", "def-scope")).forEach(scopedMeters::add);
-
-        // Fetch of both should give both meters.
-        assertThat("Scope-qualified fetch: app and def-scope",
-                   scopedMeters,
-                   allOf(
-                           hasItem((Meter) c1),
-                           hasItem((Meter) t1)
-                   ));
-    }
-
     @Test
-    void checkDefaultScope() {
-        MetricsConfig metricsConfig = MetricsConfig.create(); // Make sure to use the defaults, not leftovers from earlier tests
-        MetricsFactory.getInstance().globalRegistry(metricsConfig);
-        SystemTagsManager.instance(metricsConfig);
+    @SuppressWarnings("removal")
+    void scopeApisAreNoOps() {
+        MetricsConfig metricsConfig = MetricsConfig.builder()
+                .scoping(ScopingConfig.builder()
+                                 .tagName("scope-tag")
+                                 .defaultValue("configured-scope"))
+                .build();
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MeterRegistry reg = metricsFactory.createMeterRegistry(metricsConfig);
+        try {
+            Counter counter = reg.getOrCreate(metricsFactory.counterBuilder("scopeNoOpCounter")
+                                                       .scope("explicit-scope"));
+            Counter sameCounter = reg.getOrCreate(metricsFactory.counterBuilder("scopeNoOpCounter")
+                                                           .scope("different-scope"));
+            Timer timer = reg.getOrCreate(metricsFactory.timerBuilder("scopeNoOpTimer"));
 
-        Counter counter = Metrics.getOrCreate(Counter.builder("defaultScopedCounter"));
-        assertThat("Unspecified scope", counter.scope(), OptionalMatcher.optionalValue(is(Meter.Scope.DEFAULT)));
+            assertThat("Scope does not contribute to meter identity", sameCounter, sameInstance(counter));
+            assertThat("Explicit scope", counter.scope(), OptionalMatcher.optionalEmpty());
+            assertThat("Configured default scope", timer.scope(), OptionalMatcher.optionalEmpty());
+            assertThat("Registry scopes", reg.scopes(), emptyIterable());
+            assertThat("Explicit scope does not add tags", counter.id().tags(), emptyIterable());
+            assertThat("Configured scope does not add tags", timer.id().tags(), emptyIterable());
+
+            List<Meter> scopeSelectedMeters = new ArrayList<>();
+            reg.meters(Set.of("missing-scope")).forEach(scopeSelectedMeters::add);
+            assertThat("Scope selection is ignored",
+                       scopeSelectedMeters,
+                       containsInAnyOrder(counter, timer));
+
+            assertThat("Scope-qualified removal ignores scope",
+                       reg.remove(counter.id(), "different-scope").orElseThrow(),
+                       sameInstance(counter));
+            assertThat("Remaining meters", reg.meters(), is(List.of(timer)));
+            assertThat("Scope-qualified removal by name ignores scope",
+                       reg.remove(timer.id().name(), timer.id().tags(), "different-scope").orElseThrow(),
+                       sameInstance(timer));
+            assertThat("Removed meter", reg.meters(), empty());
+        } finally {
+            reg.close();
+        }
     }
+
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,18 +23,14 @@ import java.util.concurrent.ThreadFactory;
 import io.helidon.common.task.HelidonTaskExecutor;
 
 /**
- * Encapsulates operations with {@link Executors}. Helps to workaround
- * limitations of GraalVM for JDK21 which doesn't support execution of
- * virtual threads and Graal.js code together. New versions of GraalVM
- * don't have this limitation, but for those who stick with JDK21, this
- * is a serious limitations in using Helidon 4.0.x
- * <p>
- * By moving these <em>"factories"</em> into separate class, it is easier
- * to use GraalVM's `@Substitute` mechanism and get Helidon and Graal.js working
- * on GraalVM for JDK21. More info
- * <a href="https://github.com/enso-org/enso/pull/10783#discussion_r1768000821">available in PR-10783</a>.
+ * Creates virtual-thread executors used by the webserver.
  */
 final class ExecutorsFactory {
+    private static final System.Logger LOGGER = System.getLogger(ExecutorsFactory.class.getName());
+    private static final Thread.UncaughtExceptionHandler UNCAUGHT_EXCEPTION_HANDLER =
+            (thread, throwable) -> LOGGER.log(System.Logger.Level.ERROR,
+                                              "Uncaught exception in WebServer executor thread " + thread.getName(),
+                                              throwable);
 
     private ExecutorsFactory() {
     }
@@ -42,10 +38,10 @@ final class ExecutorsFactory {
     /**
      * Used by {@link LoomServer} to allocate its executor service.
      *
-     * @return {@link Executors#newVirtualThreadPerTaskExecutor()}
+     * @return {@link Executors#newThreadPerTaskExecutor(java.util.concurrent.ThreadFactory)}
      */
     static ExecutorService newLoomServerVirtualThreadPerTaskExecutor() {
-        return Executors.newVirtualThreadPerTaskExecutor();
+        return Executors.newThreadPerTaskExecutor(virtualThreadFactory());
     }
 
     /**
@@ -54,7 +50,7 @@ final class ExecutorsFactory {
      * @return {@link ThreadPerTaskExecutor#create(java.util.concurrent.ThreadFactory)}
      */
     static HelidonTaskExecutor newServerListenerReaderExecutor() {
-        return ThreadPerTaskExecutor.create(virtualThreadFactory());
+        return ThreadPerTaskExecutor.create(Thread.ofVirtual().factory());
     }
 
     /**
@@ -67,6 +63,8 @@ final class ExecutorsFactory {
     }
 
     private static ThreadFactory virtualThreadFactory() {
-        return Thread.ofVirtual().factory();
+        return Thread.ofVirtual()
+                .uncaughtExceptionHandler(UNCAUGHT_EXCEPTION_HANDLER)
+                .factory();
     }
 }

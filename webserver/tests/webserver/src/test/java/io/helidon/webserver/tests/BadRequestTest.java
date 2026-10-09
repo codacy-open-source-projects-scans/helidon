@@ -16,7 +16,11 @@
 
 package io.helidon.webserver.tests;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
 
 import io.helidon.common.testing.http.junit5.SocketHttpClient;
 import io.helidon.http.BadRequestException;
@@ -28,7 +32,13 @@ import io.helidon.http.HeaderValues;
 import io.helidon.http.Method;
 import io.helidon.http.ServerResponseHeaders;
 import io.helidon.http.Status;
+import io.helidon.http.WritableHeaders;
+import io.helidon.http.encoding.ContentDecoder;
+import io.helidon.http.encoding.ContentEncoder;
+import io.helidon.http.encoding.ContentEncoding;
+import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.webclient.http1.Http1Client;
+import io.helidon.webclient.http1.Http1ClientResponse;
 import io.helidon.webserver.WebServerConfig;
 import io.helidon.webserver.http.DirectHandlers;
 import io.helidon.webserver.http.HttpRouting;
@@ -41,6 +51,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.hasHeader;
+import static io.helidon.common.testing.http.junit5.HttpHeaderMatcher.noHeader;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -64,6 +75,12 @@ class BadRequestTest {
         builder.get("/bad-request", (req, res) -> {
             throw new BadRequestException("Bad request in routing");
         });
+        builder.get("/internal-error", (req, res) -> {
+            throw new IllegalStateException("Internal error in routing");
+        });
+        builder.any("/direct-handler-error", (req, res) -> {
+            throw new IllegalStateException("Internal error in routing");
+        });
         builder.route(Http1Route.route(Method.GET,
                                        "/",
                                        (req, res) -> res.send("Hi")))
@@ -74,7 +91,10 @@ class BadRequestTest {
 
     @SetUpServer
     static void setUpServer(WebServerConfig.Builder builder) {
-        builder.directHandlers(DirectHandlers.builder()
+        builder.contentEncoding(ContentEncodingContext.builder()
+                        .addContentEncoding(new TestEncoding())
+                        .build())
+                .directHandlers(DirectHandlers.builder()
                                        .addHandler(DirectHandler.EventType.BAD_REQUEST, BadRequestTest::badRequestHandler)
                                        .build());
     }
@@ -93,6 +113,83 @@ class BadRequestTest {
     }
 
     @Test
+    void testBadRequestErrorHandlerDoesNotReparseMalformedAcceptEncoding() {
+        try (Http1ClientResponse response = client.method(Method.GET)
+                .uri("/bad-request")
+                .header(HeaderNames.ACCEPT_ENCODING, "t est")
+                .request()) {
+
+            assertThat(response.status(), is(Status.OK_200));
+            assertThat(response.entity().as(String.class), is("Bad request in routing"));
+        }
+    }
+
+    @Test
+    void testMalformedAcceptEncodingUsesBadRequestHandler() {
+        try (Http1ClientResponse response = client.method(Method.GET)
+                .header(HeaderNames.ACCEPT_ENCODING, "g zip")
+                .request()) {
+
+            assertThat(response.status(), is(Status.create(Status.BAD_REQUEST_400.code(), CUSTOM_REASON_PHRASE)));
+            assertThat(response.entity().as(String.class), is(CUSTOM_ENTITY));
+        }
+    }
+
+    @Test
+    void testRoutingErrorHandlerPreservesValidContentEncoding() {
+        String response = socketClient.sendAndReceive(Method.GET,
+                                                      "/bad-request",
+                                                      null,
+                                                      List.of("Accept-Encoding: test, identity;q=0"));
+
+        assertThat(response, containsString("200 OK"));
+        assertThat(response, containsString("Content-Encoding: test"));
+        assertThat(response, containsString("encoded:Bad request in routing"));
+    }
+
+    @Test
+    void testDefaultErrorHandlerPreservesValidContentEncoding() {
+        String response = socketClient.sendAndReceive(Method.GET,
+                                                      "/internal-error",
+                                                      null,
+                                                      List.of("Accept-Encoding: test, identity;q=0"));
+
+        assertThat(response, containsString("500 Internal Server Error"));
+        assertThat(response, containsString("Content-Encoding: test"));
+        assertThat(response, containsString("encoded:Internal Server Error"));
+    }
+
+    @Test
+    void testDirectHandlerHeadPreservesValidContentEncoding() {
+        String encodedEntity = "encoded:Internal Server Error";
+        String encodedLength = String.valueOf(encodedEntity.getBytes(StandardCharsets.UTF_8).length);
+
+        try (Http1ClientResponse response = client.method(Method.GET)
+                .uri("/direct-handler-error")
+                .header(HeaderNames.ACCEPT_ENCODING, "test, identity;q=0")
+                .request()) {
+
+            assertThat(response.status(), is(Status.INTERNAL_SERVER_ERROR_500));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_ENCODING, "test"));
+            assertThat(response.headers(), hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_LENGTH, encodedLength));
+            assertThat(response.entity().as(String.class), is(encodedEntity));
+        }
+
+        try (Http1ClientResponse response = client.method(Method.HEAD)
+                .uri("/direct-handler-error")
+                .header(HeaderNames.ACCEPT_ENCODING, "test, identity;q=0")
+                .request()) {
+
+            assertThat(response.status(), is(Status.INTERNAL_SERVER_ERROR_500));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_ENCODING, "test"));
+            assertThat(response.headers(), hasHeader(HeaderNames.VARY, HeaderNames.ACCEPT_ENCODING_NAME));
+            assertThat(response.headers(), hasHeader(HeaderNames.CONTENT_LENGTH, encodedLength));
+            assertThat(response.entity().hasEntity(), is(false));
+        }
+    }
+
+    @Test
     void testInvalidRequest() {
         // wrong content length
         String response = socketClient.sendAndReceive(Method.GET,
@@ -102,6 +199,39 @@ class BadRequestTest {
 
         assertThat(response, containsString("400 " + CUSTOM_REASON_PHRASE));
         assertThat(response, containsString(CUSTOM_ENTITY));
+    }
+
+    @Test
+    void testHeadBadRequestDoesNotSendEntity() throws IOException {
+        socketClient.request(Method.HEAD,
+                             "/",
+                             null,
+                             List.of("Content-Length: 47a"));
+        String response = new String(socketClient.socketInputStream().readAllBytes(), StandardCharsets.ISO_8859_1)
+                .replace("\r\n", "\n");
+
+        assertThat(SocketHttpClient.statusFromResponse(response),
+                   is(Status.create(Status.BAD_REQUEST_400.code(), CUSTOM_REASON_PHRASE)));
+        ClientResponseHeaders headers = SocketHttpClient.headersFromResponse(response);
+        assertThat(headers.contentLength().orElseThrow(),
+                   is((long) CUSTOM_ENTITY.getBytes(StandardCharsets.UTF_8).length));
+        assertThat(SocketHttpClient.entityFromResponse(response, true), is(""));
+    }
+
+    @Test
+    void testHeadBadRequestPreservesContentLengthWithoutEntity() throws IOException {
+        socketClient.request(Method.HEAD,
+                             "/head-no-entity",
+                             null,
+                             List.of("Content-Length: 47a"));
+        String response = new String(socketClient.socketInputStream().readAllBytes(), StandardCharsets.ISO_8859_1)
+                .replace("\r\n", "\n");
+
+        assertThat(SocketHttpClient.statusFromResponse(response),
+                   is(Status.create(Status.BAD_REQUEST_400.code(), CUSTOM_REASON_PHRASE)));
+        ClientResponseHeaders headers = SocketHttpClient.headersFromResponse(response);
+        assertThat(headers.contentLength().orElseThrow(), is(23L));
+        assertThat(SocketHttpClient.entityFromResponse(response, true), is(""));
     }
 
     @Test
@@ -119,6 +249,33 @@ class BadRequestTest {
     }
 
     @Test
+    void testNoContentBadRequestDoesNotSendEntity() {
+        String response = socketClient.sendAndReceive(Method.GET,
+                                                      "/no-content",
+                                                      null,
+                                                      List.of("Content-Length: 47a"));
+
+        assertThat(SocketHttpClient.statusFromResponse(response), is(Status.NO_CONTENT_204));
+        ClientResponseHeaders headers = SocketHttpClient.headersFromResponse(response);
+        assertThat(headers, noHeader(HeaderNames.CONTENT_LENGTH));
+        assertThat(headers, noHeader(HeaderNames.TRANSFER_ENCODING));
+        assertThat(headers, noHeader(HeaderNames.TRAILER));
+        assertThat(SocketHttpClient.entityFromResponse(response, true), is(""));
+    }
+
+    @Test
+    void testResetContentBadRequestDoesNotSendEntity() throws IOException {
+        assertNoEntityBadRequest("/reset-content", Status.RESET_CONTENT_205, HeaderValues.CONTENT_LENGTH_ZERO);
+    }
+
+    @Test
+    void testNotModifiedBadRequestDoesNotSendEntity() throws IOException {
+        assertNoEntityBadRequest("/not-modified",
+                                 Status.NOT_MODIFIED_304,
+                                 HeaderValues.create(HeaderNames.CONTENT_LENGTH, "23"));
+    }
+
+    @Test
     void testRepeatedTransferEncodingWithContentLengthRejected() {
         assertRejectedSmugglingAttempt("""
                 Transfer-Encoding: gzip\r
@@ -129,6 +286,60 @@ class BadRequestTest {
     @Test
     void testCommaSeparatedTransferEncodingWithContentLengthRejected() {
         assertRejectedSmugglingAttempt("Transfer-Encoding: gzip, chunked\r\n");
+    }
+
+    @Test
+    void testNegativeContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: -1\r\n");
+    }
+
+    @Test
+    void testSignedContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: +5\r\n");
+    }
+
+    @Test
+    void testNegativeZeroContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: -0\r\n");
+    }
+
+    @Test
+    void testRepeatedNegativeContentLengthRejected() {
+        assertRejectedContentLengthAttempt("""
+                Content-Length: 5\r
+                Content-Length: -1\r
+                """);
+    }
+
+    @Test
+    void testConflictingContentLengthRejected() {
+        assertRejectedContentLengthAttempt("""
+                Content-Length: 5\r
+                Content-Length: 4\r
+                """);
+    }
+
+    @Test
+    void testCommaSeparatedConflictingContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: 5, 4\r\n");
+    }
+
+    @Test
+    void testEqualCommaSeparatedContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: 4, 4\r\n");
+    }
+
+    @Test
+    void testEqualRepeatedContentLengthRejected() {
+        assertRejectedContentLengthAttempt("""
+                Content-Length: 4\r
+                Content-Length: 4\r
+                """);
+    }
+
+    @Test
+    void testControlCharacterContentLengthRejected() {
+        assertRejectedContentLengthAttempt("Content-Length: 5\u000b\r\n");
     }
 
     @Test
@@ -288,6 +499,32 @@ class BadRequestTest {
                     .header(HeaderNames.LOCATION, "/errorPage")
                     .build();
         }
+        if (request.path().equals("/head-no-entity")) {
+            return DirectHandler.TransportResponse.builder()
+                    .status(Status.create(Status.BAD_REQUEST_400.code(), CUSTOM_REASON_PHRASE))
+                    .header(HeaderNames.CONTENT_LENGTH, "23")
+                    .build();
+        }
+        if (request.path().equals("/no-content")) {
+            return DirectHandler.TransportResponse.builder()
+                    .status(Status.NO_CONTENT_204)
+                    .entity(CUSTOM_ENTITY)
+                    .header(HeaderNames.CONTENT_LENGTH, "23")
+                    .header(HeaderValues.TRANSFER_ENCODING_CHUNKED)
+                    .header(HeaderNames.TRAILER, "test-trailer")
+                    .build();
+        }
+        if (request.path().equals("/reset-content") || request.path().equals("/not-modified")) {
+            return DirectHandler.TransportResponse.builder()
+                    .status(request.path().equals("/reset-content")
+                                    ? Status.RESET_CONTENT_205
+                                    : Status.NOT_MODIFIED_304)
+                    .entity(CUSTOM_ENTITY)
+                    .header(HeaderNames.CONTENT_LENGTH, "23")
+                    .header(HeaderValues.TRANSFER_ENCODING_CHUNKED)
+                    .header(HeaderNames.TRAILER, "test-trailer")
+                    .build();
+        }
         return DirectHandler.TransportResponse.builder()
                 .status(httpStatus.code() == Status.BAD_REQUEST_400.code()
                                 ? Status.create(Status.BAD_REQUEST_400.code(), CUSTOM_REASON_PHRASE)
@@ -297,12 +534,43 @@ class BadRequestTest {
                 .build();
     }
 
+    private void assertNoEntityBadRequest(String path, Status status, Header contentLength) throws IOException {
+        socketClient.request(Method.GET,
+                             path,
+                             null,
+                             List.of("Content-Length: 47a"));
+        String response = new String(socketClient.socketInputStream().readAllBytes(), StandardCharsets.ISO_8859_1)
+                .replace("\r\n", "\n");
+
+        assertThat(SocketHttpClient.statusFromResponse(response), is(status));
+        ClientResponseHeaders headers = SocketHttpClient.headersFromResponse(response);
+        assertThat(headers, hasHeader(contentLength));
+        assertThat(headers, noHeader(HeaderNames.TRANSFER_ENCODING));
+        assertThat(headers, noHeader(HeaderNames.TRAILER));
+        assertThat(SocketHttpClient.entityFromResponse(response, true), is(""));
+    }
+
     private void assertRejectedSmugglingAttempt(String transferEncodingHeaders) {
         assertRejectedRequest("GET / HTTP/1.1\r\n"
                                       + "Host: localhost\r\n"
                                       + "Connection: keep-alive\r\n"
                                       + transferEncodingHeaders
                                       + "Content-Length: 14\r\n"
+                                      + "\r\n"
+                                      + "4\r\n"
+                                      + "PING\r\n"
+                                      + "0\r\n"
+                                      + "\r\n"
+                                      + "GET / HTTP/1.1\r\n"
+                                      + "Host: localhost\r\n"
+                                      + "\r\n");
+    }
+
+    private void assertRejectedContentLengthAttempt(String contentLengthHeaders) {
+        assertRejectedRequest("GET / HTTP/1.1\r\n"
+                                      + "Host: localhost\r\n"
+                                      + "Connection: keep-alive\r\n"
+                                      + contentLengthHeaders
                                       + "\r\n"
                                       + "4\r\n"
                                       + "PING\r\n"
@@ -341,5 +609,74 @@ class BadRequestTest {
         assertThat(response, containsString("Connection: close"));
         assertThat(response, containsString(CUSTOM_ENTITY));
         assertThat(socketClient.receive(), is(""));
+    }
+
+    private record TestEncoding() implements ContentEncoding {
+        @Override
+        public Set<String> ids() {
+            return Set.of("test");
+        }
+
+        @Override
+        public boolean supportsEncoding() {
+            return true;
+        }
+
+        @Override
+        public boolean supportsDecoding() {
+            return false;
+        }
+
+        @Override
+        public ContentDecoder decoder() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ContentEncoder encoder() {
+            return new ContentEncoder() {
+                @Override
+                public OutputStream apply(OutputStream network) {
+                    return new OutputStream() {
+                        private boolean prefixWritten;
+
+                        @Override
+                        public void write(int b) throws IOException {
+                            writePrefix();
+                            network.write(b);
+                        }
+
+                        @Override
+                        public void write(byte[] bytes, int offset, int length) throws IOException {
+                            writePrefix();
+                            network.write(bytes, offset, length);
+                        }
+
+                        private void writePrefix() throws IOException {
+                            if (!prefixWritten) {
+                                network.write("encoded:".getBytes(StandardCharsets.UTF_8));
+                                prefixWritten = true;
+                            }
+                        }
+                    };
+                }
+
+                @Override
+                public void headers(WritableHeaders<?> headers) {
+                    headers.add(HeaderValues.create(HeaderNames.CONTENT_ENCODING, "test"));
+                    headers.remove(HeaderNames.CONTENT_LENGTH);
+                }
+            };
+        }
+
+        @Override
+        public String name() {
+            return "test";
+        }
+
+        @Override
+        public String type() {
+            return "test";
+        }
     }
 }

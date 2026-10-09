@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 
 import javax.net.ssl.CertPathTrustManagerParameters;
 import javax.net.ssl.KeyManager;
@@ -49,23 +50,25 @@ import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
 
+import io.helidon.common.Api;
 import io.helidon.common.LazyValue;
 
 /**
  * The default configured {@link TlsManager} implementation.
  */
+@Api.Stable
 public class ConfiguredTlsManager implements TlsManager {
+    private static final System.Logger LOGGER = System.getLogger(ConfiguredTlsManager.class.getName());
     // secure random cannot be stored in native image, it must
     // be initialized at runtime
     private static final LazyValue<SecureRandom> RANDOM = LazyValue.create(SecureRandom::new);
     private final String name;
     private final String type;
+    private final ReentrantLock stateLock = new ReentrantLock();
 
-    private volatile X509KeyManager keyManager;
-    private volatile TlsReloadableX509KeyManager reloadableKeyManager;
-    private volatile X509TrustManager trustManager;
-    private volatile TlsReloadableX509TrustManager reloadableTrustManager;
-    private volatile SSLContext sslContext;
+    private volatile TlsManagerState state = new TlsManagerState();
+    // Even values are stable. An odd value exists only while stateLock is held for material publication.
+    private volatile long generationState;
 
     ConfiguredTlsManager() {
         this("@default", "tls-manager");
@@ -95,31 +98,81 @@ public class ConfiguredTlsManager implements TlsManager {
 
     @Override // TlsManager
     public SSLContext sslContext() {
-        return sslContext;
+        return state.sslContext;
     }
 
     @Override // TlsManager
     public void init(TlsConfig tlsConfig) {
-        sslContext(tlsConfig);
+        Objects.requireNonNull(tlsConfig, "tlsConfig");
+        stateLock.lock();
+        try {
+            if (state.sslContext == null) {
+                sslContext(tlsConfig);
+            }
+        } finally {
+            stateLock.unlock();
+        }
     }
 
     @Override // TlsManager
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    @SuppressWarnings("removal")
     public void reload(Tls tls) {
-        reload(tls.keyManager(), tls.trustManager());
+        Tls.validateReloadSource(tls);
+        long sourceGeneration;
+        Optional<X509KeyManager> keyManager;
+        Optional<X509TrustManager> trustManager;
+        do {
+            sourceGeneration = tls.generation();
+            keyManager = tls.keyManager();
+            trustManager = tls.trustManager();
+        } while (sourceGeneration != tls.generation());
+        reload(keyManager, trustManager);
+    }
+
+    @Override // TlsManager
+    public void reload(TlsMaterial material) {
+        Objects.requireNonNull(material, "material");
+        validateMaterial(material);
+        try {
+            reload(keyManager(material), trustManager(material));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalArgumentException("Failed to create TLS material", e);
+        }
+    }
+
+    @Override // TlsManager
+    @Api.Internal
+    public long generation() {
+        long current = generationState;
+        if ((current & 1L) == 0L) {
+            return current >>> 1;
+        }
+
+        stateLock.lock();
+        try {
+            return generationState >>> 1;
+        } finally {
+            stateLock.unlock();
+        }
     }
 
     @Override // TlsManager
     public Optional<X509KeyManager> keyManager() {
-        return Optional.ofNullable(keyManager);
+        return Optional.ofNullable(state.reloadableKeyManager.current());
     }
 
     @Override // TlsManager
     public Optional<X509TrustManager> trustManager() {
-        return Optional.ofNullable(trustManager);
+        return Optional.ofNullable(state.reloadableTrustManager.current());
     }
 
     /**
      * Reload the current SSL context with the provided key manager and trust manager (if defined).
+     * <p>
+     * Subclasses must route every key and trust material publication through this method to retain the inherited
+     * {@link io.helidon.common.tls.TlsManager#generation()} tracking. A subclass that bypasses this method owns the
+     * generation contract.
      *
      * @param keyManager   key manager to use
      * @param trustManager trust manager to use
@@ -127,12 +180,42 @@ public class ConfiguredTlsManager implements TlsManager {
     // for extensibility it is more suitable to have a single method for reloading, hence the optional parameters,
     // if we need even one more, create an object with a builder
     protected void reload(Optional<X509KeyManager> keyManager, Optional<X509TrustManager> trustManager) {
-        keyManager.ifPresent(reloadableKeyManager::reload);
-        trustManager.ifPresent(reloadableTrustManager::reload);
+        stateLock.lock();
+        try {
+            TlsManagerState current = state;
+            X509KeyManager keyManagerToReload = keyManager.orElse(null);
+            X509TrustManager trustManagerToReload = trustManager.orElse(null);
+
+            if (keyManagerToReload != null) {
+                validateReload(current.reloadableKeyManager, keyManagerToReload);
+            }
+            if (trustManagerToReload != null) {
+                validateReload(current.reloadableTrustManager, trustManagerToReload);
+            }
+
+            if (keyManagerToReload != null || trustManagerToReload != null) {
+                long publishingGeneration = generationState + 1;
+                generationState = publishingGeneration;
+                try {
+                    if (keyManagerToReload != null) {
+                        current.reloadableKeyManager.reload(keyManagerToReload);
+                    }
+                    if (trustManagerToReload != null) {
+                        current.reloadableTrustManager.reload(trustManagerToReload);
+                    }
+                } finally {
+                    generationState = publishingGeneration + 1;
+                }
+            }
+        } finally {
+            stateLock.unlock();
+        }
     }
 
     /**
      * Initialize and set the {@link javax.net.ssl.SSLContext} on this manager instance.
+     * The first successful initialization retains generation {@code 0}; later calls are ignored. Use
+     * {@link io.helidon.common.tls.TlsManager#reload(io.helidon.common.tls.TlsMaterial)} for later material changes.
      *
      * @param tlsConfig     the tls configuration
      * @param secureRandom  the secure random
@@ -143,45 +226,18 @@ public class ConfiguredTlsManager implements TlsManager {
                                   SecureRandom secureRandom,
                                   KeyManager[] keyManagers,
                                   TrustManager[] trustManagers) {
+        Objects.requireNonNull(tlsConfig, "tlsConfig");
+        Objects.requireNonNull(keyManagers, "keyManagers");
+        Objects.requireNonNull(trustManagers, "trustManagers");
+        stateLock.lock();
         try {
-            TrustManager[] tm;
-            KeyManager[] km;
-
-            if (keyManagers.length == 0) {
-                km = null;
-            } else {
-                km = wrapX509KeyManagers(keyManagers);
+            if (state.sslContext == null) {
+                initSslContextLocked(tlsConfig, secureRandom, keyManagers, trustManagers);
             }
-
-            if (trustManagers.length == 0) {
-                tm = null;
-            } else {
-                tm = wrapX509TrustManagers(trustManagers);
-            }
-
-            SSLContext sslContext;
-
-            if (tlsConfig.provider().isPresent()) {
-                sslContext = SSLContext.getInstance(tlsConfig.protocol(), tlsConfig.provider().get());
-            } else {
-                sslContext = SSLContext.getInstance(tlsConfig.protocol());
-            }
-            sslContext.init(km, tm, secureRandom);
-
-            SSLSessionContext serverSessionContext = sslContext.getServerSessionContext();
-            if (serverSessionContext != null) {
-                if (tlsConfig.sessionCacheSize() != TlsConfig.DEFAULT_SESSION_CACHE_SIZE) {
-                    // To allow javax.net.ssl.sessionCacheSize system property usage
-                    // see javax.net.ssl.SSLSessionContext.getSessionCacheSize doc
-                    serverSessionContext.setSessionCacheSize(tlsConfig.sessionCacheSize());
-                }
-                // seconds
-                serverSessionContext.setSessionTimeout((int) tlsConfig.sessionTimeout().toSeconds());
-            }
-
-            this.sslContext = sslContext;
         } catch (GeneralSecurityException e) {
             throw new IllegalArgumentException("Failed to create SSLContext", e);
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -192,22 +248,41 @@ public class ConfiguredTlsManager implements TlsManager {
      * @return secure random
      */
     protected SecureRandom secureRandom(TlsConfig tlsConfig) {
-        if (tlsConfig.secureRandom().isPresent()) {
-            return tlsConfig.secureRandom().get();
-        }
+        return secureRandom(tlsConfig.secureRandom(),
+                            tlsConfig.secureRandomAlgorithm(),
+                            tlsConfig.secureRandomProvider());
+    }
 
+    /**
+     * Load secure random.
+     *
+     * @param material TLS material
+     * @return secure random
+     */
+    protected SecureRandom secureRandom(TlsMaterial material) {
+        return secureRandom(material.secureRandom(),
+                            material.secureRandomAlgorithm(),
+                            material.secureRandomProvider());
+    }
+
+    private SecureRandom secureRandom(Optional<SecureRandom> configured,
+                                      Optional<String> algorithm,
+                                      Optional<String> provider) {
+        if (configured.isPresent()) {
+            return configured.get();
+        }
         try {
-            if (tlsConfig.secureRandomAlgorithm().isPresent() && tlsConfig.secureRandomProvider().isEmpty()) {
-                return SecureRandom.getInstance(tlsConfig.secureRandomAlgorithm().get());
+            if (algorithm.isPresent() && provider.isEmpty()) {
+                return SecureRandom.getInstance(algorithm.get());
             }
 
-            if (tlsConfig.secureRandomProvider().isPresent()) {
-                if (tlsConfig.secureRandomAlgorithm().isEmpty()) {
+            if (provider.isPresent()) {
+                if (algorithm.isEmpty()) {
                     throw new IllegalArgumentException("Invalid configuration of secure random. Provider is configured to "
-                                                               + tlsConfig.secureRandomProvider().get()
+                                                               + provider.get()
                                                                + ", but algorithm is not specified");
                 }
-                return SecureRandom.getInstance(tlsConfig.secureRandomAlgorithm().get(), tlsConfig.secureRandomProvider().get());
+                return SecureRandom.getInstance(algorithm.get(), provider.get());
             }
         } catch (GeneralSecurityException e) {
             throw new IllegalArgumentException("invalid configuration for secure random, cannot create it", e);
@@ -219,9 +294,9 @@ public class ConfiguredTlsManager implements TlsManager {
     /**
      * Build the key manager factory.
      *
-     * @param target        the tls configuration
-     * @param secureRandom  the secure random
-     * @param privateKey    the private key for the key store
+     * @param target       the tls configuration
+     * @param secureRandom the secure random
+     * @param privateKey   the private key for the key store
      * @param certificates the certificates for the keystore
      * @return a key manager factory instance
      */
@@ -229,20 +304,50 @@ public class ConfiguredTlsManager implements TlsManager {
                                          SecureRandom secureRandom,
                                          PrivateKey privateKey,
                                          Certificate[] certificates) {
+        return buildKmf(secureRandom,
+                        privateKey,
+                        certificates,
+                        internalKeystore(target),
+                        kmf(target));
+    }
+
+    /**
+     * Build the key manager factory.
+     *
+     * @param target       the TLS material
+     * @param secureRandom the secure random
+     * @param privateKey   the private key for the key store
+     * @param certificates the certificates for the keystore
+     * @return a key manager factory instance
+     */
+    protected KeyManagerFactory buildKmf(TlsMaterial target,
+                                         SecureRandom secureRandom,
+                                         PrivateKey privateKey,
+                                         Certificate[] certificates) {
+        return buildKmf(secureRandom,
+                        privateKey,
+                        certificates,
+                        internalKeystore(target),
+                        kmf(target));
+    }
+
+    private KeyManagerFactory buildKmf(SecureRandom secureRandom,
+                                       PrivateKey privateKey,
+                                       Certificate[] certificates,
+                                       KeyStore keyStore,
+                                       KeyManagerFactory keyManagerFactory) {
         byte[] passwordBytes = new byte[64];
         secureRandom.nextBytes(passwordBytes);
         char[] password = Base64.getEncoder().encodeToString(passwordBytes).toCharArray();
 
         try {
-            KeyStore ks = internalKeystore(target);
-            ks.setKeyEntry("key",
-                           privateKey,
-                           password,
-                           certificates);
+            keyStore.setKeyEntry("key",
+                                 privateKey,
+                                 password,
+                                 certificates);
 
-            KeyManagerFactory kmf = kmf(target);
-            kmf.init(ks, password);
-            return kmf;
+            keyManagerFactory.init(keyStore, password);
+            return keyManagerFactory;
         } catch (UnrecoverableKeyException | KeyStoreException | NoSuchAlgorithmException e) {
             throw new IllegalArgumentException("Invalid configuration for key management factory, cannot create factory", e);
         }
@@ -255,14 +360,30 @@ public class ConfiguredTlsManager implements TlsManager {
      * @return a new keystore
      */
     protected KeyStore internalKeystore(TlsConfig tlsConfig) {
+        return internalKeystore(tlsConfig.internalKeystoreType(),
+                                tlsConfig.internalKeystoreProvider());
+    }
+
+    /**
+     * Creates an internal keystore and loads it with no password and no data.
+     *
+     * @param material TLS material
+     * @return a new keystore
+     */
+    protected KeyStore internalKeystore(TlsMaterial material) {
+        return internalKeystore(material.internalKeystoreType(),
+                                material.internalKeystoreProvider());
+    }
+
+    private KeyStore internalKeystore(Optional<String> typeOption, Optional<String> providerOption) {
         try {
-            String type = tlsConfig.internalKeystoreType().orElseGet(KeyStore::getDefaultType);
+            String type = typeOption.orElseGet(KeyStore::getDefaultType);
 
             KeyStore ks;
-            if (tlsConfig.internalKeystoreProvider().isEmpty()) {
+            if (providerOption.isEmpty()) {
                 ks = KeyStore.getInstance(type);
             } else {
-                ks = KeyStore.getInstance(type, tlsConfig.internalKeystoreProvider().get());
+                ks = KeyStore.getInstance(type, providerOption.get());
             }
 
             ks.load(null, null);
@@ -273,8 +394,8 @@ public class ConfiguredTlsManager implements TlsManager {
                  | NoSuchAlgorithmException
                  | CertificateException e) {
             throw new IllegalArgumentException("Invalid configuration of internal keystores. Provider: "
-                                                       + tlsConfig.internalKeystoreProvider()
-                                                       + ", type: " + tlsConfig.internalKeystoreType(), e);
+                                                       + providerOption
+                                                       + ", type: " + typeOption, e);
         }
     }
 
@@ -285,31 +406,62 @@ public class ConfiguredTlsManager implements TlsManager {
      * @return a new trust manager factory
      */
     protected TrustManagerFactory createTmf(TlsConfig tlsConfig) {
+        return createTmf(tlsConfig.trustManagerFactoryAlgorithm(),
+                         tlsConfig.trustManagerFactoryProvider());
+    }
+
+    /**
+     * Create a new trust manager factory based on the TLS material (i.e., the algorithm and provider).
+     *
+     * @param material TLS material
+     * @return a new trust manager factory
+     */
+    protected TrustManagerFactory createTmf(TlsMaterial material) {
+        return createTmf(material.trustManagerFactoryAlgorithm(),
+                         material.trustManagerFactoryProvider());
+    }
+
+    private TrustManagerFactory createTmf(Optional<String> algorithmOption, Optional<String> providerOption) {
         try {
-            String algorithm = tlsConfig.trustManagerFactoryAlgorithm().orElseGet(TrustManagerFactory::getDefaultAlgorithm);
-            if (tlsConfig.trustManagerFactoryProvider().isEmpty()) {
+            String algorithm = algorithmOption.orElseGet(TrustManagerFactory::getDefaultAlgorithm);
+            if (providerOption.isEmpty()) {
                 return TrustManagerFactory.getInstance(algorithm);
             } else {
-                return TrustManagerFactory.getInstance(algorithm, tlsConfig.trustManagerFactoryProvider().get());
+                return TrustManagerFactory.getInstance(algorithm, providerOption.get());
             }
         } catch (NoSuchAlgorithmException | NoSuchProviderException e) {
             throw new IllegalArgumentException("Invalid configuration of trust manager factory. Provider: "
-                                                       + tlsConfig.trustManagerFactoryProvider()
-                                                       + ", algorithm: " + tlsConfig.trustManagerFactoryAlgorithm(), e);
+                                                       + providerOption
+                                                       + ", algorithm: " + algorithmOption, e);
         }
     }
 
     /**
      * Perform initialization of the {@link TrustManagerFactory} based on the provided TLS configuration.
      *
-     * @param tmf trust manager factory to be initialized
-     * @param keyStore keystore
+     * @param tmf       trust manager factory to be initialized
+     * @param keyStore  keystore
      * @param tlsConfig tls configuration
      */
     protected void initializeTmf(TrustManagerFactory tmf, KeyStore keyStore, TlsConfig tlsConfig) {
+        initializeTmf(tmf, keyStore, tlsConfig.revocation());
+    }
+
+    /**
+     * Perform initialization of the {@link TrustManagerFactory} based on the provided TLS material.
+     *
+     * @param tmf      trust manager factory to be initialized
+     * @param keyStore keystore
+     * @param material TLS material
+     */
+    protected void initializeTmf(TrustManagerFactory tmf, KeyStore keyStore, TlsMaterial material) {
+        initializeTmf(tmf, keyStore, material.revocation());
+    }
+
+    private void initializeTmf(TrustManagerFactory tmf, KeyStore keyStore, Optional<RevocationConfig> revocation) {
         try {
-            if (tlsConfig.revocation().isPresent()) {
-                RevocationConfig revocationConfig = tlsConfig.revocation().get();
+            if (revocation.isPresent()) {
+                RevocationConfig revocationConfig = revocation.get();
                 if (revocationConfig.enabled()) {
                     CertPathBuilder cpb = null;
                     cpb = CertPathBuilder.getInstance("PKIX");
@@ -350,6 +502,137 @@ public class ConfiguredTlsManager implements TlsManager {
         return new TrustAllManagerFactory();
     }
 
+    // for tests
+    TlsReloadableX509KeyManager reloadableKeyManager() {
+        return state.reloadableKeyManager;
+    }
+
+    private static void validateMaterial(TlsMaterial material) {
+        boolean hasPrivateKey = material.privateKey().isPresent();
+        boolean hasPrivateKeyCertChain = !material.privateKeyCertChain().isEmpty();
+        boolean hasTrust = !material.trust().isEmpty();
+
+        if (hasPrivateKey && !hasPrivateKeyCertChain) {
+            throw new IllegalArgumentException("TLS material with private key must also define the certificate chain");
+        }
+        if (!hasPrivateKey && hasPrivateKeyCertChain) {
+            throw new IllegalArgumentException("TLS material certificate chain requires a private key");
+        }
+        if (material.trustAll() && hasTrust) {
+            throw new IllegalArgumentException("TLS material cannot combine trustAll and trust certificates");
+        }
+        if (!hasPrivateKey && !hasTrust && !material.trustAll()) {
+            throw new IllegalArgumentException("TLS material must define private key or trust material");
+        }
+    }
+
+    private Optional<X509KeyManager> keyManager(TlsMaterial material) {
+        Optional<PrivateKey> privateKey = material.privateKey();
+        if (privateKey.isEmpty()) {
+            return Optional.empty();
+        }
+
+        SecureRandom secureRandom = secureRandom(material);
+        KeyManagerFactory kmf = buildKmf(material,
+                                         secureRandom,
+                                         privateKey.get(),
+                                         material.privateKeyCertChain().toArray(new Certificate[0]));
+        return Optional.of(x509KeyManager(kmf.getKeyManagers())
+                                   .orElseThrow(() -> new IllegalArgumentException(
+                                           "Configured key manager factory did not provide an X509KeyManager")));
+    }
+
+    private Optional<X509TrustManager> trustManager(TlsMaterial material) throws KeyStoreException {
+        TrustManagerFactory tmf = tmf(material);
+        if (tmf == null) {
+            return Optional.empty();
+        }
+        return Optional.of(x509TrustManager(tmf.getTrustManagers())
+                                   .orElseThrow(() -> new IllegalArgumentException(
+                                           "Configured trust manager factory did not provide an X509TrustManager")));
+    }
+
+    private static void validateReload(TlsReloadableX509KeyManager reloadableKeyManager, X509KeyManager keyManager) {
+        if (reloadableKeyManager instanceof TlsReloadableX509KeyManager.NotReloadableKeyManager) {
+            reloadableKeyManager.reload(keyManager);
+        }
+        TlsReloadableX509KeyManager.assertValid(keyManager);
+    }
+
+    private static void validateReload(TlsReloadableX509TrustManager reloadableTrustManager,
+                                       X509TrustManager trustManager) {
+        if (reloadableTrustManager instanceof TlsReloadableX509TrustManager.NotReloadableTrustManager) {
+            reloadableTrustManager.reload(trustManager);
+        }
+        TlsReloadableX509TrustManager.assertValid(trustManager);
+    }
+
+    private static Optional<X509KeyManager> x509KeyManager(KeyManager[] keyManagers) {
+        for (KeyManager keyManager : keyManagers) {
+            if (keyManager instanceof X509KeyManager x509KeyManager) {
+                return Optional.of(x509KeyManager);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<X509TrustManager> x509TrustManager(TrustManager[] trustManagers) {
+        for (TrustManager trustManager : trustManagers) {
+            if (trustManager instanceof X509TrustManager x509TrustManager) {
+                return Optional.of(x509TrustManager);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private void initSslContextLocked(TlsConfig tlsConfig,
+                                      SecureRandom secureRandom,
+                                      KeyManager[] keyManagers,
+                                      TrustManager[] trustManagers) throws GeneralSecurityException {
+        TrustManager[] tm;
+        KeyManager[] km;
+        KeyManagerState keyManagerState;
+        TrustManagerState trustManagerState;
+
+        if (keyManagers.length == 0) {
+            keyManagerState = noReloadableKeyManagerState(null);
+            km = null;
+        } else {
+            keyManagerState = wrapX509KeyManagers(keyManagers);
+            km = keyManagerState.keyManagers;
+        }
+
+        if (trustManagers.length == 0) {
+            trustManagerState = noReloadableTrustManagerState(null);
+            tm = null;
+        } else {
+            trustManagerState = wrapX509TrustManagers(trustManagers);
+            tm = trustManagerState.trustManagers;
+        }
+
+        SSLContext sslContext;
+
+        if (tlsConfig.provider().isPresent()) {
+            sslContext = SSLContext.getInstance(tlsConfig.protocol(), tlsConfig.provider().get());
+        } else {
+            sslContext = SSLContext.getInstance(tlsConfig.protocol());
+        }
+        sslContext.init(km, tm, secureRandom);
+
+        SSLSessionContext serverSessionContext = sslContext.getServerSessionContext();
+        if (serverSessionContext != null) {
+            if (tlsConfig.sessionCacheSize() != TlsConfig.DEFAULT_SESSION_CACHE_SIZE) {
+                // To allow javax.net.ssl.sessionCacheSize system property usage
+                // see javax.net.ssl.SSLSessionContext.getSessionCacheSize doc
+                serverSessionContext.setSessionCacheSize(tlsConfig.sessionCacheSize());
+            }
+            // seconds
+            serverSessionContext.setSessionTimeout((int) tlsConfig.sessionTimeout().toSeconds());
+        }
+
+        setSslContext(sslContext, keyManagerState, trustManagerState);
+    }
+
     // creates an internal keystore and initializes it with certificates discovered from configuration, then gets the trust
     // manager factory using tmf(TlsConfig)
     private TrustManagerFactory initTmf(TlsConfig tlsConfig) throws KeyStoreException {
@@ -364,9 +647,24 @@ public class ConfiguredTlsManager implements TlsManager {
         return tmf;
     }
 
+    // creates an internal keystore and initializes it with certificates discovered from TLS material, then gets the trust
+    // manager factory using tmf(TlsMaterial)
+    private TrustManagerFactory initTmf(TlsMaterial material) throws KeyStoreException {
+        KeyStore ks = internalKeystore(material);
+        int i = 1;
+        for (X509Certificate cert : material.trust()) {
+            ks.setCertificateEntry(String.valueOf(i), cert);
+            i++;
+        }
+        TrustManagerFactory tmf = createTmf(material);
+        initializeTmf(tmf, ks, material);
+        return tmf;
+    }
+
     // used by ConfiguredTlsManager to setup a TrustManagerFactory, that may be "trustAll", or based on configuration
     private TrustManagerFactory tmf(TlsConfig tlsConfig) throws KeyStoreException {
         if (tlsConfig.trustAll()) {
+            logTrustAllWarning();
             return trustAllTmf();
         }
 
@@ -377,9 +675,36 @@ public class ConfiguredTlsManager implements TlsManager {
         return null;
     }
 
+    // used by ConfiguredTlsManager to setup a TrustManagerFactory, that may be "trustAll", or based on TLS material
+    private TrustManagerFactory tmf(TlsMaterial material) throws KeyStoreException {
+        if (material.trustAll()) {
+            logTrustAllWarning();
+            return trustAllTmf();
+        }
+
+        if (!material.trust().isEmpty()) {
+            return initTmf(material);
+        }
+
+        return null;
+    }
+
+    private static void logTrustAllWarning() {
+        LOGGER.log(System.Logger.Level.WARNING,
+                   "Using a trust manager that trusts ANY certificate. Never use this in production. "
+                           + "This is a significant warning, do not ignore.");
+    }
+
     private void sslContext(TlsConfig tlsConfig) {
         if (tlsConfig.sslContext().isPresent()) {
-            this.sslContext = tlsConfig.sslContext().get();
+            stateLock.lock();
+            try {
+                setSslContext(tlsConfig.sslContext().get(),
+                              noReloadableKeyManagerState(null),
+                              noReloadableTrustManagerState(null));
+            } finally {
+                stateLock.unlock();
+            }
             return;
         }
 
@@ -407,18 +732,34 @@ public class ConfiguredTlsManager implements TlsManager {
      * @return a new key manager factory
      */
     private KeyManagerFactory kmf(TlsConfig tlsConfig) {
-        try {
-            String algorithm = tlsConfig.keyManagerFactoryAlgorithm().orElseGet(KeyManagerFactory::getDefaultAlgorithm);
+        return kmf(tlsConfig.keyManagerFactoryAlgorithm(),
+                   tlsConfig.keyManagerFactoryProvider());
+    }
 
-            if (tlsConfig.keyManagerFactoryProvider().isPresent()) {
-                return KeyManagerFactory.getInstance(algorithm, tlsConfig.keyManagerFactoryProvider().get());
+    /**
+     * Loads a key manager factory based on TLS material.
+     *
+     * @param material TLS material
+     * @return a new key manager factory
+     */
+    private KeyManagerFactory kmf(TlsMaterial material) {
+        return kmf(material.keyManagerFactoryAlgorithm(),
+                   material.keyManagerFactoryProvider());
+    }
+
+    private KeyManagerFactory kmf(Optional<String> algorithmOption, Optional<String> providerOption) {
+        try {
+            String algorithm = algorithmOption.orElseGet(KeyManagerFactory::getDefaultAlgorithm);
+
+            if (providerOption.isPresent()) {
+                return KeyManagerFactory.getInstance(algorithm, providerOption.get());
             } else {
                 return KeyManagerFactory.getInstance(algorithm);
             }
         } catch (NoSuchAlgorithmException | NoSuchProviderException e) {
             throw new IllegalArgumentException("Invalid configuration of key manager factory. Provider: "
-                                                       + tlsConfig.keyManagerFactoryProvider()
-                                                       + ", algorithm: " + tlsConfig.keyManagerFactoryAlgorithm(), e);
+                                                       + providerOption
+                                                       + ", algorithm: " + algorithmOption, e);
         }
     }
 
@@ -428,20 +769,18 @@ public class ConfiguredTlsManager implements TlsManager {
      * @param keyManagers used key managers
      * @return the same managers, except the first X509 one is wrapped
      */
-    private KeyManager[] wrapX509KeyManagers(KeyManager[] keyManagers) {
+    private KeyManagerState wrapX509KeyManagers(KeyManager[] keyManagers) {
         KeyManager[] toReturn = new KeyManager[keyManagers.length];
         System.arraycopy(keyManagers, 0, toReturn, 0, toReturn.length);
         for (int i = 0; i < keyManagers.length; i++) {
             KeyManager keyManager = keyManagers[i];
             if (keyManager instanceof X509KeyManager x509KeyManager) {
-                this.keyManager = x509KeyManager;
-                this.reloadableKeyManager = TlsReloadableX509KeyManager.create(x509KeyManager);
+                TlsReloadableX509KeyManager reloadableKeyManager = TlsReloadableX509KeyManager.create(x509KeyManager);
                 toReturn[i] = reloadableKeyManager;
-                return toReturn;
+                return new KeyManagerState(toReturn, reloadableKeyManager);
             }
         }
-        this.reloadableKeyManager = new TlsReloadableX509KeyManager.NotReloadableKeyManager();
-        return toReturn;
+        return noReloadableKeyManagerState(toReturn);
     }
 
     /**
@@ -450,19 +789,75 @@ public class ConfiguredTlsManager implements TlsManager {
      * @param trustManagers used trust managers
      * @return the same managers, except the first X509 one is wrapped
      */
-    private TrustManager[] wrapX509TrustManagers(TrustManager[] trustManagers) {
+    private TrustManagerState wrapX509TrustManagers(TrustManager[] trustManagers) {
         TrustManager[] toReturn = new TrustManager[trustManagers.length];
         System.arraycopy(trustManagers, 0, toReturn, 0, toReturn.length);
         for (int i = 0; i < trustManagers.length; i++) {
             TrustManager trustManager = trustManagers[i];
             if (trustManager instanceof X509TrustManager x509TrustManager) {
-                this.trustManager = x509TrustManager;
-                this.reloadableTrustManager = TlsReloadableX509TrustManager.create(x509TrustManager);
+                TlsReloadableX509TrustManager reloadableTrustManager = TlsReloadableX509TrustManager.create(x509TrustManager);
                 toReturn[i] = reloadableTrustManager;
-                return toReturn;
+                return new TrustManagerState(toReturn, reloadableTrustManager);
             }
         }
-        this.reloadableTrustManager = new TlsReloadableX509TrustManager.NotReloadableTrustManager();
-        return toReturn;
+        return noReloadableTrustManagerState(toReturn);
+    }
+
+    private KeyManagerState noReloadableKeyManagerState(KeyManager[] keyManagers) {
+        return new KeyManagerState(keyManagers, new TlsReloadableX509KeyManager.NotReloadableKeyManager());
+    }
+
+    private TrustManagerState noReloadableTrustManagerState(TrustManager[] trustManagers) {
+        return new TrustManagerState(trustManagers, new TlsReloadableX509TrustManager.NotReloadableTrustManager());
+    }
+
+    private void setSslContext(SSLContext sslContext,
+                               KeyManagerState keyManagerState,
+                               TrustManagerState trustManagerState) {
+        this.state = new TlsManagerState(sslContext,
+                                         keyManagerState.reloadableKeyManager,
+                                         trustManagerState.reloadableTrustManager);
+    }
+
+    private static final class TlsManagerState {
+        private final SSLContext sslContext;
+        private final TlsReloadableX509KeyManager reloadableKeyManager;
+        private final TlsReloadableX509TrustManager reloadableTrustManager;
+
+        private TlsManagerState() {
+            this(null,
+                 new TlsReloadableX509KeyManager.NotReloadableKeyManager(),
+                 new TlsReloadableX509TrustManager.NotReloadableTrustManager());
+        }
+
+        private TlsManagerState(SSLContext sslContext,
+                                TlsReloadableX509KeyManager reloadableKeyManager,
+                                TlsReloadableX509TrustManager reloadableTrustManager) {
+            this.sslContext = sslContext;
+            this.reloadableKeyManager = reloadableKeyManager;
+            this.reloadableTrustManager = reloadableTrustManager;
+        }
+    }
+
+    private static final class KeyManagerState {
+        private final KeyManager[] keyManagers;
+        private final TlsReloadableX509KeyManager reloadableKeyManager;
+
+        private KeyManagerState(KeyManager[] keyManagers,
+                                TlsReloadableX509KeyManager reloadableKeyManager) {
+            this.keyManagers = keyManagers;
+            this.reloadableKeyManager = reloadableKeyManager;
+        }
+    }
+
+    private static final class TrustManagerState {
+        private final TrustManager[] trustManagers;
+        private final TlsReloadableX509TrustManager reloadableTrustManager;
+
+        private TrustManagerState(TrustManager[] trustManagers,
+                                  TlsReloadableX509TrustManager reloadableTrustManager) {
+            this.trustManagers = trustManagers;
+            this.reloadableTrustManager = reloadableTrustManager;
+        }
     }
 }

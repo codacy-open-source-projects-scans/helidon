@@ -23,6 +23,7 @@ import java.util.EnumMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import io.helidon.common.Api;
 import io.helidon.common.NativeImageHelper;
 import io.helidon.common.features.api.HelidonFlavor;
 import io.helidon.common.features.metadata.Aot;
@@ -59,6 +61,7 @@ import io.helidon.common.features.metadata.Flavor;
  *   YAML
  * </pre>
  */
+@Api.Internal
 public final class HelidonFeatures {
     static final AtomicBoolean PRINTED = new AtomicBoolean();
     static final AtomicReference<HelidonFlavor> CURRENT_FLAVOR = new AtomicReference<>();
@@ -101,6 +104,7 @@ public final class HelidonFeatures {
      * @param classLoader to look for features in
      */
     public static void nativeBuildTime(ClassLoader classLoader) {
+        Objects.requireNonNull(classLoader, "classLoader is null");
         scan(classLoader);
         for (FeatureMetadata feat : ALL_FEATURES) {
             if (feat.aot().isPresent()) {
@@ -182,7 +186,7 @@ public final class HelidonFeatures {
             return;
         }
 
-        scan(Thread.currentThread().getContextClassLoader());
+        scan(contextClassLoader());
 
         Set<FeatureMetadata> features = FEATURES.get(currentFlavor);
         if (null == features) {
@@ -353,7 +357,7 @@ public final class HelidonFeatures {
 
         FeatureMetadata feat = node.descriptor;
         if (feat == null) {
-            System.out.println("  ".repeat(level) + name);
+            LOGGER.log(Level.INFO, "  ".repeat(level) + name);
         } else {
             String prefix = " ".repeat(level * 2);
             // start on index 10 or a tab spaces after tree
@@ -381,7 +385,7 @@ public final class HelidonFeatures {
                 }
             }
 
-            System.out.println(
+            LOGGER.log(Level.INFO,
                     prefix
                             + name
                             + suffix
@@ -402,6 +406,11 @@ public final class HelidonFeatures {
             }
             printDetails(actualName, childNode, level + 1);
         });
+    }
+
+    private static ClassLoader contextClassLoader() {
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        return classLoader == null ? HelidonFeatures.class.getClassLoader() : classLoader;
     }
 
     static final class Node {

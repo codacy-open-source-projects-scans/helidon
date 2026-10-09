@@ -37,6 +37,7 @@ import io.helidon.config.spi.ConfigSource;
 import io.helidon.service.registry.GlobalServiceRegistry;
 import io.helidon.service.registry.Service;
 import io.helidon.service.registry.ServiceInfo;
+import io.helidon.service.registry.ServiceRegistry;
 
 /**
  * Utility class that locates the meta configuration source.
@@ -89,13 +90,20 @@ final class MetaConfigFinder {
     }
 
     static Optional<Config> findMetaConfig(Function<MediaType, Boolean> supportedMediaType, List<String> supportedSuffixes) {
-        return findMetaConfigSource(supportedMediaType, supportedSuffixes)
+        return findMetaConfigSource(supportedMediaType, supportedSuffixes, Optional.empty())
+                .map(source -> Config.builder(source).build());
+    }
+
+    static Optional<Config> findMetaConfig(Function<MediaType, Boolean> supportedMediaType,
+                                           List<String> supportedSuffixes,
+                                           ServiceRegistry serviceRegistry) {
+        return findMetaConfigSource(supportedMediaType, supportedSuffixes, Optional.of(serviceRegistry))
                 .map(source -> Config.builder(source).build());
     }
 
     static Optional<ConfigSource> findConfigSource(Function<MediaType, Boolean> supportedMediaType,
                                                    List<String> supportedSuffixes) {
-        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        ClassLoader cl = contextClassLoader();
         return findSource(supportedMediaType, cl, CONFIG_PREFIX, "config source", supportedSuffixes);
     }
 
@@ -138,8 +146,9 @@ final class MetaConfigFinder {
     }
 
     private static Optional<ConfigSource> findMetaConfigSource(Function<MediaType, Boolean> supportedMediaType,
-                                                               List<String> supportedSuffixes) {
-        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+                                                               List<String> supportedSuffixes,
+                                                               Optional<ServiceRegistry> serviceRegistry) {
+        ClassLoader cl = contextClassLoader();
         Optional<ConfigSource> source;
 
         // check if meta configuration is configured using system property
@@ -174,7 +183,11 @@ final class MetaConfigFinder {
         }
         if (metaConfigFile == null) {
             if (profileName != null) {
-                return Optional.of(profileSource(supportedMediaType, cl, profileName, supportedSuffixes));
+                return Optional.of(profileSource(supportedMediaType,
+                                                 cl,
+                                                 profileName,
+                                                 supportedSuffixes,
+                                                 serviceRegistry));
             }
         } else {
             // is it a file
@@ -198,7 +211,8 @@ final class MetaConfigFinder {
     private static ConfigSource profileSource(Function<MediaType, Boolean> supportedMediaType,
                                               ClassLoader cl,
                                               String profileName,
-                                              List<String> supportedSuffixes) {
+                                              List<String> supportedSuffixes,
+                                              Optional<ServiceRegistry> serviceRegistry) {
         // first try to find the profile itself
         // default name is `config-profile.xxx`, we start with `config-profile-${profile}.xxx`
         String profileFileName = "config-profile-" + profileName + ".";
@@ -223,7 +237,7 @@ final class MetaConfigFinder {
                 .addObject(ObjectNode.builder().addValue("type", "system-properties").build());
 
         // all types from service registry
-        Set<String> namedSources = GlobalServiceRegistry.registry()
+        Set<String> namedSources = serviceRegistry.orElseGet(GlobalServiceRegistry::registry)
                 .allServices(ConfigSource.class)
                 .stream()
                 .map(ServiceInfo::qualifiers)
@@ -374,5 +388,10 @@ final class MetaConfigFinder {
             return Optional.of(ConfigSources.classpath(name).build());
         }
         return Optional.empty();
+    }
+
+    private static ClassLoader contextClassLoader() {
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        return classLoader == null ? MetaConfigFinder.class.getClassLoader() : classLoader;
     }
 }

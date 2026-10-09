@@ -22,7 +22,7 @@
     <parent>
         <groupId>io.helidon</groupId>
         <artifactId>helidon-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
     </parent>
     <packaging>pom</packaging>
     <artifactId>helidon-all</artifactId>
@@ -32,6 +32,10 @@
         <dependency>
             <groupId>io.helidon</groupId>
             <artifactId>helidon</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.graphql</groupId>
+            <artifactId>helidon-graphql</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.graphql</groupId>
@@ -306,6 +310,10 @@
             <artifactId>helidon-common-testing-http-junit5</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.common.testing</groupId>
+            <artifactId>helidon-common-testing-virtual-threads</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.common.features</groupId>
             <artifactId>helidon-common-features-api</artifactId>
         </dependency>
@@ -337,6 +345,18 @@
         <dependency>
             <groupId>io.helidon.data</groupId>
             <artifactId>helidon-data</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.data.jdbc</groupId>
+            <artifactId>helidon-data-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.data.jdbc</groupId>
+            <artifactId>helidon-data-jdbc-codegen</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.data.jdbc</groupId>
+            <artifactId>helidon-data-jdbc-lexical</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.data.jakarta.persistence</groupId>
@@ -420,6 +440,10 @@
         </dependency>
         <dependency>
             <groupId>io.helidon.telemetry</groupId>
+            <artifactId>helidon-telemetry-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.telemetry</groupId>
             <artifactId>helidon-telemetry-opentelemetry-config</artifactId>
         </dependency>
         <dependency>
@@ -467,6 +491,14 @@
             <artifactId>helidon-openapi</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.helidon.openapi</groupId>
+            <artifactId>helidon-openapi-31</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.openapi</groupId>
+            <artifactId>helidon-openapi-32</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.helidon.logging</groupId>
             <artifactId>helidon-logging-common</artifactId>
         </dependency>
@@ -488,7 +520,15 @@
         </dependency>
         <dependency>
             <groupId>io.helidon.http</groupId>
+            <artifactId>helidon-http-http1</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.http</groupId>
             <artifactId>helidon-http-http2</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.http</groupId>
+            <artifactId>helidon-http-metrics</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.http</groupId>
@@ -553,6 +593,14 @@
         <dependency>
             <groupId>io.helidon.webserver</groupId>
             <artifactId>helidon-webserver-grpc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.webserver</groupId>
+            <artifactId>helidon-webserver-grpc-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.webserver</groupId>
+            <artifactId>helidon-webserver-grpc-validation</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.webserver</groupId>
@@ -753,6 +801,10 @@
         <dependency>
             <groupId>io.helidon.declarative</groupId>
             <artifactId>helidon-declarative-codegen</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.messaging</groupId>
+            <artifactId>helidon-messaging</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.metadata</groupId>

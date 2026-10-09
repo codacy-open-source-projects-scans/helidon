@@ -103,10 +103,8 @@ class GaugeHandler {
                 .name("preDestroy")
                 .accessModifier(AccessModifier.PACKAGE_PRIVATE);
 
-        preDestroy.addContentLine("var meters = meterRegistrySupplier.get();");
-
         for (int i = 0; i < gaugeCount; i++) {
-            preDestroy.addContent("meters.remove(this.gauge_")
+            preDestroy.addContent("meterRegistry.remove(this.gauge_")
                     .addContent(String.valueOf(i))
                     .addContentLine(");");
         }
@@ -121,7 +119,9 @@ class GaugeHandler {
                 .name("postConstruct")
                 .accessModifier(AccessModifier.PACKAGE_PRIVATE);
 
-        postConstruct.addContentLine("var meters = meterRegistrySupplier.get();")
+        postConstruct.addContentLine("this.meterRegistry = meterRegistrySupplier.get();")
+                .addContentLine("var meters = this.meterRegistry;")
+                .addContentLine("var metricsFactory = meters.metricsFactory();")
                 .addContentLine();
 
         for (int i = 0; i < gauges.size(); i++) {
@@ -134,20 +134,18 @@ class GaugeHandler {
 
     private void addRegisterGauge(Method.Builder postConstruct, MetricsExtension.Gauge gauge, int index) {
         /*
-        this.gauge_1 = meters.getOrCreate(Gauge.builder("TestEndpoint.gaugeValue",
+        this.gauge_1 = meters.getOrCreate(metricsFactory.gaugeBuilder("TestEndpoint.gaugeValue",
                                                                    () -> endpoint.get().gaugeValue())
                                                              .description("Gauge annotation on method gaugeValue()")
                                                              .tags(tags)
-                                                             .baseUnit("bytes")
-                                                             .scope("application"));
+                                                             .baseUnit("bytes"));
 
             serviceSupplier
          */
         postConstruct.addContent("this.")
                 .addContent("gauge_" + index)
                 .addContent(" = meters.getOrCreate(")
-                .addContent(GAUGE)
-                .addContent(".builder(")
+                .addContent("metricsFactory.gaugeBuilder(")
                 .addContentLiteral(gauge.name())
                 .addContent(", () -> serviceSupplier.get().")
                 .addContent(gauge.methodName())
@@ -156,9 +154,6 @@ class GaugeHandler {
                 .increaseContentPadding()
                 .addContent(".description(")
                 .addContentLiteral(gauge.description())
-                .addContentLine(")")
-                .addContent(".scope(")
-                .addContentLiteral(gauge.scope())
                 .addContentLine(")")
                 .addContent(".baseUnit(")
                 .addContentLiteral(gauge.unit())
@@ -190,6 +185,12 @@ class GaugeHandler {
                         .isFinal(true)
                         .name("meterRegistrySupplier")
                         .type(meterRegistrySupplierType));
+
+        // PreDestroy must not perform service lookups, so retain the meter registry resolved during PostConstruct.
+        classModel.addField(meterRegistry -> meterRegistry
+                .accessModifier(AccessModifier.PRIVATE)
+                .type(METER_REGISTRY)
+                .name("meterRegistry"));
 
         for (int i = 0; i < gaugesCount; i++) {
             final int index = i;

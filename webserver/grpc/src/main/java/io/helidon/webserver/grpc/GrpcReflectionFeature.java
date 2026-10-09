@@ -17,17 +17,14 @@
 package io.helidon.webserver.grpc;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
 import io.helidon.builder.api.RuntimeType;
 import io.helidon.common.Weighted;
 import io.helidon.config.Config;
-import io.helidon.webserver.Routing;
 import io.helidon.webserver.WebServer;
 import io.helidon.webserver.spi.ServerFeature;
 
@@ -40,7 +37,6 @@ public class GrpcReflectionFeature implements Weighted, ServerFeature, RuntimeTy
     private static final System.Logger LOGGER = System.getLogger(GrpcReflectionFeature.class.getName());
 
     static final String GRPC_REFLECTION = "grpc-reflection";
-    static final Map<String, List<GrpcRouting>> SOCKET_GRPC_ROUTINGS = new HashMap<>();
 
     private final GrpcReflectionConfig config;
 
@@ -114,29 +110,19 @@ public class GrpcReflectionFeature implements Weighted, ServerFeature, RuntimeTy
 
         sockets.forEach(socket -> {
             SocketBuilders sb = featureContext.socket(socket);
+            List<GrpcRouting> grpcRoutings = new ArrayList<>();
 
             // adds gRPC reflection service
             if (sb.routingBuilders().hasRouting(GrpcRouting.Builder.class)) {
-                sb.routingBuilders()
+                GrpcRouting.Builder grpcRouting = sb.routingBuilders()
                         .routingBuilder(GrpcRouting.Builder.class)
-                        .service(new GrpcReflectionService(socket))
-                        .service(new GrpcReflectionServiceV1Alpha(socket));     // older version for some tools
+                        .service(new GrpcReflectionService(grpcRoutings))
+                        .service(new GrpcReflectionServiceV1Alpha(grpcRoutings));     // older version for some tools
+                grpcRoutings.add(grpcRouting.build());
             } else {
                 LOGGER.log(Level.WARNING, "Unable to register gRPC reflection service, "
                         + "no gRPC routes found for socket " + socket);
             }
-
-            // collects per-socket map of all gRPC routes found
-            sb.listener()
-                    .routings()
-                    .forEach(routingBuilder -> {
-                        Routing routing = routingBuilder.build();
-                        if (routing instanceof GrpcRouting grpcRouting) {
-                            List<GrpcRouting> grpcRoutings = SOCKET_GRPC_ROUTINGS
-                                    .computeIfAbsent(socket, k -> new ArrayList<>());
-                            grpcRoutings.add(grpcRouting);
-                        }
-                    });
         });
     }
 
@@ -151,11 +137,12 @@ public class GrpcReflectionFeature implements Weighted, ServerFeature, RuntimeTy
     }
 
     @Override
-    public GrpcReflectionConfig prototype() {
-        return config;
+    public double weight() {
+        return Weighted.DEFAULT_WEIGHT - 1;
     }
 
-    static Map<String, List<GrpcRouting>> socketGrpcRoutings() {
-        return SOCKET_GRPC_ROUTINGS;
+    @Override
+    public GrpcReflectionConfig prototype() {
+        return config;
     }
 }

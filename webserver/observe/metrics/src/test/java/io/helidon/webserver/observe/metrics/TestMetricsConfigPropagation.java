@@ -17,27 +17,60 @@ package io.helidon.webserver.observe.metrics;
 
 import io.helidon.common.media.type.MediaTypes;
 import io.helidon.json.JsonObject;
+import io.helidon.metrics.api.Counter;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.service.registry.Services;
 import io.helidon.webclient.http1.Http1Client;
 import io.helidon.webclient.http1.Http1ClientResponse;
-import io.helidon.webserver.http.HttpRouting;
+import io.helidon.webserver.WebServerConfig;
 import io.helidon.webserver.testing.junit5.ServerTest;
-import io.helidon.webserver.testing.junit5.SetUpRoute;
+import io.helidon.webserver.testing.junit5.SetUpServer;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
 @ServerTest
 class TestMetricsConfigPropagation {
 
+    private static final String EARLY_APPLICATION_COUNTER = "early.application.counter";
+    private static Counter earlyApplicationCounter;
+
     private final Http1Client client;
 
     TestMetricsConfigPropagation(Http1Client client) {
         this.client = client;
+    }
+
+    @SetUpServer
+    static void registerApplicationMetricBeforeObserveFeature(WebServerConfig.Builder ignored) {
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MeterRegistry meterRegistry = Services.get(MeterRegistry.class);
+        earlyApplicationCounter = meterRegistry.getOrCreate(metricsFactory.counterBuilder(EARLY_APPLICATION_COUNTER));
+        earlyApplicationCounter.increment();
+    }
+
+    @Test
+    void checkApplicationMetricRegisteredBeforeObserveFeature() {
+        earlyApplicationCounter.increment();
+        assertThat("Original counter remains active", earlyApplicationCounter.count(), is(2L));
+
+        try (Http1ClientResponse response = client.get("/observe/metrics")
+                .accept(MediaTypes.APPLICATION_JSON)
+                .request()) {
+            assertThat("Metrics endpoint", response.status().code(), is(200));
+            JsonObject metricsResponse = response.as(JsonObject.class);
+            assertThat("Early application counter",
+                       metricsResponse.numberValue(EARLY_APPLICATION_COUNTER).orElseThrow().intValue(),
+                       is(2));
+            assertThat("No scope grouping", metricsResponse.objectValue("application").orElse(null), nullValue());
+        }
     }
 
     @Test
@@ -47,16 +80,61 @@ class TestMetricsConfigPropagation {
                 .request()) {
             assertThat("Metrics endpoint", response.status().code(), is(200));
             JsonObject metricsResponse = response.as(JsonObject.class);
-            JsonObject vendorMeters = metricsResponse.objectValue("vendor").orElseThrow();
-            assertThat("Vendor meters", vendorMeters, notNullValue());
 
             // Make sure that the extended KPI metrics were turned on as directed by the configuration.
             assertThat("Metrics KPI load",
-                       vendorMeters.numberValue("requests.load").orElseThrow().intValue(),
+                       metricsResponse.numberValue("requests.load").orElseThrow().intValue(),
                        greaterThan(0));
 
-            // Make sure that requests.count is absent because of the filtering in the config.
-            assertThat("Metrics KPI requests.count", vendorMeters.value("requests.count").orElse(null), nullValue());
+            // The legacy scope filter in the configuration is now a no-op.
+            assertThat("Metrics KPI requests.count",
+                       metricsResponse.numberValue("requests.count").orElseThrow().intValue(),
+                       greaterThan(0));
+        }
+    }
+
+    @Test
+    void checkScopeSelectionIsIgnored() {
+        try (Http1ClientResponse response = client.get("/observe/metrics")
+                .queryParam("scope", "does-not-exist")
+                .accept(MediaTypes.APPLICATION_JSON)
+                .request()) {
+            assertThat("Metrics endpoint", response.status().code(), is(200));
+            JsonObject metricsResponse = response.as(JsonObject.class);
+            assertThat("Application metric remains visible",
+                       metricsResponse.numberValue(EARLY_APPLICATION_COUNTER).orElseThrow().intValue(),
+                       greaterThan(0));
+            assertThat("KPI metric remains visible",
+                       metricsResponse.numberValue("requests.load").orElseThrow().intValue(),
+                       greaterThan(0));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"application", "base", "vendor"})
+    void checkLegacyPathIsUnscopedAlias(String alias) {
+        try (Http1ClientResponse response = client.get("/observe/metrics/" + alias)
+                .accept(MediaTypes.APPLICATION_JSON)
+                .request()) {
+            assertThat("Metrics endpoint", response.status().code(), is(200));
+            JsonObject metricsResponse = response.as(JsonObject.class);
+            assertThat("Application metric remains visible",
+                       metricsResponse.numberValue(EARLY_APPLICATION_COUNTER).orElseThrow().intValue(),
+                       greaterThan(0));
+            assertThat("KPI metric remains visible",
+                       metricsResponse.numberValue("requests.load").orElseThrow().intValue(),
+                       greaterThan(0));
+        }
+
+        try (Http1ClientResponse response = client.get("/observe/metrics/" + alias + "/" + EARLY_APPLICATION_COUNTER)
+                .accept(MediaTypes.APPLICATION_JSON)
+                .request()) {
+            assertThat("Metrics endpoint by name", response.status().code(), is(200));
+            JsonObject metricsResponse = response.as(JsonObject.class);
+            assertThat("Selected metric",
+                       metricsResponse.numberValue(EARLY_APPLICATION_COUNTER).orElseThrow().intValue(),
+                       greaterThan(0));
+            assertThat("Unselected KPI metric", metricsResponse.value("requests.load").orElse(null), nullValue());
         }
     }
 }

@@ -20,7 +20,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.ServiceLoader;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -28,8 +31,11 @@ import java.util.concurrent.Executors;
 import io.helidon.common.HelidonServiceLoader;
 import io.helidon.common.LazyValue;
 import io.helidon.common.LruCache;
+import io.helidon.common.Weight;
+import io.helidon.common.Weighted;
 import io.helidon.common.tls.Tls;
 import io.helidon.http.Method;
+import io.helidon.service.registry.Service;
 import io.helidon.webclient.spi.ClientProtocolProvider;
 import io.helidon.webclient.spi.HttpClientSpi;
 import io.helidon.webclient.spi.HttpClientSpiProvider;
@@ -40,11 +46,14 @@ import io.helidon.webclient.spi.ProtocolConfig;
  * Base class for HTTP implementations of {@link WebClient}.
  */
 @SuppressWarnings("rawtypes")
+@Service.PerInstance(WebClientConfigBlueprint.class)
+@Weight(Weighted.DEFAULT_WEIGHT - 10)
 class LoomClient implements WebClient {
     static final LazyValue<ExecutorService> EXECUTOR =
             LazyValue.create(() -> Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
                                                                             .name("helidon-client-", 0)
                                                                             .factory()));
+    private static final System.Logger LOGGER = System.getLogger(LoomClient.class.getName());
     private static final List<HttpClientSpiProvider> PROVIDERS =
             HelidonServiceLoader.create(ServiceLoader.load(HttpClientSpiProvider.class))
                     .asList();
@@ -66,6 +75,7 @@ class LoomClient implements WebClient {
     private final List<String> tcpProtocolIds;
     private final WebClientCookieManager cookieManager;
     private final LruCache<EndpointKey, HttpClientSpi> clientSpiLruCache = LruCache.create();
+    private final HttpTransportConnectionCache<ProtocolDiscoveryConnections> observedDiscoveryConnections;
 
     /**
      * Construct this instance from a subclass of builder.
@@ -73,6 +83,7 @@ class LoomClient implements WebClient {
      * @param config builder the subclass is built from
      */
     @SuppressWarnings({"rawtypes", "unchecked"})
+    @Service.Inject
     protected LoomClient(WebClientConfig config) {
         this.config = config;
         this.protocolConfigs = ProtocolConfigs.create(config.protocolConfigs());
@@ -122,6 +133,10 @@ class LoomClient implements WebClient {
         this.tcpProtocolIds = tcpProtocols.stream()
                 .map(ProtocolSpi::id)
                 .toList();
+        this.observedDiscoveryConnections = HttpTransportConnectionCache.create(ProtocolDiscoveryConnections.class,
+                                                                                config,
+                                                                                ProtocolDiscoveryConnections::new)
+                .orElse(null);
     }
 
     @Override
@@ -150,9 +165,55 @@ class LoomClient implements WebClient {
     }
 
     @Override
+    @Service.PreDestroy
     public void closeResource() {
-        for (ProtocolSpi o : List.copyOf(clientSpiByProtocol.values())) {
-            o.spi().releaseResource();
+        try {
+            for (ProtocolSpi o : List.copyOf(clientSpiByProtocol.values())) {
+                o.spi().releaseResource();
+            }
+        } finally {
+            if (observedDiscoveryConnections != null) {
+                observedDiscoveryConnections.closeResource();
+            }
+        }
+    }
+
+    @Override
+    public CompletionStage<Void> closeResourceAsync() {
+        var completions = new ArrayList<CompletableFuture<Void>>(clientSpiByProtocol.size());
+        for (ProtocolSpi protocol : clientSpiByProtocol.values()) {
+            try {
+                completions.add(protocol.spi().closeResourceAsync().toCompletableFuture());
+            } catch (RuntimeException failure) {
+                completions.add(CompletableFuture.failedFuture(failure));
+            }
+        }
+        if (observedDiscoveryConnections != null) {
+            completions.add(observedDiscoveryConnections.closeResourceAsync().toCompletableFuture());
+        }
+        return CompletableFuture.allOf(completions.toArray(CompletableFuture<?>[]::new)).minimalCompletionStage();
+    }
+
+    @Override
+    public List<String> tcpProtocolIds() {
+        List<String> protocolIds = tcpProtocolIds;
+        if (protocolIds == null) {
+            throw new IllegalStateException("TCP protocol IDs are not available during WebClient construction");
+        }
+        return protocolIds;
+    }
+
+    @Override
+    public void responseReceived(WebClientProtocolResponse response) {
+        WebClientProtocolResponse checkedResponse = Objects.requireNonNull(response, "response");
+        for (ProtocolSpi protocol : protocols) {
+            try {
+                protocol.spi().responseReceived(checkedResponse);
+            } catch (RuntimeException failure) {
+                LOGGER.log(System.Logger.Level.WARNING,
+                           "HTTP protocol response notification failed for " + protocol.id(),
+                           failure);
+            }
         }
     }
 
@@ -184,12 +245,20 @@ class LoomClient implements WebClient {
         return EXECUTOR.get();
     }
 
+    ProtocolDiscoveryConnections.Registration discoveryObservation() {
+        return observedDiscoveryConnections == null
+                ? null
+                : observedDiscoveryConnections.cache().registration(observedDiscoveryConnections.observer());
+    }
+
     record ProtocolSpi(String id, HttpClientSpi spi) {
     }
 
     record EndpointKey(String scheme, // http/https
                        String authority, // myserver:80
+                       String transportKey, // optional explicit transport address, such as a UDS path (may be null)
                        Tls tlsConfig, // TLS configuration (may be disabled, never null)
+                       SniSupport.State sni,
                        Proxy proxy) { // proxy, never null
     }
 }

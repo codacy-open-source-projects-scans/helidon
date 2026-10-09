@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
+import io.helidon.builder.api.Option;
 import io.helidon.codegen.CodegenContext;
 import io.helidon.codegen.CodegenException;
 import io.helidon.codegen.CodegenValidator;
@@ -289,6 +290,7 @@ final class FactoryOption {
                 .name(name)
                 .declaringType(typeInfo)
                 .declaredType(type)
+                .annotations(FactoryPrototypeInfo.annotations(candidate))
                 .includeInEqualsAndHashCode(equality)
                 .includeInToString(toStringValue)
                 .confidential(confidential)
@@ -420,6 +422,7 @@ final class FactoryOption {
         Option.Builder.build() // build method
          */
         if (actualType.equals(OBJECT)
+                || actualType.array()
                 || actualType.unboxed().primitive()
                 || actualType.generic()) {
             // cannot build these for sure
@@ -501,7 +504,10 @@ final class FactoryOption {
 
             String singularSetterName;
             if (singularAddPrefix) {
-                String prefix = returnType.isMap() ? "put" : "add";
+                TypeName singularType = returnType.isOptional()
+                        ? returnType.typeArguments().getFirst()
+                        : returnType;
+                String prefix = singularType.isMap() ? "put" : "add";
                 singularSetterName = prefix + capitalize(singularName);
             } else {
                 singularSetterName = singularName;
@@ -661,7 +667,12 @@ final class FactoryOption {
 
             option.provider(provider -> provider
                     .providerType(annotation.typeValue().orElseThrow())
+                    .providerIdentity(annotation.enumValue("identity", Option.Provider.Identity.class)
+                                                .orElse(Option.Provider.Identity.TYPE_AND_NAME))
+                    .configForm(annotation.enumValue("configForm", Option.Provider.ConfigForm.class)
+                                        .orElse(Option.Provider.ConfigForm.AUTO))
                     .discoverServices(annotation.booleanValue("discoverServices").orElse(true))
+                    .enabledBy(annotation.stringValue("enabledBy").orElse(""))
             );
         }
     }
@@ -700,7 +711,12 @@ final class FactoryOption {
                                             String optionName,
                                             OptionConfigured.Builder configured) {
 
-        TypeName actualType = Utils.realType(optionType);
+        TypeName containerType = Utils.realType(optionType);
+        boolean optionalContainer = optionType.isOptional()
+                && (containerType.isList() || containerType.isSet() || containerType.isMap());
+        TypeName actualType = optionalContainer
+                ? Utils.realType(containerType)
+                : containerType;
         // first check config factories
         for (FactoryMethod configFactory : prototypeInfo.configFactories()) {
             if (typesEqual(configFactory.returnType(), actualType)) {

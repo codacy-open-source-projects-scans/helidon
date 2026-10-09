@@ -19,8 +19,10 @@ package io.helidon.codegen.apt;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -47,6 +49,10 @@ import javax.lang.model.util.Elements;
 
 import io.helidon.common.types.TypeName;
 import io.helidon.common.types.TypeNames;
+
+import com.sun.source.tree.ImportTree;
+import com.sun.source.util.TreePath;
+import com.sun.source.util.Trees;
 
 import static io.helidon.common.types.TypeName.createFromGenericDeclaration;
 
@@ -133,6 +139,75 @@ final class AptTypeFactory {
         return createTypeName(elements, new HashSet<>(), type);
     }
 
+    static Optional<TypeName> createTypeName(AptContext ctx, Element type) {
+        return createTypeName(ctx.aptEnv().getElementUtils(), type)
+                .map(it -> resolveImportedTypes(ctx, type, it));
+    }
+
+    static Optional<TypeName> createTypeName(AptContext ctx, Element source, TypeMirror type) {
+        return createTypeName(type)
+                .map(it -> resolveImportedTypes(ctx, source, it));
+    }
+
+    private static TypeName resolveImportedTypes(AptContext ctx, Element source, TypeName typeName) {
+        if (!hasUnqualifiedClass(typeName)) {
+            return typeName;
+        }
+        TreePath path;
+        try {
+            path = Trees.instance(ctx.aptEnv()).getPath(source);
+        } catch (IllegalArgumentException _) {
+            // Compilation-unit trees are not available from every annotation processing implementation.
+            return typeName;
+        }
+        if (path == null) {
+            return typeName;
+        }
+        Map<String, TypeName> imports = new HashMap<>();
+        for (ImportTree imported : path.getCompilationUnit().getImports()) {
+            String name = imported.getQualifiedIdentifier().toString();
+            if (!imported.isStatic() && !name.endsWith(".*")) {
+                TypeName importedType = TypeName.create(name);
+                imports.put(importedType.className(), importedType);
+            }
+        }
+        return imports.isEmpty() ? typeName : resolveImportedTypes(typeName, imports);
+    }
+
+    private static TypeName resolveImportedTypes(TypeName typeName, Map<String, TypeName> imports) {
+        TypeName.Builder builder = TypeName.builder(typeName);
+        if (unqualifiedClass(typeName)) {
+            List<String> enclosingNames = typeName.enclosingNames();
+            String importedName = enclosingNames.isEmpty() ? typeName.className() : enclosingNames.getFirst();
+            TypeName imported = imports.get(importedName);
+            if (imported != null) {
+                List<String> qualifiedEnclosing = new ArrayList<>(imported.enclosingNames());
+                if (!enclosingNames.isEmpty()) {
+                    qualifiedEnclosing.add(imported.className());
+                    qualifiedEnclosing.addAll(enclosingNames.subList(1, enclosingNames.size()));
+                }
+                builder.packageName(imported.packageName()).enclosingNames(qualifiedEnclosing);
+            }
+        }
+        builder.typeArguments(typeName.typeArguments().stream().map(it -> resolveImportedTypes(it, imports)).toList())
+                .upperBounds(typeName.upperBounds().stream().map(it -> resolveImportedTypes(it, imports)).toList())
+                .lowerBounds(typeName.lowerBounds().stream().map(it -> resolveImportedTypes(it, imports)).toList());
+        typeName.componentType().ifPresent(it -> builder.componentType(resolveImportedTypes(it, imports)));
+        return builder.build();
+    }
+
+    private static boolean hasUnqualifiedClass(TypeName typeName) {
+        return unqualifiedClass(typeName)
+                || typeName.typeArguments().stream().anyMatch(AptTypeFactory::hasUnqualifiedClass)
+                || typeName.upperBounds().stream().anyMatch(AptTypeFactory::hasUnqualifiedClass)
+                || typeName.lowerBounds().stream().anyMatch(AptTypeFactory::hasUnqualifiedClass)
+                || typeName.componentType().map(AptTypeFactory::hasUnqualifiedClass).orElse(false);
+    }
+
+    private static boolean unqualifiedClass(TypeName typeName) {
+        return typeName.packageName().isEmpty() && !typeName.primitive() && !typeName.generic() && !typeName.wildcard();
+    }
+
     // we must accept `null` elements, until we hide the methods from public
     // as otherwise this whole method would have to be duplicated
     private static Optional<TypeName> createTypeName(Elements elements, Set<TypeMirror> inProgress, TypeMirror typeMirror) {
@@ -150,27 +225,28 @@ final class AptTypeFactory {
                 default -> throw new IllegalStateException("Unknown primitive type: " + kind);
             };
 
-            return Optional.of(TypeName.create(type));
+            return Optional.of(decorateTypeName(TypeName.create(type), typeMirror, elements));
         }
 
         switch (kind) {
         case VOID -> {
-            return Optional.of(TypeName.create(void.class));
+            return Optional.of(decorateTypeName(TypeName.create(void.class), typeMirror, elements));
         }
         case TYPEVAR -> {
+            var typeVar = (TypeVariable) typeMirror;
+            var typeName = createFromGenericDeclaration(typeVar.asElement().getSimpleName().toString());
             if (!inProgress.add(typeMirror)) {
                 // prevent infinite loop
-                return Optional.of(TypeName.createFromGenericDeclaration(typeMirror.toString()));
+                return Optional.of(decorateTypeName(typeName, typeMirror, elements));
             }
 
             try {
-                var builder = TypeName.builder(createFromGenericDeclaration(typeMirror.toString()));
+                var builder = TypeName.builder(typeName);
 
-                var typeVar = ((TypeVariable) typeMirror);
                 handleBounds(elements, inProgress, typeVar.getUpperBound(), builder::addUpperBound);
                 handleBounds(elements, inProgress, typeVar.getLowerBound(), builder::addLowerBound);
 
-                return Optional.of(builder.build());
+                return Optional.of(decorateTypeName(builder.build(), typeMirror, elements));
             } finally {
                 inProgress.remove(typeMirror);
             }
@@ -185,10 +261,10 @@ final class AptTypeFactory {
             handleBounds(elements, inProgress, vt.getExtendsBound(), builder::addUpperBound);
             handleBounds(elements, inProgress, vt.getSuperBound(), builder::addLowerBound);
 
-            return Optional.of(builder.build());
+            return Optional.of(decorateTypeName(builder.build(), typeMirror, elements));
         }
         case ERROR -> {
-            return Optional.of(TypeName.create(typeMirror.toString()));
+            return Optional.of(decorateTypeName(TypeName.create(typeMirror.toString()), typeMirror, elements));
         }
         // this is most likely a type that is code generated as part of this round, best effort
         case NONE -> {
@@ -201,46 +277,61 @@ final class AptTypeFactory {
 
         if (typeMirror instanceof ArrayType arrayType) {
             TypeName typeName = createTypeName(elements, inProgress, arrayType.getComponentType()).orElseThrow();
-            return Optional.of(TypeName.builder(typeName)
-                                       .componentType(typeName)
-                                       .array(true)
-                                       .build());
+            TypeName arrayName = TypeName.builder(typeName)
+                    .annotations(List.of())
+                    .componentType(typeName)
+                    .array(true)
+                    .build();
+            return Optional.of(decorateTypeName(arrayName, typeMirror, elements));
         }
 
         if (typeMirror instanceof DeclaredType declaredType) {
-            List<TypeName> typeParams = declaredType.getTypeArguments()
-                    .stream()
-                    .map(it -> createTypeName(elements, inProgress, it))
-                    .flatMap(Optional::stream)
-                    .collect(Collectors.toList());
-
-            TypeName result = createTypeName(elements, inProgress, declaredType.asElement()).orElse(null);
-
-            if (result == null) {
-                return Optional.empty();
-            }
-
-            var annotationMirrors = declaredType.getAnnotationMirrors();
-            if (!annotationMirrors.isEmpty() && elements != null) {
-                // we cannot do this if elements is null
-                var newResultBuilder = TypeName.builder(result);
-                for (AnnotationMirror annotationMirror : annotationMirrors) {
-                    newResultBuilder.addAnnotation(AptAnnotationFactory.createAnnotation(annotationMirror, elements));
-                }
-                result = newResultBuilder.build();
-            }
-
-            if (typeParams.isEmpty()) {
-                return Optional.ofNullable(result);
-            }
-
             if (!inProgress.add(typeMirror)) {
                 return Optional.empty(); // prevent infinite loop
             }
-            return Optional.of(TypeName.builder(result).typeArguments(typeParams).build());
+            try {
+                List<TypeName> typeParams = declaredType.getTypeArguments()
+                        .stream()
+                        .map(it -> createTypeName(elements, inProgress, it))
+                        .flatMap(Optional::stream)
+                        .collect(Collectors.toList());
+
+                TypeName result = createTypeName(elements, inProgress, declaredType.asElement()).orElse(null);
+
+                if (result == null) {
+                    return Optional.empty();
+                }
+
+                result = decorateTypeName(result, typeMirror, elements);
+
+                if (typeParams.isEmpty()) {
+                    return Optional.of(result);
+                }
+
+                return Optional.of(TypeName.builder(result).typeArguments(typeParams).build());
+            } finally {
+                inProgress.remove(typeMirror);
+            }
         }
 
         throw new IllegalStateException("Unknown type mirror: " + typeMirror);
+    }
+
+    private static TypeName decorateTypeName(TypeName typeName, TypeMirror typeMirror, Elements elements) {
+        if (elements == null) {
+            return typeName;
+        }
+
+        var annotationMirrors = typeMirror.getAnnotationMirrors();
+        if (annotationMirrors.isEmpty()) {
+            return typeName;
+        }
+
+        var builder = TypeName.builder(typeName);
+        for (AnnotationMirror annotationMirror : annotationMirrors) {
+            builder.addAnnotation(AptAnnotationFactory.createAnnotation(annotationMirror, elements));
+        }
+        return builder.build();
     }
 
     private static void handleBounds(Elements elements,

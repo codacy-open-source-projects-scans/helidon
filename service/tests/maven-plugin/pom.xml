@@ -23,7 +23,7 @@
     <parent>
         <groupId>io.helidon.service.tests</groupId>
         <artifactId>helidon-service-tests-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -116,6 +116,12 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-invoker-plugin</artifactId>
+                <configuration>
+                    <extraArtifacts>
+                        <extraArtifact>io.helidon.codegen:helidon-codegen-apt:${project.version}</extraArtifact>
+                        <extraArtifact>io.helidon.codegen:helidon-codegen-helidon-copyright:${project.version}</extraArtifact>
+                    </extraArtifacts>
+                </configuration>
                 <executions>
                     <execution>
                         <goals>

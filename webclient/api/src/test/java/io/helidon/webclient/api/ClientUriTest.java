@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package io.helidon.webclient.api;
 
 import java.net.URI;
 
+import io.helidon.common.uri.UriInfo;
 import io.helidon.common.uri.UriPath;
 import io.helidon.common.uri.UriQueryWriteable;
 
@@ -42,6 +43,32 @@ class ClientUriTest {
     @Test
     void testDefaultsHttps() {
         ClientUri helper = ClientUri.create(URI.create("https://localhost"));
+
+        assertThat(helper.authority(), is("localhost:443"));
+        assertThat(helper.host(), is("localhost"));
+        assertThat(helper.path(), is(UriPath.root()));
+        assertThat(helper.port(), is(443));
+        assertThat(helper.scheme(), is("https"));
+    }
+
+    @Test
+    void testDefaultsUppercaseHttps() {
+        ClientUri helper = ClientUri.create(URI.create("HTTPS://localhost"));
+
+        assertThat(helper.authority(), is("localhost:443"));
+        assertThat(helper.host(), is("localhost"));
+        assertThat(helper.path(), is(UriPath.root()));
+        assertThat(helper.port(), is(443));
+        assertThat(helper.scheme(), is("https"));
+    }
+
+    @Test
+    void testDefaultsUppercaseHttpsUriInfo() {
+        UriInfo baseUri = UriInfo.builder()
+                .scheme("HTTPS")
+                .host("localhost")
+                .build();
+        ClientUri helper = ClientUri.create(baseUri);
 
         assertThat(helper.authority(), is("localhost:443"));
         assertThat(helper.host(), is("localhost"));
@@ -81,6 +108,39 @@ class ClientUriTest {
         assertThat(helper.query().get("p2"), is("v2"));
         assertThat(helper.query().get("p3"), is("//v3//"));
         assertThat(helper.query().getRaw("p3"), is("%2F%2Fv3%2F%2F"));
+    }
+
+    @Test
+    void testRequestTargetQueryUsesConfiguredEncoding() {
+        ClientUri helper = ClientUri.create(URI.create("http://localhost/path"));
+        helper.writeableQuery().set("q", "a#b");
+
+        assertThat(helper.requestTargetQuery().rawValue(), is("q=a%23b"));
+
+        helper.skipUriEncoding(true);
+
+        assertThat(helper.requestTargetQuery().rawValue(), is("q=a#b"));
+        assertThat(helper.query().rawValue(), is("q=a%23b"));
+    }
+
+    @Test
+    void testEmptyQueryDelimiter() {
+        ClientUri helper = ClientUri.create(URI.create("http://localhost:8080/loom/quick?"));
+
+        assertThat(helper.hasQuery(), is(true));
+        assertThat(helper.query().rawValue(), is(""));
+        assertThat(helper.pathWithQueryAndFragment(), is("/loom/quick?"));
+        assertThat(helper.toUri(), is(URI.create("http://localhost:8080/loom/quick?")));
+    }
+
+    @Test
+    void testNoQueryDelimiter() {
+        ClientUri helper = ClientUri.create(URI.create("http://localhost:8080/loom/quick"));
+
+        assertThat(helper.hasQuery(), is(false));
+        assertThat(helper.query().rawValue(), is(""));
+        assertThat(helper.pathWithQueryAndFragment(), is("/loom/quick"));
+        assertThat(helper.toUri(), is(URI.create("http://localhost:8080/loom/quick")));
     }
 
     @Test

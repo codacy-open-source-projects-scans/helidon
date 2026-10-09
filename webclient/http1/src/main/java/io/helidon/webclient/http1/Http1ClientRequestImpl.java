@@ -17,31 +17,49 @@
 package io.helidon.webclient.http1;
 
 import java.io.ByteArrayOutputStream;
+import java.net.UnixDomainSocketAddress;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import io.helidon.common.GenericType;
 import io.helidon.common.buffers.BufferData;
 import io.helidon.http.ClientRequestHeaders;
 import io.helidon.http.Header;
+import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
+import io.helidon.http.LogFormatter;
 import io.helidon.http.Method;
 import io.helidon.http.Status;
 import io.helidon.http.media.EntityWriter;
 import io.helidon.http.media.InstanceWriter;
 import io.helidon.http.media.MediaContext;
+import io.helidon.webclient.api.ClientConnection;
 import io.helidon.webclient.api.ClientRequestBase;
 import io.helidon.webclient.api.ClientUri;
 import io.helidon.webclient.api.FullClientRequest;
-import io.helidon.webclient.api.Proxy.ProxyType;
+import io.helidon.webclient.api.Proxy;
+import io.helidon.webclient.api.ProxyRoute;
 import io.helidon.webclient.api.WebClientServiceRequest;
 import io.helidon.webclient.api.WebClientServiceResponse;
 
-class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1ClientResponse> implements Http1ClientRequest {
+class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1ClientResponse>
+        implements Http1ClientRequest {
     private static final System.Logger LOGGER = System.getLogger(Http1ClientRequestImpl.class.getName());
+    private static final Set<HeaderName> REPLAYABLE_HEADERS = Set.of(HeaderNames.ACCEPT,
+                                                                     HeaderNames.ACCEPT_CHARSET,
+                                                                     HeaderNames.ACCEPT_ENCODING,
+                                                                     HeaderNames.ACCEPT_LANGUAGE,
+                                                                     HeaderNames.CONTENT_ENCODING,
+                                                                     HeaderNames.CONTENT_LANGUAGE,
+                                                                     HeaderNames.CONTENT_LOCATION,
+                                                                     HeaderNames.CONTENT_TYPE);
+
     private final Http1ClientImpl http1Client;
     private final FullClientRequest<?> delegate;
+
     private boolean outputStreamRedirect;
+    private int outputStreamRedirects;
 
     Http1ClientRequestImpl(Http1ClientImpl http1Client,
                            Method method,
@@ -56,13 +74,26 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
                            ClientUri clientUri,
                            Boolean sendExpectContinue,
                            Map<String, String> properties) {
+        this(http1Client, delegate, method, clientUri, sendExpectContinue, properties, null, false);
+    }
+
+    private Http1ClientRequestImpl(Http1ClientImpl http1Client,
+                                   FullClientRequest<?> delegate,
+                                   Method method,
+                                   ClientUri clientUri,
+                                   Boolean sendExpectContinue,
+                                   Map<String, String> properties,
+                                   ClientUri redirectSourceUri,
+                                   boolean crossOriginRedirect) {
         super(http1Client.clientConfig(),
               http1Client.webClient().cookieManager(),
               Http1Client.PROTOCOL_ID,
               method,
               clientUri,
               sendExpectContinue,
-              properties);
+              properties,
+              redirectSourceUri,
+              crossOriginRedirect);
         this.http1Client = http1Client;
         this.delegate = delegate;
     }
@@ -71,18 +102,50 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
     Http1ClientRequestImpl(Http1ClientRequestImpl request,
                            Method method,
                            ClientUri clientUri,
-                           Map<String, String> properties) {
+                           Map<String, String> properties,
+                           boolean preserveEntity) {
         this(request.http1Client,
              null,
              method,
              clientUri,
              null,
-             properties);
+             properties,
+             request.resolvedUri(),
+             request.crossesRedirectOriginBoundary(clientUri));
 
         followRedirects(request.followRedirects());
         maxRedirects(request.maxRedirects());
         tls(request.tls());
+        proxy(request.proxy());
+        request.sni().ifPresent(this::sni);
+        if (sameOrigin(request.resolvedUri(), clientUri)) {
+            request.address().ifPresent(this::address);
+            request.selectedProxyRoute().ifPresent(this::selectedProxyRoute);
+        }
+        readTimeout(request.readTimeout());
+        readContinueTimeout(request.readContinueTimeout());
+        request.sendExpectContinue().ifPresent(this::sendExpectContinue);
         outputStreamRedirect(request.outputStreamRedirect());
+        outputStreamRedirects(request.outputStreamRedirects());
+        if (preserveEntity) {
+            REPLAYABLE_HEADERS.forEach(name -> request.headers().find(name).ifPresent(headers()::set));
+        }
+    }
+
+    @Override
+    public void selectedProxyRoute(ProxyRoute proxyRoute) {
+        super.selectedProxyRoute(proxyRoute);
+        if (delegate != null) {
+            delegate.selectedProxyRoute(proxyRoute);
+        }
+    }
+
+    @Override
+    public void clearSelectedProxyRoute() {
+        super.clearSelectedProxyRoute();
+        if (delegate != null) {
+            delegate.clearSelectedProxyRoute();
+        }
     }
 
     @Override
@@ -127,6 +190,10 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
             }
         }
 
+        if (method() == Method.QUERY && !headers().contains(HeaderNames.CONTENT_TYPE)) {
+            throw new IllegalArgumentException("Content-Type header is required for method '" + Method.QUERY + "'");
+        }
+
         if (followRedirects()) {
             return RedirectionProcessor.invokeWithFollowRedirects(this, entityBytes);
         }
@@ -148,50 +215,54 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
 
     @Override
     public UpgradeResponse upgrade(String protocol) {
-        if (!headers().contains(HeaderNames.UPGRADE)) {
-            headers().set(HeaderNames.UPGRADE, protocol);
-        }
-        Header requestedUpgrade = headers().get(HeaderNames.UPGRADE);
-        Http1ClientResponseImpl response;
+        try {
+            if (!headers().contains(HeaderNames.UPGRADE)) {
+                headers().set(HeaderNames.UPGRADE, protocol);
+            }
+            Header requestedUpgrade = headers().get(HeaderNames.UPGRADE);
+            Http1ClientResponseImpl response;
 
-        if (followRedirects()) {
-            response = RedirectionProcessor.invokeWithFollowRedirects(this, BufferData.EMPTY_BYTES);
-        } else {
-            response = invokeRequestWithEntity(BufferData.EMPTY_BYTES);
-        }
+            if (followRedirects()) {
+                response = RedirectionProcessor.invokeWithFollowRedirects(this, BufferData.EMPTY_BYTES);
+            } else {
+                response = invokeRequestWithEntity(BufferData.EMPTY_BYTES);
+            }
 
-        if (response.status() == Status.SWITCHING_PROTOCOLS_101) {
-            // is the upgrade request successful?
-            if (upgradeSuccessful(requestedUpgrade, response.headers().get(HeaderNames.UPGRADE))) {
-                if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
-                    response.connection()
-                            .helidonSocket().log(LOGGER,
-                                                 System.Logger.Level.TRACE,
-                                                 "Upgrading to %s",
-                                                 requestedUpgrade);
+            if (response.status() == Status.SWITCHING_PROTOCOLS_101) {
+                // is the upgrade request successful?
+                if (upgradeSuccessful(requestedUpgrade, response.headers().get(HeaderNames.UPGRADE))) {
+                    if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
+                        response.connection()
+                                .helidonSocket().log(LOGGER,
+                                                     System.Logger.Level.TRACE,
+                                                     "Upgrading to %s",
+                                                     LogFormatter.escape(requestedUpgrade.get()));
+                    }
+                    // upgrade was a success
+                    return UpgradeResponse.success(response, response.connection());
+                } else {
+                    if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
+                        response.connection().helidonSocket().log(LOGGER,
+                                                                  System.Logger.Level.TRACE,
+                                                                  "Upgrade failed. Expected upgrade: %s, got headers: %s",
+                                                                  LogFormatter.escape(requestedUpgrade.get()),
+                                                                  http1Client.logFormatter().format(response.headers()));
+                    }
                 }
-                // upgrade was a success
-                return UpgradeResponse.success(response, response.connection());
             } else {
                 if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
                     response.connection().helidonSocket().log(LOGGER,
                                                               System.Logger.Level.TRACE,
-                                                              "Upgrade failed. Expected upgrade: {0}, got headers: {1}",
-                                                              requestedUpgrade,
-                                                              response.headers());
+                                                              "Upgrade failed. Tried upgrading to %s, got status: %s",
+                                                              LogFormatter.escape(requestedUpgrade.get()),
+                                                              response.status().codeText());
                 }
             }
-        } else {
-            if (LOGGER.isLoggable(System.Logger.Level.TRACE)) {
-                response.connection().helidonSocket().log(LOGGER,
-                                                          System.Logger.Level.TRACE,
-                                                          "Upgrade failed. Tried upgrading to %s, got status: %s",
-                                                          requestedUpgrade,
-                                                          response.status());
-            }
-        }
 
-        return UpgradeResponse.failure(response);
+            return UpgradeResponse.failure(response);
+        } finally {
+            clearSelectedProxyRoute();
+        }
     }
 
     @Override
@@ -199,16 +270,26 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
         return super.mediaContext();
     }
 
-    @Override
-    protected void additionalHeaders() {
-        super.additionalHeaders();
-        if (proxy().type() != ProxyType.NONE) {
-            header(PROXY_CONNECTION);
-        }
+    Proxy effectiveProxy() {
+        return address().filter(UnixDomainSocketAddress.class::isInstance).isPresent() ? Proxy.noProxy() : proxy();
     }
 
     Http1ClientImpl http1Client() {
         return http1Client;
+    }
+
+    private static boolean sameOrigin(ClientUri sourceUri, ClientUri targetUri) {
+        return sourceUri.scheme().equalsIgnoreCase(targetUri.scheme())
+                && sourceUri.host().equalsIgnoreCase(targetUri.host())
+                && sourceUri.port() == targetUri.port();
+    }
+
+    void sanitizeRedirectHeaders(ClientUri requestUri, ClientRequestHeaders requestHeaders) {
+        super.sanitizeRedirectSensitiveHeaders(requestUri, requestHeaders);
+    }
+
+    boolean canReplayEntityTo(ClientUri requestUri) {
+        return clientConfig().followCrossOriginEntityRedirects() || !crossesRedirectOriginBoundary(requestUri);
     }
 
     /**
@@ -240,6 +321,10 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
         return invokeWithServices(callChain, whenSent, whenComplete);
     }
 
+    Http1ClientResponseImpl redirectProbe() {
+        return (Http1ClientResponseImpl) requestWithoutRouteCleanup();
+    }
+
     private Http1ClientResponseImpl invokeWithServices(Http1CallChainBase callChain,
                                                        CompletableFuture<WebClientServiceRequest> whenSent,
                                                        CompletableFuture<WebClientServiceResponse> whenComplete) {
@@ -247,7 +332,11 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
         // will create a copy, so we could invoke this method multiple times
         ClientUri resolvedUri = resolvedUri();
 
-        WebClientServiceResponse serviceResponse = invokeServices(callChain, whenSent, whenComplete, resolvedUri);
+        WebClientServiceResponse serviceResponse = invokeServices(http1Client.webClient(),
+                                                                  callChain,
+                                                                  whenSent,
+                                                                  whenComplete,
+                                                                  resolvedUri);
 
         CompletableFuture<Void> complete = new CompletableFuture<>();
         complete.thenAccept(ignored -> serviceResponse.whenComplete().complete(serviceResponse))
@@ -260,16 +349,21 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
             ClientRequestHeaders delegateHeaders = delegate.headers();
             this.headers().forEach(delegateHeaders::set);
         }
+        ClientConnection responseConnection = serviceResponse.connection() instanceof ClientConnection clientConnection
+                ? clientConnection
+                : callChain.connection();
         return new Http1ClientResponseImpl(clientConfig(),
                                            http1Client().protocolConfig(),
                                            serviceResponse.status(),
+                                           serviceResponse.serviceRequest().method(),
                                            serviceResponse.serviceRequest().headers(),
                                            serviceResponse.headers(),
-                                           callChain.connection(),
+                                           responseConnection,
                                            serviceResponse.inputStream().orElse(null),
                                            mediaContext(),
                                            resolvedUri,
-                                           complete);
+                                           complete,
+                                           callChain.transportObservation());
     }
 
     /**
@@ -286,6 +380,22 @@ class Http1ClientRequestImpl extends ClientRequestBase<Http1ClientRequest, Http1
 
     boolean outputStreamRedirect() {
         return outputStreamRedirect;
+    }
+
+    boolean ownsExplicitConnection() {
+        ClientConnection current = connection().orElse(null);
+        return delegate != null
+                && current != null
+                && delegate.connection().orElse(null) != current;
+    }
+
+    Http1ClientRequestImpl outputStreamRedirects(int outputStreamRedirects) {
+        this.outputStreamRedirects = outputStreamRedirects;
+        return this;
+    }
+
+    int outputStreamRedirects() {
+        return outputStreamRedirects;
     }
 
 }

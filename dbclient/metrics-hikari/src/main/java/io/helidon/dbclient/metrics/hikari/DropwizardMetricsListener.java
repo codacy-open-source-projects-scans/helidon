@@ -16,12 +16,13 @@
 package io.helidon.dbclient.metrics.hikari;
 
 import java.lang.System.Logger.Level;
-import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
-import io.helidon.common.LazyValue;
 import io.helidon.config.Config;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.service.registry.Services;
 
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Gauge;
@@ -37,19 +38,24 @@ import com.codahale.metrics.Timer;
  */
 public class DropwizardMetricsListener implements MetricRegistryListener {
 
-    private static final String SCOPE = io.helidon.metrics.api.Meter.Scope.VENDOR;
-
     private static final System.Logger LOGGER = System.getLogger(DropwizardMetricsListener.class.getName());
 
     private final String prefix;
-    private final LazyValue<MeterRegistry> registry = LazyValue.create(Metrics::globalRegistry);
+    private final MetricsFactory metricsFactory;
+    private final MeterRegistry registry;
+    private final ConcurrentMap<String, io.helidon.metrics.api.Gauge> registeredGauges = new ConcurrentHashMap<>();
 
-    private DropwizardMetricsListener(String prefix) {
+    private DropwizardMetricsListener(String prefix, MetricsFactory metricsFactory, MeterRegistry registry) {
         this.prefix = prefix;
+        this.metricsFactory = metricsFactory;
+        this.registry = registry;
     }
 
     static MetricRegistryListener create(Config config) {
-        return new DropwizardMetricsListener(config.get("name-prefix").asString().orElse("db.pool."));
+        MeterRegistry meterRegistry = Services.get(MeterRegistry.class);
+        return new DropwizardMetricsListener(config.get("name-prefix").asString().orElse("db.pool."),
+                                             meterRegistry.metricsFactory(),
+                                             meterRegistry);
     }
 
     @Override
@@ -59,7 +65,7 @@ public class DropwizardMetricsListener implements MetricRegistryListener {
             LOGGER.log(Level.TRACE, () -> String.format("Gauge added: %s", name));
             @SuppressWarnings("unchecked")
             Gauge<? extends Number> nGauge = (Gauge<? extends Number>) gauge;
-            registerGauge(name, nGauge);
+            registeredGauges.compute(name, (ignoredName, ignoredGauge) -> registerGauge(name, nGauge));
         } else {
             LOGGER.log(Level.WARNING, () -> String.format("Cannot add gauge returning type "
                                                                   + value.getClass().getName()
@@ -70,19 +76,19 @@ public class DropwizardMetricsListener implements MetricRegistryListener {
     @Override
     public void onGaugeRemoved(String name) {
         LOGGER.log(Level.TRACE, () -> String.format("Gauge removed: %s", name));
-        registry.get().remove(prefix + name, Set.of(), SCOPE);
+        removeGauge(name);
     }
 
     @Override
     public void onCounterAdded(String name, Counter counter) {
         LOGGER.log(Level.TRACE, () -> String.format("Counter added: %s", name));
-        registerGauge(name, counter);
+        registeredGauges.compute(name, (ignoredName, ignoredGauge) -> registerGauge(name, counter));
     }
 
     @Override
     public void onCounterRemoved(String name) {
         LOGGER.log(Level.TRACE, () -> String.format("Counter removed: %s", name));
-        registry.get().remove(prefix + name, Set.of(), SCOPE);
+        removeGauge(name);
     }
 
     @Override
@@ -117,18 +123,25 @@ public class DropwizardMetricsListener implements MetricRegistryListener {
 
 
     private io.helidon.metrics.api.Gauge registerGauge(String name, Gauge<? extends Number> gauge) {
-        return registry.get()
-                .getOrCreate(io.helidon.metrics.api.Gauge.builder(prefix + name,
-                                                                  gauge,
-                                                                  g -> g.getValue().doubleValue())
-                                     .scope(SCOPE));
+        return registry
+                .getOrCreate(metricsFactory.gaugeBuilder(prefix + name,
+                                                         gauge,
+                                                         g -> g.getValue().doubleValue())
+                                     .origin(DropwizardMetricsListener.class.getName()));
     }
 
     private io.helidon.metrics.api.Gauge registerGauge(String name, Counter counter) {
-        return registry.get()
-                .getOrCreate(io.helidon.metrics.api.Gauge.builder(prefix + name,
-                                                                  counter,
-                                                                  Counter::getCount)
-                                     .scope(SCOPE));
+        return registry
+                .getOrCreate(metricsFactory.gaugeBuilder(prefix + name,
+                                                         counter,
+                                                         Counter::getCount)
+                                     .origin(DropwizardMetricsListener.class.getName()));
+    }
+
+    private void removeGauge(String name) {
+        registeredGauges.computeIfPresent(name, (ignoredName, gauge) -> {
+            registry.remove(gauge);
+            return null;
+        });
     }
 }

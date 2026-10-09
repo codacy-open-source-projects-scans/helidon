@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@
 
 package io.helidon.webserver;
 
+import java.util.Objects;
 import java.util.function.Consumer;
 
 import io.helidon.builder.api.RuntimeType;
 import io.helidon.common.context.Context;
 import io.helidon.common.tls.Tls;
+import io.helidon.common.tls.TlsMaterial;
 
 /**
  * Server that opens server sockets and handles requests through routing.
@@ -70,15 +72,21 @@ public interface WebServer extends RuntimeType.Api<WebServerConfig> {
      * The start will fail on a server that is shut down, or that failed to start.
      * In such cases, create a new instance of WebServer.
      *
+     * If startup fails, all started channels are shut down before the failure is propagated.
+     * Additional cleanup failures may be attached as suppressed exceptions.
+     *
      * @return a started server
-     * @throws IllegalStateException when startup fails, in such a case all channels are shut down
+     * @throws IllegalStateException if startup or startup cleanup fails
      */
     WebServer start();
 
     /**
      * Attempt to gracefully shutdown the server.
+     * All channels are asked to stop even when one fails. If shutdown fails, the server is marked as stopped before
+     * the failure is propagated. Additional shutdown failures may be attached as suppressed exceptions.
      *
      * @return a stopped server
+     * @throws RuntimeException if shutdown cleanup fails
      * @see #start()
      */
     WebServer stop();
@@ -114,6 +122,9 @@ public interface WebServer extends RuntimeType.Api<WebServerConfig> {
 
     /**
      * Returns {@code true} if TLS is configured for the default socket.
+     * <p>
+     * This is strictly a listener TLS configuration query. It does not report effective transport security and is not
+     * changed by bindings that provide their own TLS-equivalent protection.
      *
      * @return whether TLS is enabled for the default socket
      */
@@ -130,6 +141,9 @@ public interface WebServer extends RuntimeType.Api<WebServerConfig> {
 
     /**
      * Returns {@code true} if TLS is configured for the named socket.
+     * <p>
+     * This is strictly a listener TLS configuration query. It does not report effective transport security and is not
+     * changed by bindings that provide their own TLS-equivalent protection.
      *
      * @param socketName the name of a socket
      * @return whether TLS is enabled for the socket, returns {@code false} if the socket does not exists
@@ -140,7 +154,9 @@ public interface WebServer extends RuntimeType.Api<WebServerConfig> {
      * Reload TLS keystore and truststore configuration for the default socket.
      *
      * @param tls new TLS configuration
+     * @deprecated use {@link #reloadTls(TlsMaterial)}
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     default void reloadTls(Tls tls) {
         reloadTls(DEFAULT_SOCKET_NAME, tls);
     }
@@ -150,6 +166,57 @@ public interface WebServer extends RuntimeType.Api<WebServerConfig> {
      *
      * @param socketName socket name to reload TLS configuration on
      * @param tls new TLS configuration
+     * @deprecated use {@link #reloadTls(io.helidon.common.tls.TlsMaterial, String)}
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     void reloadTls(String socketName, Tls tls);
+
+    /**
+     * Reload TLS key and trust material for the default socket.
+     *
+     * @param material new TLS material
+     */
+    default void reloadTls(TlsMaterial material) {
+        Objects.requireNonNull(material, "material");
+        reloadTls(material, DEFAULT_SOCKET_NAME);
+    }
+
+    /**
+     * Reload TLS key and trust material for the named socket.
+     *
+     * @param material new TLS material
+     * @param socketName socket name to reload TLS material on
+     */
+    default void reloadTls(TlsMaterial material, String socketName) {
+        Objects.requireNonNull(material, "material");
+        Objects.requireNonNull(socketName, "socketName");
+        throw new UnsupportedOperationException("TLS material reload is not supported by this WebServer implementation");
+    }
+
+    /**
+     * Reload TLS key and trust material for a virtual host configured on the default socket.
+     *
+     * @param material new TLS material
+     * @param host configured virtual host name
+     */
+    default void reloadVirtualHostTls(TlsMaterial material, String host) {
+        Objects.requireNonNull(material, "material");
+        Objects.requireNonNull(host, "host");
+        reloadVirtualHostTls(material, DEFAULT_SOCKET_NAME, host);
+    }
+
+    /**
+     * Reload TLS key and trust material for a virtual host configured on the named socket.
+     *
+     * @param material new TLS material
+     * @param socketName socket name containing the virtual host
+     * @param host configured virtual host name
+     */
+    default void reloadVirtualHostTls(TlsMaterial material, String socketName, String host) {
+        Objects.requireNonNull(material, "material");
+        Objects.requireNonNull(socketName, "socketName");
+        Objects.requireNonNull(host, "host");
+        throw new UnsupportedOperationException("Virtual host TLS material reload is not supported by this WebServer "
+                                                        + "implementation");
+    }
 }

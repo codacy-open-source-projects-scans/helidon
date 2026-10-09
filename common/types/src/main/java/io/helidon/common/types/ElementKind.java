@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@
 
 package io.helidon.common.types;
 
+import io.helidon.common.Api;
+
 /**
  * Kind of element.
  * Order is significant, as it is used downstream in comparator of injection point ids.
  */
+@Api.Stable
 public enum ElementKind {
     /**
      * Constructor element type kind.
@@ -67,7 +70,7 @@ public enum ElementKind {
      */
     PACKAGE,
     /**
-     * Record element type kind (since Java 16).
+     * Record element type kind.
      * See javax.lang.model.element.ElementKind#RECORD
      */
     RECORD,

@@ -22,18 +22,42 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+import java.util.Arrays;
+import java.util.Objects;
 
 class ReadOnlyArrayData extends ReadOnlyBufferData {
+    static final BufferData EMPTY = new ReadOnlyArrayData(BufferData.EMPTY_BYTES, 0, 0);
+
     private final byte[] bytes;
     private final int offset;
     private final int length;
+    private final boolean sliceSharesBacking;
     private int position;
 
     ReadOnlyArrayData(byte[] bytes, int offset, int length) {
+        this(bytes, offset, length, false);
+    }
+
+    ReadOnlyArrayData(byte[] bytes, int offset, int length, boolean sliceSharesBacking) {
         this.bytes = bytes;
         this.offset = offset;
         this.length = length;
+        this.sliceSharesBacking = sliceSharesBacking;
         this.position = 0;
+    }
+
+    BufferData readOnlySlice(int sliceLength) {
+        Objects.checkFromIndexSize(position, sliceLength, length);
+        int sliceOffset = offset + position;
+        BufferData result;
+        if (sliceSharesBacking) {
+            result = new ReadOnlyArrayData(bytes, sliceOffset, sliceLength, true);
+        } else {
+            byte[] copy = Arrays.copyOfRange(bytes, sliceOffset, sliceOffset + sliceLength);
+            result = BufferData.createReadOnly(copy, 0, copy.length);
+        }
+        position += sliceLength;
+        return result;
     }
 
     @Override
@@ -84,6 +108,7 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
 
     @Override
     public String readString(int length, Charset charset) {
+        Objects.checkFromIndexSize(position, length, this.length);
         String result = new String(bytes, offset + position, length, charset);
         position += length;
         return result;
@@ -109,7 +134,7 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
 
     @Override
     public String debugDataBinary() {
-        return BufferUtil.debugDataBinary(bytes, offset + position, length - position);
+        return BufferUtil.debugDataBinary(bytes, offset + position, offset + length);
     }
 
     @Override
@@ -117,7 +142,7 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
         if (fullBuffer) {
             return BufferUtil.debugDataHex(bytes, offset, offset + length);
         } else {
-            return BufferUtil.debugDataHex(bytes, offset + position, offset + length - position);
+            return BufferUtil.debugDataHex(bytes, offset + position, offset + length);
         }
 
     }
@@ -129,7 +154,9 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
 
     @Override
     public void skip(int length) {
-        position = Math.min(this.length, position + length);
+        int actualLength = Math.min(length, available());
+        Objects.checkFromIndexSize(position, actualLength, this.length);
+        position += actualLength;
     }
 
     @Override
@@ -145,7 +172,11 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
 
     @Override
     public int lastIndexOf(byte aByte, int length) {
-        for (int i = length - 1; i >= position; i--) {
+        if (length <= 0) {
+            return -1;
+        }
+        int searchLength = Math.min(length, available());
+        for (int i = (position + searchLength) - 1; i >= position; i--) {
             byte b = bytes[offset + i];
             if (b == aByte) {
                 return i - position;
@@ -161,6 +192,7 @@ class ReadOnlyArrayData extends ReadOnlyBufferData {
 
     @Override
     public int get(int index) {
+        Objects.checkIndex(index, available());
         return bytes[offset + position + index] & 0xFF;
     }
 }

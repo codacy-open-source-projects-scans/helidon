@@ -17,19 +17,15 @@
 package io.helidon.webserver.http2;
 
 import io.helidon.http.http2.Http2ErrorCode;
-import io.helidon.http.http2.Http2Flag;
-import io.helidon.http.http2.Http2GoAway;
-import io.helidon.http.http2.Http2Settings;
 import io.helidon.webserver.CloseConnectionException;
 
 class Http2ConnectionChecks {
     private static final System.Logger LOGGER = System.getLogger(Http2ConnectionChecks.class.getName());
 
-    // No fancy client settings needed for goaway
-    private final Http2Settings clientSettings = Http2Settings.builder().build();
     private final Http2Connection connection;
     private final long rapidResetCheckPeriod;
     private final int maxRapidResets;
+    private final int maxServerSideResets;
     private int rapidResetCnt = 0;
     private long rapidResetPeriodStart = 0;
     private long serverSideResetCounter = 0;
@@ -37,6 +33,7 @@ class Http2ConnectionChecks {
     Http2ConnectionChecks(Http2Config http2Config, Http2Connection connection) {
         this.rapidResetCheckPeriod = http2Config.rapidResetCheckPeriod().toNanos();
         this.maxRapidResets = http2Config.maxRapidResets();
+        this.maxServerSideResets = http2Config.maxRapidResets();
         this.connection = connection;
     }
 
@@ -48,40 +45,35 @@ class Http2ConnectionChecks {
     void rapidResetCheck(boolean rapidReset) {
         if (rapidReset && maxRapidResets != -1) {
             long currentTime = System.nanoTime();
-            if (rapidResetCheckPeriod >= currentTime - rapidResetPeriodStart) {
-                rapidResetCnt = 1;
+            if (rapidResetPeriodStart == 0 || currentTime - rapidResetPeriodStart > rapidResetCheckPeriod) {
+                rapidResetCnt = 0;
                 rapidResetPeriodStart = currentTime;
-            } else if (maxRapidResets < rapidResetCnt) {
+            }
+            if (++rapidResetCnt > maxRapidResets) {
                 closeConnection("Rapid reset attack detected!");
-            } else {
-                rapidResetCnt++;
             }
         }
     }
 
     /**
      * Made you reset counter. Not thread safe, expected to run on dispatcher thread.
-     *
-     * @param lastStreamId the highest stream id seen on the connection so far.
+     * Uses the configured reset threshold as a connection lifetime limit for server-side resets.
      */
-    void madeYouResetCheck(int lastStreamId) {
-        if (serverSideResetCounter++ > maxRapidResets
-                && serverSideResetCounter > lastStreamId / 4) {
+    void madeYouResetCheck() {
+        if (maxServerSideResets != -1 && ++serverSideResetCounter > maxServerSideResets) {
             closeConnection("MadeYouReset attack detected!");
         }
     }
 
     private void closeConnection(String msg) {
+        closeConnection(Http2ErrorCode.ENHANCE_YOUR_CALM, msg);
+    }
+
+    void closeConnection(Http2ErrorCode errorCode, String msg) {
         if (LOGGER.isLoggable(System.Logger.Level.DEBUG)) {
             LOGGER.log(System.Logger.Level.DEBUG, msg + " Closing connection " + connection + " with GOAWAY");
         }
-        Http2GoAway frame = new Http2GoAway(0, Http2ErrorCode.ENHANCE_YOUR_CALM, msg);
-        try {
-            connection.writeConnectionFrame(frame.toFrameData(clientSettings, 0, Http2Flag.NoFlags.create()));
-        } finally {
-            // Finish to avoid implicit GOAWAY after close, even if the peer is already gone.
-            connection.finish();
-        }
+        connection.writeGoAwayAndFinish(errorCode, msg);
         // Avoid further processing changing the connection state
         throw new CloseConnectionException("Enhance your calm.");
     }

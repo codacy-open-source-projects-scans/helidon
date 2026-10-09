@@ -24,6 +24,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
@@ -35,7 +36,14 @@ import io.helidon.common.types.TypeName;
 
 /**
  * A set of annotations (and APIs) required to declare a service.
+ * <p>
+ * Any service instance created by the service registry must never call methods on
+ * {@link io.helidon.service.registry.Services}. Required dependencies must be injected into the service. When
+ * programmatic lookup is required during normal operation, inject
+ * {@link io.helidon.service.registry.ServiceRegistry} instead. This restriction applies throughout the service lifecycle,
+ * including construction, post-construct, business methods, and pre-destroy.
  */
+@Api.Stable
 public final class Service {
     private Service() {
     }
@@ -157,6 +165,15 @@ public final class Service {
      * is created once, and pre-destroy is called when the registry is shut down.
      * This also implies that instances that are NOT created within a scope cannot have their pre-destroy methods
      * invoked, as we do not control their lifecycle.
+     * <p>
+     * A pre-destroy method is intended to release resources held by the service instance, not to interact with other services.
+     * It must not invoke methods that may instantiate another service, such as an instance lookup on an injected
+     * {@link io.helidon.service.registry.ServiceRegistry}.
+     * For compatibility with previously generated services, an injected {@link java.util.function.Supplier} may return
+     * an already initialized, still-active dependency from the same scope instance during the callback. Such access is limited to
+     * the callback thread and fails if resolution would create a service, invoke a factory, or wait for initialization.
+     * The dependency's scope must still be resolvable during cleanup.
+     * Prefer retaining dependencies needed for cleanup while the service is active.
      * <p>
      * The method must not have any parameters and must be accessible (not {@code private}).
      */
@@ -465,7 +482,7 @@ public final class Service {
      * This annotation is used by framework developers that need to extend the set of entry points of an
      * application.
      */
-    @Api.Incubating
+    @Api.Preview
     @Api.Since("4.3.0")
     @Retention(RetentionPolicy.CLASS)
     @Target({ElementType.METHOD, ElementType.ANNOTATION_TYPE})
@@ -609,7 +626,7 @@ public final class Service {
          * @return a new qualified instance
          */
         static <T> QualifiedInstance<T> create(T instance, io.helidon.service.registry.Qualifier... qualifiers) {
-            return new QualifiedInstanceImpl<>(instance, Set.of(qualifiers));
+            return create(instance, Set.of(qualifiers));
         }
 
         /**
@@ -621,7 +638,8 @@ public final class Service {
          * @return a new qualified instance
          */
         static <T> QualifiedInstance<T> create(T instance, Set<io.helidon.service.registry.Qualifier> qualifiers) {
-            return new QualifiedInstanceImpl<>(instance, qualifiers);
+            Objects.requireNonNull(instance, "instance");
+            return new QualifiedInstanceImpl<>(instance, Set.copyOf(qualifiers));
         }
 
         /**
@@ -677,6 +695,8 @@ public final class Service {
 
         /**
          * De-activate the given scope.
+         * <p>
+         * This method must not be invoked concurrently for the same scope instance.
          *
          * @param scope scope to de-activate
          */

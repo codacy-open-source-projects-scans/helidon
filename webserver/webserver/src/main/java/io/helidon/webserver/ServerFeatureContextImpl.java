@@ -34,6 +34,7 @@ import io.helidon.common.Builder;
 import io.helidon.common.LazyValue;
 import io.helidon.common.Weighted;
 import io.helidon.common.Weights;
+import io.helidon.webserver.HttpTransportObserverSupport.ObserverLifecycle;
 import io.helidon.webserver.http.ErrorHandler;
 import io.helidon.webserver.http.Filter;
 import io.helidon.webserver.http.HttpFeature;
@@ -41,6 +42,7 @@ import io.helidon.webserver.http.HttpRoute;
 import io.helidon.webserver.http.HttpRouting;
 import io.helidon.webserver.http.HttpSecurity;
 import io.helidon.webserver.http.HttpService;
+import io.helidon.webserver.http.HttpServiceLocator;
 import io.helidon.webserver.spi.ServerFeature;
 
 import static io.helidon.webserver.WebServer.DEFAULT_SOCKET_NAME;
@@ -50,6 +52,7 @@ class ServerFeatureContextImpl implements ServerFeature.ServerFeatureContext {
     private final Map<String, ListenerBuildersImpl> socketToBuilders;
     private final Set<String> configuredSockets;
     private final Map<String, ServerToHttpFeatureBuilder> inProgressBuilders;
+    private final Map<String, List<ObserverLifecycle>> httpTransportObservers;
 
     private final AtomicReference<Double> weight;
 
@@ -64,6 +67,7 @@ class ServerFeatureContextImpl implements ServerFeature.ServerFeatureContext {
                 .collect(Collectors.toSet());
         this.weight = weight;
         this.inProgressBuilders = new HashMap<>();
+        this.httpTransportObservers = new HashMap<>();
     }
 
     static ServerFeatureContextImpl create(WebServerConfig serverConfig) {
@@ -158,6 +162,16 @@ class ServerFeatureContextImpl implements ServerFeature.ServerFeatureContext {
         return builder.update(it -> listener.routings()
                         .forEach(it::addRouting))
                 .build();
+    }
+
+    void addHttpTransportObserver(String socketName, ObserverLifecycle observerLifecycle) {
+        listenerBuilder(socketName);
+        httpTransportObservers.computeIfAbsent(socketName, _ -> new ArrayList<>())
+                .add(observerLifecycle);
+    }
+
+    List<ObserverLifecycle> httpTransportObservers(String socketName) {
+        return List.copyOf(httpTransportObservers.getOrDefault(socketName, List.of()));
     }
 
     private static HttpRouting.Builder defaultRouting(WebServerConfig serverConfig) {
@@ -379,8 +393,20 @@ class ServerFeatureContextImpl implements ServerFeature.ServerFeatureContext {
         }
 
         @Override
+        public HttpRouting.Builder registerLocator(HttpServiceLocator locator) {
+            delegate.registerLocator(locator);
+            return this;
+        }
+
+        @Override
         public HttpRouting.Builder register(String path, HttpService... services) {
             delegate.register(path, services);
+            return this;
+        }
+
+        @Override
+        public HttpRouting.Builder registerLocator(String pathPattern, HttpServiceLocator locator) {
+            delegate.registerLocator(pathPattern, locator);
             return this;
         }
 

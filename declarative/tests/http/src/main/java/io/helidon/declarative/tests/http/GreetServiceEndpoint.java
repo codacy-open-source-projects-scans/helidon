@@ -16,6 +16,9 @@
 
 package io.helidon.declarative.tests.http;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -40,6 +43,7 @@ import io.helidon.security.abac.role.RoleValidator;
 import io.helidon.service.registry.Service;
 import io.helidon.webserver.http.RestServer;
 import io.helidon.webserver.http.ServerRequest;
+import io.helidon.webserver.http.ServerResponse;
 
 /**
  * A simple endpoint to greet you. Examples:
@@ -122,6 +126,28 @@ class GreetServiceEndpoint implements GreetService {
         return Integer.toString(queryParam);
     }
 
+    @Http.GET
+    @Http.Path("/output-stream")
+    @Http.Produces(MediaTypes.TEXT_PLAIN_VALUE)
+    @RestServer.Header(name = "X-Stream", value = "true")
+    @RestServer.Status(Status.CREATED_201_CODE)
+    void outputStream(ServerResponse response) throws IOException {
+        try (var outputStream = response.outputStream()) {
+            outputStream.write("streamed".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @Http.POST
+    @Http.Path("/input-stream-output-stream")
+    @Http.Consumes(MediaTypes.TEXT_PLAIN_VALUE)
+    @Http.Produces(MediaTypes.TEXT_PLAIN_VALUE)
+    void inputStreamOutputStream(@Http.Entity InputStream inputStream,
+                                 ServerResponse response) throws IOException {
+        try (var outputStream = response.outputStream()) {
+            inputStream.transferTo(outputStream);
+        }
+    }
+
     /**
      * Return a worldly greeting message.
      */
@@ -138,6 +164,21 @@ class GreetServiceEndpoint implements GreetService {
             return List.of(new GreetingDto("Hello"));
         }
         return List.of(new GreetingDto(this.greeting.get()), new GreetingDto("Hello"));
+    }
+
+    @Override
+    public String query(@Http.Entity String query) {
+        return "Result: " + query;
+    }
+
+    @Override
+    public String uppercaseCustomMethod() {
+        return "CASE";
+    }
+
+    @Override
+    public String lowercaseCustomMethod() {
+        return "case";
     }
 
     @Ft.Fallback(value = "fallback", applyOn = IllegalStateException.class)
@@ -196,6 +237,33 @@ class GreetServiceEndpoint implements GreetService {
     @Http.Path("/test/multiple/methods/with/same/name")
     public String getMessageHandler() {
         return "Success";
+    }
+
+    @Http.GET
+    @Http.Path("/optional-present/{name}")
+    @Http.Produces(MediaTypes.APPLICATION_JSON_VALUE)
+    JsonObject optionalMessage(@Http.PathParam("name") String name) {
+        return response(name);
+    }
+
+    @Http.GET
+    @Http.Path("/optional/empty")
+    @RestServer.Status(Status.NO_CONTENT_204_CODE)
+    void optionalMessageEmpty() {
+    }
+
+    @Http.GET
+    @Http.Path("/optional/not-found")
+    @Http.Produces(MediaTypes.APPLICATION_JSON_VALUE)
+    Optional<JsonObject> optionalMessageNotFound() {
+        return Optional.empty();
+    }
+
+    @Http.GET
+    @Http.Path("/optional/not-found/handled")
+    @Http.Produces(MediaTypes.APPLICATION_JSON_VALUE)
+    Optional<JsonObject> optionalMessageNotFoundHandled() {
+        return Optional.empty();
     }
 
     /**
@@ -273,6 +341,38 @@ class GreetServiceEndpoint implements GreetService {
         ServerRequest serverRequest = serverRequestSupplier.get();
         OptionalValue<String> greet = serverRequest.query().first("greet");
         return greet.get();
+    }
+
+    @Http.POST
+    @Http.Path("/input-stream")
+    String inputStreamEntity(@Http.Entity InputStream inputStream) throws IOException {
+        try (inputStream) {
+            return new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    @Http.POST
+    @Http.Path("/optional-entity")
+    String optionalEntity(@Http.Entity Optional<String> entity) {
+        return entity.orElse("none");
+    }
+
+    @Http.POST
+    @Http.Path("/optional-input-stream")
+    String optionalInputStreamEntity(@Http.Entity Optional<InputStream> entity) throws IOException {
+        if (entity.isEmpty()) {
+            return "none";
+        }
+        try (InputStream inputStream = entity.get()) {
+            return new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    @Http.POST
+    @Http.Path("/optional-byte-array")
+    String optionalByteArrayEntity(@Http.Entity Optional<byte[]> entity) {
+        return entity.map(bytes -> new String(bytes, StandardCharsets.UTF_8))
+                .orElse("none");
     }
 
     private JsonObject response(String name) {

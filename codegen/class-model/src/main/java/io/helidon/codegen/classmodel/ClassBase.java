@@ -30,6 +30,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import io.helidon.common.Api;
 import io.helidon.common.types.AccessModifier;
 import io.helidon.common.types.ElementKind;
 import io.helidon.common.types.TypeName;
@@ -37,10 +38,12 @@ import io.helidon.common.types.TypeName;
 /**
  * Abstract class type model. Contains common logic for all class related models.
  */
+@Api.Internal
 public abstract class ClassBase extends AnnotatedComponent {
 
     private final boolean isFinal;
     private final boolean isAbstract;
+    private final boolean sealed;
     private final boolean isStatic;
     private final List<EnumConstant> enumConstants;
     private final List<Field> fields;
@@ -48,6 +51,7 @@ public abstract class ClassBase extends AnnotatedComponent {
     private final List<Method> methods;
     private final List<Method> staticMethods;
     private final Set<Type> interfaces;
+    private final Set<Type> permittedSubclasses;
     private final Set<String> tokenNames;
     private final List<Constructor> constructors;
     private final List<TypeArgument> genericParameters;
@@ -59,6 +63,7 @@ public abstract class ClassBase extends AnnotatedComponent {
         super(builder);
         this.isFinal = builder.isFinal;
         this.isAbstract = builder.isAbstract;
+        this.sealed = builder.sealed;
         this.isStatic = builder.isStatic;
         if (builder.sortFields) {
             this.fields = builder.fields.values().stream().sorted(ClassBase::fieldComparator).toList();
@@ -75,6 +80,7 @@ public abstract class ClassBase extends AnnotatedComponent {
         this.staticMethods = builder.staticMethods.stream().sorted(ClassBase::methodCompare).toList();
         this.constructors = List.copyOf(builder.constructors);
         this.interfaces = Collections.unmodifiableSet(new LinkedHashSet<>(builder.interfaces));
+        this.permittedSubclasses = Collections.unmodifiableSet(new LinkedHashSet<>(builder.permittedSubclasses));
         this.innerClasses = List.copyOf(builder.innerClasses.values());
         this.genericParameters = List.copyOf(builder.genericParameters);
         this.tokenNames = this.genericParameters.stream()
@@ -121,6 +127,15 @@ public abstract class ClassBase extends AnnotatedComponent {
      */
     public List<Constructor> constructors() {
         return List.copyOf(constructors);
+    }
+
+    /**
+     * Generic type parameters declared by this type, including their bounds.
+     *
+     * @return declared generic type parameters
+     */
+    public List<TypeArgument> genericArguments() {
+        return List.copyOf(genericParameters);
     }
 
     /**
@@ -172,6 +187,26 @@ public abstract class ClassBase extends AnnotatedComponent {
     }
 
     /**
+     * Is this a sealed class or interface.
+     *
+     * @return whether this class or interface is sealed
+     */
+    public boolean sealed() {
+        return sealed;
+    }
+
+    /**
+     * Permitted direct subclasses of this sealed class or interface.
+     *
+     * @return permitted direct subclasses
+     */
+    public List<TypeName> permittedSubclassTypeNames() {
+        return permittedSubclasses.stream()
+                .map(Type::genericTypeName)
+                .toList();
+    }
+
+    /**
      * Is this a static class.
      *
      * @return whether this class is static
@@ -198,6 +233,17 @@ public abstract class ClassBase extends AnnotatedComponent {
         }
         if (isStatic) {
             writer.write("static ");
+        }
+        if (sealed) {
+            if (isFinal) {
+                throw new IllegalStateException("Class cannot be sealed and final");
+            }
+            if (this.classType != ElementKind.CLASS && this.classType != ElementKind.INTERFACE) {
+                throw new IllegalStateException("Only a class or interface can be sealed");
+            }
+            writer.write("sealed ");
+        } else if (!permittedSubclasses.isEmpty()) {
+            throw new IllegalStateException("Only a sealed class or interface can declare permitted subclasses");
         }
         if (isFinal) {
             writer.write("final ");
@@ -234,6 +280,9 @@ public abstract class ClassBase extends AnnotatedComponent {
         }
         if (!interfaces.isEmpty()) {
             writeClassInterfaces(writer, combinedTokens, imports);
+        }
+        if (!permittedSubclasses.isEmpty()) {
+            writePermittedSubclasses(writer, combinedTokens, imports);
         }
         writer.write("{");
         writer.writeSeparatorLine();
@@ -283,6 +332,7 @@ public abstract class ClassBase extends AnnotatedComponent {
         methods.forEach(method -> method.addImports(imports));
         staticMethods.forEach(method -> method.addImports(imports));
         interfaces.forEach(imp -> imp.addImports(imports));
+        permittedSubclasses.forEach(permittedSubclass -> permittedSubclass.addImports(imports));
         constructors.forEach(constructor -> constructor.addImports(imports));
         genericParameters.forEach(param -> param.addImports(imports));
         innerClasses.forEach(innerClass -> {
@@ -336,6 +386,18 @@ public abstract class ClassBase extends AnnotatedComponent {
         }
     }
 
+    private static String typeName(ElementKind kind) {
+        return switch (kind) {
+        case CLASS -> "class";
+        case INTERFACE -> "interface";
+        case ENUM -> "enum";
+        case ANNOTATION_TYPE -> "@interface";
+        case RECORD -> "record";
+        case CONSTRUCTOR, FIELD, METHOD, PARAMETER, PACKAGE, RECORD_COMPONENT, STATIC_INIT, INSTANCE_INIT, ENUM_CONSTANT,
+             LOCAL_VARIABLE, MODULE, OTHER -> throw new IllegalStateException("Invalid kind for a Java class: " + kind);
+        };
+    }
+
     private void writeGenericParameters(ModelWriter writer, Set<String> declaredTokens, ImportOrganizer imports) {
         writer.write("<");
         boolean first = true;
@@ -364,6 +426,20 @@ public abstract class ClassBase extends AnnotatedComponent {
                 writer.write(", ");
             }
             interfaceName.writeComponent(writer, declaredTokens, imports, this.classType);
+        }
+        writer.write(" ");
+    }
+
+    private void writePermittedSubclasses(ModelWriter writer, Set<String> declaredTokens, ImportOrganizer imports) {
+        writer.write("permits ");
+        boolean first = true;
+        for (Type permittedSubclass : permittedSubclasses) {
+            if (first) {
+                first = false;
+            } else {
+                writer.write(", ");
+            }
+            permittedSubclass.writeComponent(writer, declaredTokens, imports, this.classType);
         }
         writer.write(" ");
     }
@@ -446,6 +522,7 @@ public abstract class ClassBase extends AnnotatedComponent {
         private final Set<Method> methods = new LinkedHashSet<>();
         private final Set<Method> staticMethods = new LinkedHashSet<>();
         private final Set<Type> interfaces = new LinkedHashSet<>();
+        private final Set<Type> permittedSubclasses = new LinkedHashSet<>();
         private final List<EnumConstant> enumConstants = new ArrayList<>();
         private final Map<String, Field> fields = new LinkedHashMap<>();
         private final Map<String, Field> staticFields = new LinkedHashMap<>();
@@ -457,6 +534,7 @@ public abstract class ClassBase extends AnnotatedComponent {
         private Type superType;
         private boolean isFinal;
         private boolean isAbstract;
+        private boolean sealed;
         private boolean isStatic;
         private boolean sortFields = true;
         private boolean sortStaticFields = true;
@@ -498,6 +576,17 @@ public abstract class ClassBase extends AnnotatedComponent {
          */
         public B isAbstract(boolean isAbstract) {
             this.isAbstract = isAbstract;
+            return identity();
+        }
+
+        /**
+         * Whether this type is sealed.
+         *
+         * @param sealed whether this type is sealed
+         * @return updated builder instance
+         */
+        public B sealed(boolean sealed) {
+            this.sealed = sealed;
             return identity();
         }
 
@@ -644,6 +733,37 @@ public abstract class ClassBase extends AnnotatedComponent {
          */
         public B addInterface(TypeName interfaceType) {
             interfaces.add(Type.fromTypeName(interfaceType));
+            return identity();
+        }
+
+        /**
+         * Add a permitted direct subclass of this sealed type.
+         *
+         * @param permittedSubclass permitted subclass
+         * @return updated builder instance
+         */
+        public B addPermittedSubclass(Class<?> permittedSubclass) {
+            return addPermittedSubclass(TypeName.create(permittedSubclass));
+        }
+
+        /**
+         * Add a permitted direct subclass of this sealed type.
+         *
+         * @param permittedSubclass fully qualified permitted subclass name
+         * @return updated builder instance
+         */
+        public B addPermittedSubclass(String permittedSubclass) {
+            return addPermittedSubclass(TypeName.create(permittedSubclass));
+        }
+
+        /**
+         * Add a permitted direct subclass of this sealed type.
+         *
+         * @param permittedSubclass permitted subclass
+         * @return updated builder instance
+         */
+        public B addPermittedSubclass(TypeName permittedSubclass) {
+            permittedSubclasses.add(Type.fromTypeName(permittedSubclass.genericTypeName()));
             return identity();
         }
 
@@ -819,17 +939,6 @@ public abstract class ClassBase extends AnnotatedComponent {
         }
 
         /**
-         * Whether this type is static.
-         *
-         * @param isStatic whether type is static
-         * @return updated builder instance
-         */
-        B isStatic(boolean isStatic) {
-            this.isStatic = isStatic;
-            return identity();
-        }
-
-        /**
          * Add an enum constant (only valid if the class type is set to ENUM.
          *
          * @param builderConsumer consumer of field builder, type does not have to be specified.
@@ -839,6 +948,17 @@ public abstract class ClassBase extends AnnotatedComponent {
             var builder = EnumConstant.builder();
             builderConsumer.accept(builder);
             this.enumConstants.add(builder.build());
+            return identity();
+        }
+
+        /**
+         * Whether this type is static.
+         *
+         * @param isStatic whether type is static
+         * @return updated builder instance
+         */
+        B isStatic(boolean isStatic) {
+            this.isStatic = isStatic;
             return identity();
         }
 
@@ -860,17 +980,5 @@ public abstract class ClassBase extends AnnotatedComponent {
                 throw new IllegalStateException("Trying to add enum constants to a class of type: " + classType);
             }
         }
-    }
-
-    private static String typeName(ElementKind kind) {
-        return switch (kind) {
-        case CLASS -> "class";
-        case INTERFACE -> "interface";
-        case ENUM -> "enum";
-        case ANNOTATION_TYPE -> "@interface";
-        case RECORD -> "record";
-        case CONSTRUCTOR, FIELD, METHOD, PARAMETER, PACKAGE, RECORD_COMPONENT, STATIC_INIT, INSTANCE_INIT, ENUM_CONSTANT,
-             LOCAL_VARIABLE, MODULE, OTHER -> throw new IllegalStateException("Invalid kind for a Java class: " + kind);
-        };
     }
 }

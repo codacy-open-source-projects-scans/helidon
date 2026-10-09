@@ -26,6 +26,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLParameters;
@@ -37,11 +38,13 @@ import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
 
 import io.helidon.builder.api.RuntimeType;
+import io.helidon.common.Api;
 import io.helidon.config.Config;
 
 /**
  * TLS configuration - common for server and client.
  */
+@Api.Stable
 public class Tls implements RuntimeType.Api<TlsConfig> {
 
     /**
@@ -68,13 +71,25 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
     private Tls(TlsConfig config) {
         // at this time, the TlsConfigDecorator should have created SSL parameters; the SSL context is the responsibility
         // of the manager to provide
-        this.tlsConfig = Objects.requireNonNull(config);
-        this.sslParameters = config.sslParameters().orElseThrow();
+        config = Objects.requireNonNull(config);
+        TlsConfig configuredTls = config;
+        this.sslParameters = copySslParameters(config.sslParameters().orElseThrow());
         this.enabled = config.enabled();
 
         if (config.enabled()) {
-            this.tlsManager = config.manager();
-            this.tlsManager.init(config);
+            if (config.sslContext().isEmpty()) {
+                TlsManager configuredManager = config.manager();
+                if (configuredManager.getClass() == ConfiguredTlsManager.class) {
+                    configuredManager = new ConfiguredTlsManager();
+                }
+                this.tlsManager = configuredManager;
+            } else {
+                this.tlsManager = new ExplicitContextTlsManager(config.sslContext().get());
+                configuredTls = TlsConfig.builder(config)
+                        .manager(this.tlsManager)
+                        .buildPrototype();
+            }
+            this.tlsManager.init(configuredTls);
             this.sslContext = tlsManager.sslContext();
             this.sslSocketFactory = sslContext.getSocketFactory();
             this.sslServerSocketFactory = sslContext.getServerSocketFactory();
@@ -84,6 +99,7 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
             this.sslServerSocketFactory = null;
             this.tlsManager = null;
         }
+        this.tlsConfig = configuredTls;
     }
 
     /**
@@ -140,7 +156,7 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
     public final SSLEngine newEngine() {
         checkEnabled();
         SSLEngine sslEngine = sslContext.createSSLEngine();
-        sslEngine.setSSLParameters(sslParameters);
+        sslEngine.setSSLParameters(copySslParameters(sslParameters));
         return sslEngine;
     }
 
@@ -177,9 +193,7 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
         try {
             SSLServerSocket socket = (SSLServerSocket) sslServerSocketFactory.createServerSocket();
 
-            // create a copy of SSLParameters, as otherwise we may use wrong endpoint identification algorithm for server
-            SSLParameters parameters = copySslParameters();
-            parameters.setApplicationProtocols(this.sslParameters.getApplicationProtocols());
+            SSLParameters parameters = copySslParameters(sslParameters);
             parameters.setEndpointIdentificationAlgorithm("");
 
             socket.setSSLParameters(parameters);
@@ -198,15 +212,63 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
      * @return a new socket ready for TLS communication
      */
     public SSLSocket createSocket(List<String> alpnProtocols, Socket socket, InetSocketAddress address) {
+        return createSocketInternal(alpnProtocols, socket, address.getHostName(), address.getPort(), null);
+    }
+
+    /**
+     * Create a TLS socket using a logical peer identity and the configured server names.
+     *
+     * @param alpnProtocols protocol(s) to use (order is significant)
+     * @param socket existing socket
+     * @param tlsPeerHost TLS peer host for SNI and endpoint identification
+     * @param tlsPeerPort TLS peer port for endpoint identification
+     * @return a new socket ready for TLS communication
+     */
+    @Api.Internal
+    public SSLSocket createSocket(List<String> alpnProtocols,
+                                  Socket socket,
+                                  String tlsPeerHost,
+                                  int tlsPeerPort) {
+        Objects.requireNonNull(tlsPeerHost, "tlsPeerHost");
+        return createSocketInternal(alpnProtocols, socket, tlsPeerHost, tlsPeerPort, null);
+    }
+
+    /**
+     * Create a SSLSocket for the chosen protocol and the given socket.
+     *
+     * @param alpnProtocols       protocol(s) to use (order is significant)
+     * @param socket              existing socket
+     * @param tlsPeerHost         TLS peer host for SNI and endpoint identification
+     * @param tlsPeerPort         TLS peer port for endpoint identification
+     * @param serverNamesOverride server names to use for this socket
+     * @return a new socket ready for TLS communication
+     */
+    @Api.Internal
+    public SSLSocket createSocket(List<String> alpnProtocols,
+                                  Socket socket,
+                                  String tlsPeerHost,
+                                  int tlsPeerPort,
+                                  List<SNIServerName> serverNamesOverride) {
+        Objects.requireNonNull(tlsPeerHost, "tlsPeerHost");
+        Objects.requireNonNull(serverNamesOverride, "serverNamesOverride");
+        return createSocketInternal(alpnProtocols, socket, tlsPeerHost, tlsPeerPort, serverNamesOverride);
+    }
+
+    private SSLSocket createSocketInternal(List<String> alpnProtocols,
+                                           Socket socket,
+                                           String tlsPeerHost,
+                                           int tlsPeerPort,
+                                           List<SNIServerName> serverNamesOverride) {
         checkEnabled();
         try {
             SSLSocket sslSocket = (SSLSocket) sslSocketFactory
-                    .createSocket(socket, address.getHostName(), address.getPort(), true);
+                    .createSocket(socket, tlsPeerHost, tlsPeerPort, true);
 
-            // create a copy of SSLParameters, as otherwise we may overwrite alpnProtocols of requests in parallel
-            SSLParameters parameters = copySslParameters();
+            SSLParameters parameters = copySslParameters(sslParameters);
             parameters.setApplicationProtocols(alpnProtocols.toArray(new String[0]));
-            parameters.setEndpointIdentificationAlgorithm(this.sslParameters.getEndpointIdentificationAlgorithm());
+            if (serverNamesOverride != null) {
+                parameters.setServerNames(serverNamesOverride);
+            }
 
             sslSocket.setSSLParameters(parameters);
             return sslSocket;
@@ -216,7 +278,7 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
     }
 
     /**
-     * Provides the SSL context.
+     * Provides the SSL context captured when this TLS instance was created.
      *
      * @return SSL context
      */
@@ -226,23 +288,55 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
     }
 
     /**
-     * SSL parameters.
+     * SSL parameters. The returned parameters are a copy, and changing them does not modify this TLS configuration.
      *
-     * @return SSL parameters
+     * @return SSL parameters copy
      */
     public SSLParameters sslParameters() {
-        return sslParameters;
+        return copySslParameters(sslParameters);
     }
 
     /**
      * Reload reloadable {@link TlsReloadableComponent}s with the new configuration.
      *
      * @param tls new TLS configuration
+     * @deprecated use {@link #reload(TlsMaterial)}
      */
+    @Deprecated
+    @SuppressWarnings("removal")
     public void reload(Tls tls) {
         if (enabled) {
+            validateReloadSource(tls);
             tlsManager.reload(tls);
         }
+    }
+
+    /**
+     * Reload reloadable {@link TlsReloadableComponent}s with new key and trust material.
+     *
+     * @param material new TLS material
+     */
+    public void reload(TlsMaterial material) {
+        Objects.requireNonNull(material, "material");
+        if (enabled) {
+            tlsManager.reload(material);
+        }
+    }
+
+    /**
+     * Generation of TLS material changes reported by the configured
+     * {@link io.helidon.common.tls.TlsManager#generation()}.
+     * <p>
+     * For enabled TLS, this method returns the configured manager's generation. The generation after the manager's
+     * first successful initialization is zero. A custom manager that inherits the compatibility default continues to
+     * report zero after material changes and may therefore lag behind its current material. When TLS is disabled, this
+     * method also returns zero.
+     *
+     * @return current TLS material generation
+     */
+    @Api.Internal
+    public long generation() {
+        return enabled ? tlsManager.generation() : 0L;
     }
 
     /**
@@ -262,25 +356,32 @@ public class Tls implements RuntimeType.Api<TlsConfig> {
         return tlsManager.trustManager();
     }
 
-    private SSLParameters copySslParameters() {
-        // this copy does not set application protocols (each client request may have different ones)
-        // this copy does not set endpoint identification algorithm, server must not set it
-        SSLParameters parameters = new SSLParameters();
-        parameters.setServerNames(this.sslParameters.getServerNames());
-        parameters.setCipherSuites(this.sslParameters.getCipherSuites());
-        parameters.setAlgorithmConstraints(this.sslParameters.getAlgorithmConstraints());
-        parameters.setEnableRetransmissions(this.sslParameters.getEnableRetransmissions());
-        parameters.setMaximumPacketSize(this.sslParameters.getMaximumPacketSize());
-        parameters.setNamedGroups(this.sslParameters.getNamedGroups());
-        parameters.setProtocols(this.sslParameters.getProtocols());
-        parameters.setSignatureSchemes(this.sslParameters.getSignatureSchemes());
-        parameters.setSNIMatchers(this.sslParameters.getSNIMatchers());
-        parameters.setUseCipherSuitesOrder(this.sslParameters.getUseCipherSuitesOrder());
-        if (this.sslParameters.getNeedClientAuth()) {
-            parameters.setNeedClientAuth(this.sslParameters.getNeedClientAuth());
+    static void validateReloadSource(Tls tls) {
+        Objects.requireNonNull(tls, "tls");
+        if (tls.prototype().sslContext().isPresent()) {
+            throw new UnsupportedOperationException(ExplicitContextTlsManager.RELOAD_NOT_SUPPORTED_MESSAGE);
         }
-        if (this.sslParameters.getWantClientAuth()) {
-            parameters.setWantClientAuth(this.sslParameters.getWantClientAuth());
+    }
+
+    private static SSLParameters copySslParameters(SSLParameters source) {
+        SSLParameters parameters = new SSLParameters();
+        parameters.setServerNames(source.getServerNames());
+        parameters.setCipherSuites(source.getCipherSuites());
+        parameters.setAlgorithmConstraints(source.getAlgorithmConstraints());
+        parameters.setApplicationProtocols(source.getApplicationProtocols());
+        parameters.setEndpointIdentificationAlgorithm(source.getEndpointIdentificationAlgorithm());
+        parameters.setEnableRetransmissions(source.getEnableRetransmissions());
+        parameters.setMaximumPacketSize(source.getMaximumPacketSize());
+        parameters.setNamedGroups(source.getNamedGroups());
+        parameters.setProtocols(source.getProtocols());
+        parameters.setSignatureSchemes(source.getSignatureSchemes());
+        parameters.setSNIMatchers(source.getSNIMatchers());
+        parameters.setUseCipherSuitesOrder(source.getUseCipherSuitesOrder());
+        if (source.getNeedClientAuth()) {
+            parameters.setNeedClientAuth(source.getNeedClientAuth());
+        }
+        if (source.getWantClientAuth()) {
+            parameters.setWantClientAuth(source.getWantClientAuth());
         }
         return parameters;
     }

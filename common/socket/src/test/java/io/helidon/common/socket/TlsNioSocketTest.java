@@ -25,9 +25,11 @@ import java.nio.channels.SocketChannel;
 import java.nio.channels.spi.SelectorProvider;
 import java.util.Collections;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLEngine;
@@ -38,15 +40,267 @@ import io.helidon.common.buffers.BufferData;
 
 import org.junit.jupiter.api.Test;
 
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class TlsNioSocketTest {
+
+    @Test
+    void reportsInitialHandshakeCompletionWithoutApplicationData() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x16});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicReference<SSLEngineResult.HandshakeStatus> handshakeStatus =
+                new AtomicReference<>(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        AtomicInteger completions = new AtomicInteger();
+        AtomicBoolean callbackOutsideHandshakeLock = new AtomicBoolean();
+        AtomicReference<TlsNioSocket> socketReference = new AtomicReference<>();
+        AtomicReference<Thread> callbackWriter = new AtomicReference<>();
+        CountDownLatch callbackWriteCompleted = new CountDownLatch(1);
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenAnswer(invocation -> handshakeStatus.get());
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        doAnswer(invocation -> {
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NEED_UNWRAP);
+            return null;
+        }).when(engine).beginHandshake();
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            src.get();
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.FINISHED,
+                                       1,
+                                       0);
+        });
+        when(engine.wrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            src.get();
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       1,
+                                       0);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.server(channel,
+                                                  engine,
+                                                  "listener",
+                                                  "server",
+                                                  () -> {
+                                                      completions.incrementAndGet();
+                                                      callbackWriter.set(Thread.ofPlatform().start(() -> {
+                                                          socketReference.get().write(BufferData.create(new byte[] {0x02}));
+                                                          callbackWriteCompleted.countDown();
+                                                      }));
+                                                      try {
+                                                          callbackOutsideHandshakeLock.set(
+                                                                  callbackWriteCompleted.await(5, TimeUnit.SECONDS));
+                                                      } catch (InterruptedException e) {
+                                                          Thread.currentThread().interrupt();
+                                                      }
+                                                  });
+        socketReference.set(socket);
+
+        CompletableFuture<Void> firstHandshake = CompletableFuture.runAsync(socket::handshake);
+        CompletableFuture<Void> secondHandshake = CompletableFuture.runAsync(socket::handshake);
+        CompletableFuture.allOf(firstHandshake, secondHandshake).get(5, TimeUnit.SECONDS);
+        callbackWriter.get().join(TimeUnit.SECONDS.toMillis(5));
+
+        assertThat("initial handshake completion callback count", completions.get(), is(1));
+        assertThat("initial handshake callback invoked outside the handshake lock",
+                   callbackOutsideHandshakeLock.get(),
+                   is(true));
+    }
+
+    @Test
+    void doesNotReportInitialHandshakeCompletionWhenEngineCloses() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x15});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicReference<SSLEngineResult.HandshakeStatus> handshakeStatus =
+                new AtomicReference<>(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        AtomicInteger completions = new AtomicInteger();
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenAnswer(invocation -> handshakeStatus.get());
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        doAnswer(invocation -> {
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NEED_UNWRAP);
+            return null;
+        }).when(engine).beginHandshake();
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            src.get();
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+            return new SSLEngineResult(SSLEngineResult.Status.CLOSED,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       1,
+                                       0);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.server(channel,
+                                                  engine,
+                                                  "listener",
+                                                  "server",
+                                                  completions::incrementAndGet);
+
+        socket.handshake();
+
+        assertThat("initial handshake completion callback count", completions.get(), is(0));
+        assertThat("socket connected after the TLS engine closed", socket.isConnected(), is(false));
+    }
+
+    @Test
+    void reportsWriteHandshakeCompletionBeforeApplicationData() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x16});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicReference<SSLEngineResult.HandshakeStatus> handshakeStatus =
+                new AtomicReference<>(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        AtomicInteger completions = new AtomicInteger();
+        AtomicBoolean callbackOutsideHandshakeLock = new AtomicBoolean();
+        AtomicReference<TlsNioSocket> socketReference = new AtomicReference<>();
+        AtomicReference<Thread> callbackWriter = new AtomicReference<>();
+        CountDownLatch callbackWriteCompleted = new CountDownLatch(1);
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenAnswer(invocation -> handshakeStatus.get());
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        doAnswer(invocation -> {
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NEED_UNWRAP);
+            return null;
+        }).when(engine).beginHandshake();
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            src.get();
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.FINISHED,
+                                       1,
+                                       0);
+        });
+        when(engine.wrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            assertThat("callback count before application data write", completions.get(), is(1));
+            ByteBuffer src = invocation.getArgument(0);
+            src.get();
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       1,
+                                       0);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.server(channel,
+                                                  engine,
+                                                  "listener",
+                                                  "server",
+                                                  () -> {
+                                                      completions.incrementAndGet();
+                                                      callbackWriter.set(Thread.ofPlatform().start(() -> {
+                                                          socketReference.get().write(BufferData.create(new byte[] {0x02}));
+                                                          callbackWriteCompleted.countDown();
+                                                      }));
+                                                      try {
+                                                          callbackOutsideHandshakeLock.set(
+                                                                  callbackWriteCompleted.await(5, TimeUnit.SECONDS));
+                                                      } catch (InterruptedException e) {
+                                                          Thread.currentThread().interrupt();
+                                                      }
+                                                  });
+        socketReference.set(socket);
+
+        socket.write(BufferData.create(new byte[] {0x01}));
+        callbackWriter.get().join(TimeUnit.SECONDS.toMillis(5));
+
+        assertThat("initial handshake completion callback count", completions.get(), is(1));
+        assertThat("initial handshake callback invoked outside the handshake lock",
+                   callbackOutsideHandshakeLock.get(),
+                   is(true));
+    }
+
+    @Test
+    void reportsReadHandshakeCompletionBeforeApplicationDataAndIsolatesCallbackFailure() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x16, 0x16, 0x41});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicInteger unwraps = new AtomicInteger();
+        AtomicInteger completions = new AtomicInteger();
+
+        when(engine.getSession()).thenReturn(session);
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            ByteBuffer dst = invocation.getArgument(1);
+            int unwrap = unwraps.getAndIncrement();
+            src.get();
+            if (unwrap == 0) {
+                return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                           SSLEngineResult.HandshakeStatus.NEED_UNWRAP,
+                                           1,
+                                           0);
+            }
+            if (unwrap == 1) {
+                return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                           SSLEngineResult.HandshakeStatus.FINISHED,
+                                           1,
+                                           0);
+            }
+            assertThat("callback count before application data read", completions.get(), is(1));
+            dst.put((byte) 0x41);
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       1,
+                                       1);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.server(channel,
+                                                  engine,
+                                                  "listener",
+                                                  "server",
+                                                  () -> {
+                                                      completions.incrementAndGet();
+                                                      throw new IllegalStateException("test callback failure");
+                                                  });
+
+        assertThat("application data", socket.get(), is(new byte[] {0x41}));
+        assertThat("initial handshake completion callback count", completions.get(), is(1));
+    }
+
+    @Test
+    void emptyWriteDoesNotStartHandshake() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel();
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+
+        when(engine.getSession()).thenReturn(session);
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+
+        TlsNioSocket socket = TlsNioSocket.server(channel,
+                                                  engine,
+                                                  "listener",
+                                                  "server");
+
+        socket.write(BufferData.empty());
+
+        verify(engine, never()).beginHandshake();
+        verify(engine, never()).getHandshakeStatus();
+    }
 
     @Test
     void closeDoesNotRaceWithInFlightTlsWrite() throws Exception {
@@ -58,6 +312,7 @@ class TlsNioSocketTest {
         CountDownLatch closeWrapStarted = new CountDownLatch(1);
 
         when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenReturn(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
         when(session.getPacketBufferSize()).thenReturn(1);
         when(session.getApplicationBufferSize()).thenReturn(1);
         when(engine.wrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
@@ -131,12 +386,161 @@ class TlsNioSocketTest {
         assertNull(closeFailure.get(), "TLS close must not fail when a write is in flight");
     }
 
+    @Test
+    void handshakePreservesApplicationBytes() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x16});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicReference<SSLEngineResult.HandshakeStatus> handshakeStatus =
+                new AtomicReference<>(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenAnswer(invocation -> handshakeStatus.get());
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        doAnswer(invocation -> {
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NEED_UNWRAP);
+            return null;
+        }).when(engine).beginHandshake();
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            ByteBuffer dst = invocation.getArgument(1);
+            int consumed = src.hasRemaining() ? 1 : 0;
+            if (consumed > 0) {
+                src.get();
+            }
+            dst.put((byte) 'S');
+            handshakeStatus.set(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.FINISHED,
+                                       consumed,
+                                       1);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.client(channel, engine, "client");
+
+        socket.handshake();
+
+        assertArrayEquals(new byte[] {'S'}, socket.get());
+    }
+
+    @Test
+    void replayedNetworkDataUsesPacketSizedChunks() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel();
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        ByteBuffer replay = ByteBuffer.wrap(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+        AtomicInteger consumed = new AtomicInteger();
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenReturn(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        when(session.getPacketBufferSize()).thenReturn(4);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            ByteBuffer dst = invocation.getArgument(1);
+            int available = src.remaining();
+            assertTrue(available <= 4, "Replay should not expand the retained peer network buffer");
+
+            src.position(src.limit());
+            int totalConsumed = consumed.addAndGet(available);
+            if (totalConsumed < 10) {
+                return new SSLEngineResult(SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                                           SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                           available,
+                                           0);
+            }
+
+            dst.put((byte) 'R');
+            return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       available,
+                                       1);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.server(channel, engine, "listener", "server", replay);
+
+        assertArrayEquals(new byte[] {'R'}, socket.get());
+        assertEquals(10, consumed.get());
+    }
+
+    @Test
+    void idleDetectsBufferedTlsClose() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x17, 0x15});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+        AtomicBoolean responseReturned = new AtomicBoolean();
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenReturn(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class))).thenAnswer(invocation -> {
+            ByteBuffer src = invocation.getArgument(0);
+            ByteBuffer dst = invocation.getArgument(1);
+
+            if (responseReturned.compareAndSet(false, true)) {
+                src.get();
+                dst.put((byte) 'R');
+                return new SSLEngineResult(SSLEngineResult.Status.OK,
+                                           SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                           1,
+                                           1);
+            }
+
+            src.get();
+            return new SSLEngineResult(SSLEngineResult.Status.CLOSED,
+                                       SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                       1,
+                                       0);
+        });
+
+        TlsNioSocket socket = TlsNioSocket.client(channel, engine, "client");
+
+        assertArrayEquals(new byte[] {'R'}, socket.get());
+        socket.idle();
+
+        assertFalse(socket.isConnected());
+        assertTrue(channel.blockingModeRestored());
+    }
+
+    @Test
+    void idleDiscardsPartialTlsRecord() throws Exception {
+        BlockingSocketChannel channel = new BlockingSocketChannel(new byte[] {0x15});
+        SSLEngine engine = mock(SSLEngine.class);
+        SSLSession session = mock(SSLSession.class);
+
+        when(engine.getSession()).thenReturn(session);
+        when(engine.getHandshakeStatus()).thenReturn(SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING);
+        when(session.getPacketBufferSize()).thenReturn(8);
+        when(session.getApplicationBufferSize()).thenReturn(8);
+        when(engine.unwrap(any(ByteBuffer.class), any(ByteBuffer.class)))
+                .thenReturn(new SSLEngineResult(SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                                                SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                                                0,
+                                                0));
+
+        TlsNioSocket socket = TlsNioSocket.client(channel, engine, "client");
+        socket.idle();
+
+        assertFalse(socket.isConnected());
+        assertTrue(channel.blockingModeRestored());
+    }
+
     private static final class BlockingSocketChannel extends SocketChannel {
         private final CountDownLatch writeStarted = new CountDownLatch(1);
         private final CountDownLatch allowWriteToFinish = new CountDownLatch(1);
+        private final byte[] readableBytes;
+        private int readPosition;
+        private boolean blockingModeRestored = true;
 
         private BlockingSocketChannel() {
+            this(null);
+        }
+
+        private BlockingSocketChannel(byte[] readableBytes) {
             super(SelectorProvider.provider());
+            this.readableBytes = readableBytes;
         }
 
         boolean awaitWriteStarted() throws InterruptedException {
@@ -145,6 +549,10 @@ class TlsNioSocketTest {
 
         void allowWriteToFinish() {
             allowWriteToFinish.countDown();
+        }
+
+        boolean blockingModeRestored() {
+            return blockingModeRestored;
         }
 
         @Override
@@ -179,7 +587,16 @@ class TlsNioSocketTest {
 
         @Override
         public int read(ByteBuffer dst) {
-            throw new UnsupportedOperationException();
+            if (readableBytes == null) {
+                throw new UnsupportedOperationException();
+            }
+            if (readPosition == readableBytes.length) {
+                return -1;
+            }
+            int length = Math.min(dst.remaining(), readableBytes.length - readPosition);
+            dst.put(readableBytes, readPosition, length);
+            readPosition += length;
+            return length;
         }
 
         @Override
@@ -258,6 +675,7 @@ class TlsNioSocketTest {
 
         @Override
         protected void implConfigureBlocking(boolean block) throws IOException {
+            blockingModeRestored = block;
         }
     }
 }

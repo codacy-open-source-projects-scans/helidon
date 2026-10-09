@@ -16,7 +16,10 @@
 
 package io.helidon.webserver;
 
+import java.io.ByteArrayOutputStream;
 import java.net.Socket;
+import java.net.SocketException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -26,17 +29,75 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 
+import io.helidon.common.configurable.AllowList;
+
 import org.junit.jupiter.api.Test;
 
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class ServerListenerSuspendTest {
+    private static final int SOCKET_TIMEOUT_MILLIS = 5000;
+
+    @Test
+    void failedProxyProtocolSetupReleasesConnectionLimit() throws Exception {
+        WebServer server = WebServer.builder()
+                .port(0)
+                .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
+                .maxTcpConnections(1)
+                .routing(routing -> routing.get("/", (req, res) -> res.send("ok")))
+                .build()
+                .start();
+
+        try {
+            try (Socket malformed = new Socket("127.0.0.1", server.port())) {
+                malformed.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
+                malformed.getOutputStream().write("PROXY \r\n".getBytes(StandardCharsets.US_ASCII));
+                malformed.getOutputStream().flush();
+                try {
+                    assertThat(malformed.getInputStream().read(), is(-1));
+                } catch (SocketException e) {
+                    // Connection reset is also an acceptable close signal for the malformed socket.
+                }
+            }
+
+            String response = "";
+            try (Socket valid = new Socket("127.0.0.1", server.port())) {
+                valid.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
+                valid.getOutputStream()
+                        .write(("PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n"
+                                + "GET / HTTP/1.1\r\n"
+                                + "Host: localhost\r\n"
+                                + "Connection: close\r\n"
+                                + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                valid.getOutputStream().flush();
+                ByteArrayOutputStream responseBytes = new ByteArrayOutputStream();
+                byte[] buffer = new byte[256];
+                do {
+                    int read = valid.getInputStream().read(buffer);
+                    if (read == -1) {
+                        break;
+                    }
+                    responseBytes.write(buffer, 0, read);
+                    response = responseBytes.toString(StandardCharsets.US_ASCII);
+                } while (!response.contains("ok"));
+            }
+
+            assertThat(response, containsString("200 OK"));
+            assertThat(response, containsString("ok"));
+        } finally {
+            server.stop();
+        }
+    }
+
     @Test
     void suspendStopsListenerWaitingOnConnectionLimitDuringCheckpoint() throws Exception {
         LoomServer server = (LoomServer) WebServer.builder()
                 .port(0)
-                .enableProxyProtocol(true)
-                .maxTcpConnections(1)
+                .proxyProtocol(it -> it.trustedProxies(AllowList.builder().allowAll(true).build()))
+                .maxConnections(1)
                 .build()
                 .start();
 
@@ -46,14 +107,12 @@ class ServerListenerSuspendTest {
         boolean suspended = false;
 
         try {
-            ServerListener listener = server.listener(WebServer.DEFAULT_SOCKET_NAME);
-            Thread listenerThread = listener.serverThreads();
             stalledConnection = new Socket("127.0.0.1", server.port());
             queuedConnection = new Socket("127.0.0.1", server.port());
 
             waitFor(Duration.ofSeconds(5),
-                    () -> listenerThread.getState() == Thread.State.TIMED_WAITING,
-                    "listener did not block on the TCP connection limit");
+                    () -> listenerThreadState(WebServer.DEFAULT_SOCKET_NAME) == Thread.State.TIMED_WAITING,
+                    "listener did not block on the connection limit");
 
             Future<?> suspendFuture = executor.submit(server::suspend);
             try {
@@ -78,6 +137,68 @@ class ServerListenerSuspendTest {
         }
     }
 
+    @Test
+    void suspendResumeReleasesConnectionLimitPermitHeldByAccept() throws Exception {
+        LoomServer server = (LoomServer) WebServer.builder()
+                .port(0)
+                .maxConnections(1)
+                .routing(routing -> routing.get("/", (req, res) -> res.send("ok")))
+                .build()
+                .start();
+        boolean suspended = false;
+
+        try {
+            waitFor(Duration.ofSeconds(5),
+                    () -> {
+                        Thread listener = listenerThread(WebServer.DEFAULT_SOCKET_NAME);
+                        if (listener == null) {
+                            return false;
+                        }
+                        for (StackTraceElement element : listener.getStackTrace()) {
+                            if ("accept".equals(element.getMethodName())) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    },
+                    "listener did not block in accept");
+
+            server.suspend();
+            suspended = true;
+            server.resume();
+            suspended = false;
+
+            String response = "";
+            try (Socket valid = new Socket("127.0.0.1", server.port())) {
+                valid.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
+                valid.getOutputStream()
+                        .write(("GET / HTTP/1.1\r\n"
+                                + "Host: localhost\r\n"
+                                + "Connection: close\r\n"
+                                + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                valid.getOutputStream().flush();
+                ByteArrayOutputStream responseBytes = new ByteArrayOutputStream();
+                byte[] buffer = new byte[256];
+                do {
+                    int read = valid.getInputStream().read(buffer);
+                    if (read == -1) {
+                        break;
+                    }
+                    responseBytes.write(buffer, 0, read);
+                    response = responseBytes.toString(StandardCharsets.US_ASCII);
+                } while (!response.contains("ok"));
+            }
+
+            assertThat(response, containsString("200 OK"));
+            assertThat(response, containsString("ok"));
+        } finally {
+            if (suspended) {
+                server.resume();
+            }
+            server.stop();
+        }
+    }
+
     private static void awaitSuspendForCleanup(Future<?> suspendFuture) throws Exception {
         try {
             suspendFuture.get(5, TimeUnit.SECONDS);
@@ -96,6 +217,21 @@ class ServerListenerSuspendTest {
             throw error;
         }
         return e;
+    }
+
+    private static Thread.State listenerThreadState(String socketName) {
+        Thread thread = listenerThread(socketName);
+        return thread == null ? null : thread.getState();
+    }
+
+    private static Thread listenerThread(String socketName) {
+        String threadName = "server-" + socketName + "-listener";
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (threadName.equals(thread.getName())) {
+                return thread;
+            }
+        }
+        return null;
     }
 
     private static void waitFor(Duration timeout, BooleanSupplier condition, String message) throws InterruptedException {

@@ -1,0 +1,781 @@
+/*
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.helidon.declarative.tests.grpc;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+import io.helidon.declarative.tests.grpc.DeclarativeGrpcProto.GreetingReply;
+import io.helidon.declarative.tests.grpc.DeclarativeGrpcProto.GreetingRequest;
+import io.helidon.declarative.tests.grpc.DescriptorTypesProto.Envelope;
+import io.helidon.metrics.api.Counter;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.metrics.api.Tag;
+import io.helidon.metrics.api.Timer;
+import io.helidon.webclient.grpc.RpcClient;
+import io.helidon.webserver.WebServer;
+import io.helidon.webserver.WebServerConfig;
+import io.helidon.webserver.grpc.GrpcReflectionFeature;
+import io.helidon.webserver.testing.junit5.ServerTest;
+import io.helidon.webserver.testing.junit5.SetUpServer;
+
+import com.google.protobuf.DescriptorProtos;
+import com.google.protobuf.Empty;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.Status.Code;
+import io.grpc.StatusRuntimeException;
+import io.grpc.reflection.v1.ServerReflectionGrpc;
+import io.grpc.reflection.v1.ServerReflectionRequest;
+import io.grpc.reflection.v1.ServerReflectionResponse;
+import io.grpc.reflection.v1.ServiceResponse;
+import io.grpc.stub.MetadataUtils;
+import io.grpc.stub.StreamObserver;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+import static io.helidon.common.testing.junit5.MatcherWithRetry.assertThatWithRetry;
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+@ServerTest
+@SuppressWarnings("helidon:api:incubating")
+class DeclarativeGrpcTest {
+    private static final String USERNAME = "tomas";
+    private static final String ADMIN = "admin";
+    private static final String USER = "user";
+    private static final String CLIENT_ATTEMPT_STARTED = "grpc.client.attempt.started";
+    private static final char[] PASSWORD = "changeit".toCharArray();
+
+    private final ManagedChannel channel;
+    private final GreetingServiceGrpc.GreetingServiceBlockingStub blockingStub;
+    private final DefaultSecuredGreetingServiceGrpc.DefaultSecuredGreetingServiceBlockingStub defaultSecuredBlockingStub;
+    private final GreetingServiceGrpc.GreetingServiceStub asyncStub;
+    private final GreetingClient greetingClient;
+    private final ConfiguredGreetingClient configuredGreetingClient;
+    private final NamedRegistryGreetingClient namedRegistryGreetingClient;
+    private final DefaultRegistryGreetingClient defaultRegistryGreetingClient;
+    private final TestSpanExporter exporter;
+
+    @SetUpServer
+    static void setupServer(WebServerConfig.Builder builder) {
+        builder.addFeature(GrpcReflectionFeature.builder().enabled(true).build());
+    }
+
+    DeclarativeGrpcTest(WebServer server,
+                        TestTracerFactory tracerFactory,
+                        @RpcClient.Client GreetingClient greetingClient,
+                        @RpcClient.Client ConfiguredGreetingClient configuredGreetingClient,
+                        @RpcClient.Client NamedRegistryGreetingClient namedRegistryGreetingClient,
+                        @RpcClient.Client DefaultRegistryGreetingClient defaultRegistryGreetingClient) {
+        this.channel = ManagedChannelBuilder.forAddress("localhost", server.port())
+                .usePlaintext()
+                .build();
+        this.blockingStub = GreetingServiceGrpc.newBlockingStub(channel);
+        this.defaultSecuredBlockingStub = DefaultSecuredGreetingServiceGrpc.newBlockingStub(channel);
+        this.asyncStub = GreetingServiceGrpc.newStub(channel);
+        this.greetingClient = greetingClient;
+        this.configuredGreetingClient = configuredGreetingClient;
+        this.namedRegistryGreetingClient = namedRegistryGreetingClient;
+        this.defaultRegistryGreetingClient = defaultRegistryGreetingClient;
+        this.exporter = tracerFactory.exporter();
+    }
+
+    @AfterEach
+    void afterEach() throws InterruptedException {
+        channel.shutdown();
+        assertThat("gRPC channel terminated",
+                   channel.awaitTermination(10, TimeUnit.SECONDS),
+                   is(true));
+    }
+
+    @Test
+    void testUnary() {
+        var response = blockingStub.greet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testOptionalUnaryPresent() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).optionalGreet(request("Tomas"), observer);
+
+        observer.assertSuccess(reply("Hello Tomas"));
+    }
+
+    @Test
+    void testOptionalUnaryEmpty() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).optionalGreet(request("empty"), observer);
+
+        observer.assertFailure(Code.NOT_FOUND,
+                               "No response for gRPC method " + ClientConfigGreetingClients.SERVICE_NAME + "/OptionalGreet");
+    }
+
+    @Test
+    void testOptionalUnaryNull() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).optionalGreet(request("null"), observer);
+
+        observer.assertFailure(Code.INTERNAL,
+                               "Declarative gRPC unary method " + ClientConfigGreetingClients.SERVICE_NAME
+                                       + "/OptionalGreet returned null");
+    }
+
+    @Test
+    void testOptionalUnaryDefaultResponse() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).optionalGreet(request("default"), observer);
+
+        observer.assertSuccess(GreetingReply.getDefaultInstance());
+    }
+
+    @Test
+    void testDirectUnaryNull() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).directGreet(request("null"), observer);
+
+        observer.assertFailure(Code.INTERNAL,
+                               "Declarative gRPC unary method " + ClientConfigGreetingClients.SERVICE_NAME
+                                       + "/DirectGreet returned null");
+    }
+
+    @Test
+    void testDirectUnaryDefaultResponse() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).directGreet(request("default"), observer);
+
+        observer.assertSuccess(GreetingReply.getDefaultInstance());
+    }
+
+    @Test
+    void testOptionalUnaryPreservesStatusAndTrailers() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).optionalGreet(request("denied"), observer);
+
+        var exception = observer.assertFailure(Code.PERMISSION_DENIED, "Greeting is forbidden");
+        assertThat(exception.getTrailers(), notNullValue());
+        assertThat(exception.getTrailers().get(Metadata.Key.of("failure-detail", Metadata.ASCII_STRING_MARSHALLER)),
+                   is("greeting denied"));
+    }
+
+    @Test
+    void testDirectUnaryPreservesStatusAndTrailers() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).directGreet(request("denied"), observer);
+
+        var exception = observer.assertFailure(Code.PERMISSION_DENIED, "Greeting is forbidden");
+        assertThat(exception.getTrailers(), notNullValue());
+        assertThat(exception.getTrailers().get(Metadata.Key.of("failure-detail", Metadata.ASCII_STRING_MARSHALLER)),
+                   is("greeting denied"));
+    }
+
+    @Test
+    void testObserverUnary() throws InterruptedException {
+        var observer = new UnaryResponseObserver();
+
+        asyncStub.withDeadlineAfter(10, TimeUnit.SECONDS).observerGreet(request("Tomas"), observer);
+
+        observer.assertSuccess(reply("Hello Tomas"));
+    }
+
+    @Test
+    void testDeclarativeUnaryClient() {
+        var response = greetingClient.greet(request("Declarative"));
+
+        assertThat(response.getMessage(), is("Hello Declarative"));
+    }
+
+    @Test
+    void testImportedAndNestedProtoTypes() {
+        var stub = DescriptorTypeServiceGrpc.newBlockingStub(channel);
+
+        Envelope.Request nested = stub.importedEmpty(Empty.getDefaultInstance());
+        Empty imported = stub.nested(nested);
+
+        assertThat(nested.getName(), is("imported"));
+        assertThat(imported, is(Empty.getDefaultInstance()));
+    }
+
+    @Test
+    void testDeclarativeClientUsesConfiguredGrpcClientBeforeRegistry() {
+        MeterRegistry meterRegistry = MetricsFactory.getInstance().globalRegistry();
+        long clientCounterBefore = clientAttemptStartedCount(meterRegistry);
+
+        var response = configuredGreetingClient.greet(request("Configured"));
+
+        assertThat(response.getMessage(), is("Hello Configured"));
+        assertThat(clientAttemptStartedCount(meterRegistry), is(clientCounterBefore + 1));
+    }
+
+    @Test
+    void testDeclarativeClientUsesNamedRegistryGrpcClient() {
+        var response = namedRegistryGreetingClient.greet(request("Named Registry"));
+
+        assertThat(response.getMessage(), is("Named registry: Named Registry"));
+    }
+
+    @Test
+    void testDeclarativeClientUsesDefaultRegistryGrpcClientBeforeFallback() {
+        var response = defaultRegistryGreetingClient.greet(request("Default Registry"));
+
+        assertThat(response.getMessage(), is("Default registry: Default Registry"));
+    }
+
+    @Test
+    void testDeclarativeServerStreamingClient() {
+        List<DeclarativeGrpcProto.GreetingReply> replies;
+        try (var responses = greetingClient.split(request("Declarative,Streaming"))) {
+            replies = responses.toList();
+        }
+
+        assertThat(replies,
+                   contains(reply("Hello Declarative"), reply("Hello Streaming")));
+    }
+
+    @Test
+    void testDeclarativeClientStreamingClient() {
+        var response = greetingClient.join(List.of(request("Declarative"), request("Streaming")).stream());
+
+        assertThat(response, is(reply("Hello Declarative, Streaming")));
+    }
+
+    @Test
+    void testDeclarativeBidirectionalStreamingClient() {
+        List<DeclarativeGrpcProto.GreetingReply> replies;
+        try (var responses = greetingClient.chat(List.of(request("Declarative"), request("Streaming")).stream())) {
+            replies = responses.toList();
+        }
+
+        assertThat(replies,
+                   contains(reply("Hello Declarative"), reply("Hello Streaming")));
+    }
+
+    @Test
+    void testUnaryMethodMetrics() {
+        MeterRegistry meterRegistry = MetricsFactory.getInstance().globalRegistry();
+        List<Tag> methodTags = List.of(Tag.create("transport", "grpc"));
+        List<Tag> methodTimerTags = List.of();
+        String grpcGreetMethod = ClientConfigGreetingClients.SERVICE_NAME + "/Greet";
+        List<Tag> grpcMethodTags = List.of(Tag.create("grpc.method", grpcGreetMethod));
+        List<Tag> grpcDurationTags = List.of(Tag.create("grpc.method", grpcGreetMethod),
+                                             Tag.create("grpc.status", "OK"));
+        long methodCounterBefore = counterCount(meterRegistry, "GreetingEndpoint.greet", methodTags);
+        long methodTimerBefore = timerCount(meterRegistry, "grpc-greet", methodTimerTags);
+        long grpcStartedBefore = counterCount(meterRegistry, "grpc.server.call.started", grpcMethodTags);
+        long grpcDurationBefore = timerCount(meterRegistry, "grpc.server.call.duration", grpcDurationTags);
+
+        var response = blockingStub.greet(request("Metrics"));
+
+        assertThat(response.getMessage(), is("Hello Metrics"));
+        assertThat(counterCount(meterRegistry, "GreetingEndpoint.greet", methodTags), is(methodCounterBefore + 1));
+        assertThat(timerCount(meterRegistry, "grpc-greet", methodTimerTags), is(methodTimerBefore + 1));
+        assertThat(counterCount(meterRegistry, "grpc.server.call.started", grpcMethodTags), is(grpcStartedBefore + 1));
+        assertThatWithRetry("gRPC call duration metric",
+                            () -> timerCount(meterRegistry, "grpc.server.call.duration", grpcDurationTags),
+                            is(grpcDurationBefore + 1));
+    }
+
+    @Test
+    void testUnaryMethodTracing() {
+        exporter.clear();
+        long startEpochMillis = System.currentTimeMillis();
+
+        var response = blockingStub.greet(request("Tracing"));
+
+        assertThat(response.getMessage(), is("Hello Tracing"));
+        var spans = exporter.spanData(startEpochMillis, grpcGreetMethod(), "grpc-greet-method");
+        exporter.clear();
+        SpanData grpcSpan = span(spans, grpcGreetMethod());
+        SpanData methodSpan = span(spans, "grpc-greet-method");
+
+        assertThat("gRPC span", grpcSpan, notNullValue());
+        assertThat("declarative method span", methodSpan, notNullValue());
+        assertThat(methodSpan.getTraceId(), is(grpcSpan.getTraceId()));
+        assertThat(methodSpan.getParentSpanId(), is(grpcSpan.getSpanId()));
+        assertThat(methodSpan.getKind(), is(SpanKind.SERVER));
+        assertThat(methodSpan.getAttributes().get(AttributeKey.stringKey("transport")), is("grpc"));
+    }
+
+    @Test
+    void testProtoReflection() throws Exception {
+        ServerReflectionResponse list = reflectionResponse(ServerReflectionRequest.newBuilder()
+                                                                   .setListServices("*")
+                                                                   .build());
+        Set<String> serviceNames = list.getListServicesResponse()
+                .getServiceList()
+                .stream()
+                .map(ServiceResponse::getName)
+                .collect(Collectors.toSet());
+        assertThat(serviceNames.toString(), serviceNames.contains(ClientConfigGreetingClients.SERVICE_NAME), is(true));
+
+        for (String symbol : List.of(ClientConfigGreetingClients.SERVICE_NAME,
+                                     ClientConfigGreetingClients.SERVICE_NAME + ".Greet",
+                                     "io.helidon.declarative.tests.grpc.GreetingRequest")) {
+            ServerReflectionResponse response = reflectionResponse(ServerReflectionRequest.newBuilder()
+                                                                         .setFileContainingSymbol(symbol)
+                                                                         .build());
+            assertThat(response.getFileDescriptorResponse().getFileDescriptorProtoCount(), greaterThan(0));
+        }
+
+        ServerReflectionResponse file = reflectionResponse(ServerReflectionRequest.newBuilder()
+                                                               .setFileByFilename("greeting.proto")
+                                                               .build());
+        var fileResponse = file.getFileDescriptorResponse();
+        assertThat(fileResponse.getFileDescriptorProtoCount(), is(1));
+        DescriptorProtos.FileDescriptorProto descriptor =
+                DescriptorProtos.FileDescriptorProto.parseFrom(fileResponse.getFileDescriptorProto(0));
+        assertThat(descriptor.getName(), is("greeting.proto"));
+        assertThat(descriptor.getPackage(), is("io.helidon.declarative.tests.grpc"));
+        assertThat(descriptor.getService(0).getName(), is("GreetingService"));
+    }
+
+    @Test
+    void testUnaryUsesServiceRegistryInvocation() {
+        var response = blockingStub.interceptedGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas intercepted"));
+    }
+
+    @Test
+    void testValidatedUnary() {
+        GreetingRequestValidatorProvider.reset();
+
+        var response = blockingStub.validatedGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+        assertThat(GreetingRequestValidatorProvider.invocations(), is(1));
+
+        GreetingRequestValidatorProvider.reset();
+
+        var invalid = assertThrows(StatusRuntimeException.class, () -> blockingStub.validatedGreet(request(" ")));
+
+        assertThat(invalid.getStatus().getCode(), is(Code.INVALID_ARGUMENT));
+        assertThat(invalid.getStatus().getDescription(), containsString("name is blank"));
+        assertThat(GreetingRequestValidatorProvider.invocations(), is(1));
+    }
+
+    // Each security outcome gets its own test channel, avoiding reuse after an early rejection.
+    @Test
+    void testSecureUnaryUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class, () -> blockingStub.secureGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testSecureUnary() {
+        var response = authenticatedBlockingStub(USERNAME)
+                .secureGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testAuthorizedUnaryUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class, () -> blockingStub.authorizedGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testAuthorizedUnary() {
+        var response = authenticatedBlockingStub(USERNAME)
+                .authorizedGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testRoleProtectedUnaryUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class, () -> blockingStub.adminGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testRoleProtectedUnaryWrongRole() {
+        var wrongRole = assertThrows(StatusRuntimeException.class,
+                                     () -> authenticatedBlockingStub(USER).adminGreet(request("Tomas")));
+        assertThat(wrongRole.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testRoleProtectedUnary() {
+        var response = authenticatedBlockingStub(ADMIN)
+                .adminGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testServiceRolesUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class,
+                                           () -> defaultSecuredBlockingStub.adminDefaultGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testServiceRolesWrongRole() {
+        var wrongRole = assertThrows(StatusRuntimeException.class,
+                                     () -> authenticatedDefaultSecuredBlockingStub(USER).adminDefaultGreet(request("Tomas")));
+        assertThat(wrongRole.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testServiceRoles() {
+        var adminResponse = authenticatedDefaultSecuredBlockingStub(ADMIN)
+                .adminDefaultGreet(request("Tomas"));
+        assertThat(adminResponse.getMessage(), is("Default secured hello Tomas"));
+    }
+
+    @Test
+    void testPermitAllOverridesServiceRoles() {
+        var permitAllResponse = defaultSecuredBlockingStub.permitAllDefaultGreet(request("Tomas"));
+        assertThat(permitAllResponse.getMessage(), is("Default secured hello Tomas"));
+    }
+
+    @Test
+    void testRoleValidatorOverridesServiceRolesWrongRole() {
+        var request = request("Tomas");
+
+        var wrongRole = assertThrows(StatusRuntimeException.class,
+                                     () -> authenticatedDefaultSecuredBlockingStub(ADMIN)
+                                             .roleValidatorDefaultGreet(request));
+        assertThat(wrongRole.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testRoleValidatorOverridesServiceRoles() {
+        var response = authenticatedDefaultSecuredBlockingStub(USER)
+                .roleValidatorDefaultGreet(request("Tomas"));
+        assertThat(response.getMessage(), is("Default secured hello Tomas"));
+    }
+
+    @Test
+    void testPermitAllUnary() {
+        var response = blockingStub.permitAllGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testInheritedDenyAllUnary() {
+        var denied = assertThrows(StatusRuntimeException.class, () -> blockingStub.denyAllGreet(request("Tomas")));
+
+        assertThat(denied.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testInheritedRoleValidatorUnaryUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class,
+                                           () -> blockingStub.roleValidatorGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testInheritedRoleValidatorUnaryWrongRole() {
+        var wrongRole = assertThrows(StatusRuntimeException.class,
+                                     () -> authenticatedBlockingStub(USER).roleValidatorGreet(request("Tomas")));
+        assertThat(wrongRole.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testInheritedRoleValidatorUnary() {
+        var response = authenticatedBlockingStub(ADMIN)
+                .roleValidatorGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testInheritedScopeProtectedUnaryUnauthenticated() {
+        var request = request("Tomas");
+
+        var unauthenticated = assertThrows(StatusRuntimeException.class,
+                                           () -> blockingStub.scopeGreet(request));
+        assertThat(unauthenticated.getStatus().getCode(), is(Code.UNAUTHENTICATED));
+    }
+
+    @Test
+    void testInheritedScopeProtectedUnary() {
+        var missingScope = assertThrows(StatusRuntimeException.class,
+                                        () -> authenticatedBlockingStub(ADMIN).scopeGreet(request("Tomas")));
+        assertThat(missingScope.getStatus().getCode(), is(Code.PERMISSION_DENIED));
+    }
+
+    @Test
+    void testAuditedUnary() {
+        var response = blockingStub.auditedGreet(request("Tomas"));
+
+        assertThat(response.getMessage(), is("Hello Tomas"));
+    }
+
+    @Test
+    void testServerStreaming() {
+        var responses = blockingStub.split(request("Tomas,Helidon"));
+        var replies = new ArrayList<DeclarativeGrpcProto.GreetingReply>();
+        responses.forEachRemaining(replies::add);
+
+        assertThat(replies,
+                   contains(reply("Hello Tomas"), reply("Hello Helidon")));
+    }
+
+    @Test
+    void testClientStreaming() throws InterruptedException {
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        var replies = new ArrayList<DeclarativeGrpcProto.GreetingReply>();
+        StreamObserver<GreetingRequest> requests = asyncStub.join(new StreamObserver<>() {
+            @Override
+            public void onNext(DeclarativeGrpcProto.GreetingReply response) {
+                replies.add(response);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                error.set(throwable);
+                completed.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                completed.countDown();
+            }
+        });
+
+        requests.onNext(request("Tomas"));
+        requests.onNext(request("Helidon"));
+        requests.onCompleted();
+
+        assertThat("client stream completed",
+                   completed.await(10, TimeUnit.SECONDS),
+                   is(true));
+        assertThat(error.get(), nullValue());
+        assertThat(replies, contains(reply("Hello Tomas, Helidon")));
+    }
+
+    @Test
+    void testBidirectionalStreaming() throws InterruptedException {
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        var replies = new ArrayList<DeclarativeGrpcProto.GreetingReply>();
+        StreamObserver<GreetingRequest> requests = asyncStub.chat(new StreamObserver<>() {
+            @Override
+            public void onNext(DeclarativeGrpcProto.GreetingReply response) {
+                replies.add(response);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                error.set(throwable);
+                completed.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                completed.countDown();
+            }
+        });
+
+        requests.onNext(request("Tomas"));
+        requests.onNext(request("Helidon"));
+        requests.onCompleted();
+
+        assertThat("bidirectional stream completed",
+                   completed.await(10, TimeUnit.SECONDS),
+                   is(true));
+        assertThat(error.get(), nullValue());
+        assertThat(replies,
+                   contains(reply("Hello Tomas"), reply("Hello Helidon")));
+    }
+
+    private static GreetingRequest request(String name) {
+        return GreetingRequest.newBuilder()
+                .setName(name)
+                .build();
+    }
+
+    private static DeclarativeGrpcProto.GreetingReply reply(String message) {
+        return DeclarativeGrpcProto.GreetingReply.newBuilder()
+                .setMessage(message)
+                .build();
+    }
+
+    private GreetingServiceGrpc.GreetingServiceBlockingStub authenticatedBlockingStub(String username) {
+        String token = username + ":" + new String(PASSWORD);
+        Metadata headers = new Metadata();
+        headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER),
+                    "Basic " + Base64.getEncoder().encodeToString(token.getBytes(StandardCharsets.UTF_8)));
+        return blockingStub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
+    }
+
+    private DefaultSecuredGreetingServiceGrpc.DefaultSecuredGreetingServiceBlockingStub authenticatedDefaultSecuredBlockingStub(
+            String username) {
+        String token = username + ":" + new String(PASSWORD);
+        Metadata headers = new Metadata();
+        headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER),
+                    "Basic " + Base64.getEncoder().encodeToString(token.getBytes(StandardCharsets.UTF_8)));
+        return defaultSecuredBlockingStub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
+    }
+
+    private static long counterCount(MeterRegistry meterRegistry, String name, List<Tag> tags) {
+        return meterRegistry.counter(name, tags)
+                .map(Counter::count)
+                .orElse(0L);
+    }
+
+    private static long timerCount(MeterRegistry meterRegistry, String name, List<Tag> tags) {
+        return meterRegistry.timer(name, tags)
+                .map(Timer::count)
+                .orElse(0L);
+    }
+
+    private static long clientAttemptStartedCount(MeterRegistry meterRegistry) {
+        return meterRegistry.meters()
+                .stream()
+                .filter(Counter.class::isInstance)
+                .filter(it -> it.id().name().equals(CLIENT_ATTEMPT_STARTED))
+                .filter(it -> grpcGreetMethod().equals(it.id().tagsMap().get("grpc.method")))
+                .map(Counter.class::cast)
+                .mapToLong(Counter::count)
+                .sum();
+    }
+
+    private static String grpcGreetMethod() {
+        return ClientConfigGreetingClients.SERVICE_NAME + "/Greet";
+    }
+
+    private static SpanData span(List<SpanData> spans, String name) {
+        return spans.stream()
+                .filter(it -> it.getName().equals(name))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private ServerReflectionResponse reflectionResponse(ServerReflectionRequest request) throws InterruptedException {
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<ServerReflectionResponse> response = new AtomicReference<>();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        StreamObserver<ServerReflectionRequest> requests = ServerReflectionGrpc.newStub(channel)
+                .serverReflectionInfo(new StreamObserver<>() {
+                    @Override
+                    public void onNext(ServerReflectionResponse serverReflectionResponse) {
+                        response.set(serverReflectionResponse);
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+                        error.set(throwable);
+                        completed.countDown();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        completed.countDown();
+                    }
+                });
+
+        requests.onNext(request);
+        requests.onCompleted();
+
+        assertThat("reflection request completed",
+                   completed.await(10, TimeUnit.SECONDS),
+                   is(true));
+        assertThat(error.get(), nullValue());
+        assertThat(response.get(), notNullValue());
+        return response.get();
+    }
+
+    private static class UnaryResponseObserver implements StreamObserver<GreetingReply> {
+        private final CountDownLatch terminated = new CountDownLatch(1);
+        private final List<GreetingReply> replies = new ArrayList<>();
+        private Throwable error;
+        private boolean completed;
+
+        @Override
+        public void onNext(GreetingReply response) {
+            replies.add(response);
+        }
+
+        @Override
+        public void onError(Throwable throwable) {
+            error = throwable;
+            terminated.countDown();
+        }
+
+        @Override
+        public void onCompleted() {
+            completed = true;
+            terminated.countDown();
+        }
+
+        void assertSuccess(GreetingReply expected) throws InterruptedException {
+            assertThat("unary response terminated", terminated.await(10, TimeUnit.SECONDS), is(true));
+            assertThat("unary response error", error, nullValue());
+            assertThat("unary response completed", completed, is(true));
+            assertThat(replies, contains(expected));
+        }
+
+        StatusRuntimeException assertFailure(Code expectedCode, String expectedDescription) throws InterruptedException {
+            assertThat("unary response terminated", terminated.await(10, TimeUnit.SECONDS), is(true));
+            assertThat("error response messages", replies, empty());
+            assertThat("error response completed", completed, is(false));
+            assertThat(error, instanceOf(StatusRuntimeException.class));
+            var exception = (StatusRuntimeException) error;
+            assertThat(exception.getStatus().getCode(), is(expectedCode));
+            assertThat(exception.getStatus().getDescription(), is(expectedDescription));
+            return exception;
+        }
+    }
+}

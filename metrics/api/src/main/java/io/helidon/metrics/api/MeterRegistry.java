@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,20 +18,33 @@ package io.helidon.metrics.api;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
+import io.helidon.common.DeprecationSupport;
+import io.helidon.service.registry.Services;
+
 /**
  * Manages the look-up and registration of meters.
+ * <p>
+ * The shared registry obtained from {@link Services} or an
+ * {@link io.helidon.service.registry.ServiceRegistry} is owned and closed by that service registry; application code must not
+ * close it. A custom registry created using {@link MetricsFactory} is owned by the caller, which must close it to release the
+ * registry and any publisher resources it owns.
  */
 public interface MeterRegistry extends Wrapper {
     /**
-     * Creates a meter registry, not saved as the global registry, using default metrics config information based on global
-     * config.
+     * Creates a new meter registry.
+     * For general case where you just need a {@link io.helidon.metrics.api.MeterRegistry}, use
+     * {@link io.helidon.service.registry.Services#get(java.lang.Class) Services.get(MeterRegistry.class)}.
      *
      * @return new meter registry
+     * @deprecated either use {@link io.helidon.service.registry.ServiceRegistry#get(Class)} to get the global meter registry,
+     * or get the {@link MetricsFactory#createMeterRegistry(MetricsConfig)} to get a custom instance
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     static MeterRegistry create() {
         return create(MetricsConfig.create());
     }
@@ -41,9 +54,12 @@ public interface MeterRegistry extends Wrapper {
      *
      * @param metricsConfig metrics config
      * @return new meter registry
+     * @deprecated either use {@link io.helidon.service.registry.ServiceRegistry#get(Class)} to get the global meter registry,
+     * or get the {@link MetricsFactory#createMeterRegistry(MetricsConfig)} to get a custom instance
      */
+    @Deprecated(forRemoval = true, since = "27.0.0")
     static MeterRegistry create(MetricsConfig metricsConfig) {
-        return MetricsFactory.getInstance().createMeterRegistry(metricsConfig);
+        return Services.get(MetricsFactory.class).createMeterRegistry(metricsConfig);
     }
 
     /**
@@ -62,35 +78,98 @@ public interface MeterRegistry extends Wrapper {
     Collection<Meter> meters(Predicate<Meter> filter);
 
     /**
-     * Returns previously-registered meters which match one of the specified scopes.
+     * Returns all previously-registered meters, ignoring the scope selection.
      *
-     * @param scopeSelection scopes to match
-     * @return matching meters
+     * @param scopeSelection ignored; must not be {@code null}
+     * @return all registered meters
+     * @deprecated Use {@link #meters()}. Scope selection is ignored and this method will be removed.
      */
-    Iterable<Meter> meters(Iterable<String> scopeSelection);
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    default Iterable<Meter> meters(Iterable<String> scopeSelection) {
+        Objects.requireNonNull(scopeSelection);
+        return meters();
+    }
 
     /**
-     * Returns the scopes (if any) as represented by tags on meter IDs.
+     * Always returns an empty iterable and will be removed.
      *
-     * @return scopes across all registered meters
+     * @return empty iterable
+     * @deprecated Always returns an empty iterable and will be removed.
      */
-    Iterable<String> scopes();
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    default Iterable<String> scopes() {
+        return List.of();
+    }
 
     /**
-     * Closes the meter registry.
+     * Closes this meter registry and the resources it owns, including publisher registries.
+     * Callers must close custom registries they create using {@link MetricsFactory}. The
+     * {@link io.helidon.service.registry.ServiceRegistry} closes its shared registry; application code must not close that
+     * registry.
      */
     void close();
 
     /**
-     * Returns whether the specified meter is enabled or not, based on whether the meter registry as a whole is enabled and also
-     * whether the config settings for filtering include and exclude indicate the specific meter is enabled.
+     * Returns whether any meter with the specified name can be enabled, regardless of its tags.
+     * A {@code false} result guarantees that no tag combination is enabled. A {@code true} result still permits
+     * tag-dependent filtering by {@link #isMeterEnabled(String, Map)}.
+     * <p>
+     * The default implementation conservatively returns {@code true}. Implementations can override this method when
+     * they can determine enablement without knowing the tags.
+     *
+     * @param name name of the meter to check
+     * @return false if every meter with this name is disabled; true otherwise
+     * @since 28.0.0
+     */
+    default boolean isMeterEnabled(String name) {
+        Objects.requireNonNull(name);
+        return true;
+    }
+
+    /**
+     * Returns whether the specified meter is enabled.
+     * <p>
+     * The default implementation delegates to the deprecated overload for compatibility with existing implementations.
+     * Implementations should override this method to apply provider-neutral enablement rules. Legacy implementations
+     * which override the deprecated overload continue to work.
+     *
+     * @param name name of the meter to check
+     * @param tags tags of the meter to check
+     * @return true if the meter is enabled; false otherwise
+     */
+    default boolean isMeterEnabled(String name, Map<String, String> tags) {
+        Objects.requireNonNull(name);
+        Objects.requireNonNull(tags);
+
+        DeprecationSupport.requireOverride(this,
+                                           MeterRegistry.class,
+                                           "isMeterEnabled",
+                                           String.class,
+                                           Map.class,
+                                           Optional.class);
+
+        return isMeterEnabled(name, tags, Optional.empty());
+    }
+
+    /**
+     * Returns whether the specified meter is enabled, ignoring the scope.
+     * <p>
+     * The default implementation delegates to {@link #isMeterEnabled(String, Map)}. Implementations must override either
+     * this method or the scope-free overload.
      *
      * @param name  name of the meter to check
      * @param tags  tags of the meter to check
-     * @param scope scope, if present, of the meter to check
-     * @return true if the meter (and its meter registry) are enabled; false otherwise
+     * @param scope ignored; must not be {@code null}
+     * @return true if the meter is enabled; false otherwise
+     * @deprecated Use {@link #isMeterEnabled(String, Map)}. Scope is ignored and this method will be removed.
      */
-    boolean isMeterEnabled(String name, Map<String, String> tags, Optional<String> scope);
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    default boolean isMeterEnabled(String name, Map<String, String> tags, Optional<String> scope) {
+        Objects.requireNonNull(name);
+        Objects.requireNonNull(tags);
+        Objects.requireNonNull(scope);
+        return isMeterEnabled(name, tags);
+    }
 
     /**
      * Returns the default {@link io.helidon.metrics.api.Clock} in use by the registry.
@@ -186,13 +265,19 @@ public interface MeterRegistry extends Wrapper {
     Optional<Meter> remove(Meter.Id id);
 
     /**
-     * Removes a previously-registered meter with the specified ID and scope.
+     * Removes a previously-registered meter with the specified ID, ignoring the scope.
      *
      * @param id    ID for the meter to remove
-     * @param scope scope of the meter to remove
-     * @return the removed meter; empty if the specified ID and scope do not correspond to a registered meter
+     * @param scope ignored; must not be {@code null}
+     * @return the removed meter; empty if the specified ID does not correspond to a registered meter
+     * @deprecated Use {@link #remove(Meter.Id)}. Scope is ignored and this method will be removed.
      */
-    Optional<Meter> remove(Meter.Id id, String scope);
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    default Optional<Meter> remove(Meter.Id id, String scope) {
+        Objects.requireNonNull(id);
+        Objects.requireNonNull(scope);
+        return remove(id);
+    }
 
     /**
      * Removes a previously-registered meter with the specified name and tags.
@@ -204,14 +289,21 @@ public interface MeterRegistry extends Wrapper {
     Optional<Meter> remove(String name, Iterable<Tag> tags);
 
     /**
-     * Removes a previously-registered meter with the specified name, tags, and scope.
+     * Removes a previously-registered meter with the specified name and tags, ignoring the scope.
      *
      * @param name  meter name
      * @param tags  tags for further identifying the meter
-     * @param scope scope within which to locate the meter
-     * @return the removed meter; empty if the specified name, tags, and scope do not correspond to a registered meter
+     * @param scope ignored; must not be {@code null}
+     * @return the removed meter; empty if the specified name and tags do not correspond to a registered meter
+     * @deprecated Use {@link #remove(String, Iterable)}. Scope is ignored and this method will be removed.
      */
-    Optional<Meter> remove(String name, Iterable<Tag> tags, String scope);
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    default Optional<Meter> remove(String name, Iterable<Tag> tags, String scope) {
+        Objects.requireNonNull(name);
+        Objects.requireNonNull(tags);
+        Objects.requireNonNull(scope);
+        return remove(name, tags);
+    }
 
     /**
      * Indicates if the meter has been deleted.
@@ -236,6 +328,18 @@ public interface MeterRegistry extends Wrapper {
      * @return the meter registry
      */
     MeterRegistry onMeterRemoved(Consumer<Meter> onRemoveListener);
+
+    /**
+     * Metrics factory that created this registry.
+     * <p>
+     * The default implementation returns the shared metrics factory from the service registry for compatibility.
+     * Implementations created by a different factory must override this method and return that factory.
+     *
+     * @return metrics factory
+     */
+    default MetricsFactory metricsFactory() {
+        return Services.get(MetricsFactory.class);
+    }
 
     /**
      * Builder for creating a new meter registry.

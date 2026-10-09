@@ -20,8 +20,10 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.net.UnixDomainSocketAddress;
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 import io.helidon.common.GenericType;
@@ -76,6 +78,36 @@ public interface ClientRequest<T extends ClientRequest<T>> {
     T tls(Tls tls);
 
     /**
+     * Configure client-side TLS SNI for this request.
+     * <p>
+     * Request-level SNI overrides client-level SNI. A configured SNI host is also used as the TLS peer host for
+     * endpoint identification.
+     *
+     * @param sni SNI configuration
+     * @return updated request
+     */
+    default T sni(SniConfig sni) {
+        Objects.requireNonNull(sni, "sni");
+        throw new UnsupportedOperationException("SNI configuration is not supported by this request implementation");
+    }
+
+    /**
+     * Configure client-side TLS SNI for this request.
+     * <p>
+     * Request-level SNI overrides client-level SNI. A configured SNI host is also used as the TLS peer host for
+     * endpoint identification.
+     *
+     * @param sni SNI configuration builder
+     * @return updated request
+     */
+    default T sni(Consumer<SniConfig.Builder> sni) {
+        Objects.requireNonNull(sni, "sni");
+        SniConfig.Builder builder = SniConfig.builder();
+        sni.accept(builder);
+        return sni(builder.buildPrototype());
+    }
+
+    /**
      * Proxy configuration for this specific request.
      *
      * @param proxy proxy configuration
@@ -95,6 +127,11 @@ public interface ClientRequest<T extends ClientRequest<T>> {
      * Socket address to use. This can be used to connect to a UNIX domain socket.
      * Note that if UNIX domain socket address is configured, all other address configuration is ignored.
      * This includes if it is configured as a base address on the client.
+     * <p>
+     * An {@link java.net.InetSocketAddress} updates the logical URI host and port. A {@link UnixDomainSocketAddress}
+     * overrides the physical transport only, so the request URI, resolved against the client base URI, still provides
+     * the logical HTTP authority. For TLS over a UNIX domain socket, the resolved URI host and port are used for SNI
+     * and endpoint identification, while the UNIX domain socket path is used only for transport.
      *
      * @param socketAddress socket address to use, this will override any other address configuration
      * @return updated request

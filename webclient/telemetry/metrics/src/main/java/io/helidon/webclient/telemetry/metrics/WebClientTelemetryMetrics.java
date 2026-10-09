@@ -17,10 +17,13 @@
 package io.helidon.webclient.telemetry.metrics;
 
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Supplier;
 
 import io.helidon.common.LazyValue;
 import io.helidon.config.Config;
 import io.helidon.http.Status;
+import io.helidon.service.registry.ServiceRegistry;
 import io.helidon.service.registry.Services;
 import io.helidon.telemetry.otelconfig.HelidonOpenTelemetry;
 import io.helidon.webclient.api.WebClientServiceRequest;
@@ -46,7 +49,7 @@ public class WebClientTelemetryMetrics implements WebClientService {
 
     static final String REQUEST_DURATION = "http.client.request.duration";
 
-    static final String HTTP_REQUEST_METHOD = "http.client.request.method";
+    static final String HTTP_REQUEST_METHOD = "http.request.method";
     static final String SERVER_ADDRESS = "server.address";
     static final String SERVER_PORT = "server.port";
     static final String ERROR_TYPE = "error.type";
@@ -54,10 +57,16 @@ public class WebClientTelemetryMetrics implements WebClientService {
     static final String URL_SCHEME = "url.scheme";
     static final String URL_TEMPLATE = "url.template";
 
-    private final LazyValue<DoubleHistogram> outboundHttpRequestDuration =
-            LazyValue.create(WebClientTelemetryMetrics::createHistogram);
+    private static final String OTHER_METHOD = "_OTHER";
+
+    private final LazyValue<DoubleHistogram> outboundHttpRequestDuration;
 
     private WebClientTelemetryMetrics() {
+        this(WebClientTelemetryMetrics::createHistogram);
+    }
+
+    private WebClientTelemetryMetrics(Supplier<DoubleHistogram> histogramSupplier) {
+        outboundHttpRequestDuration = LazyValue.create(histogramSupplier);
     }
 
     /**
@@ -79,6 +88,20 @@ public class WebClientTelemetryMetrics implements WebClientService {
         return create();
     }
 
+    /**
+     * Creates a new instance of the telemetry metrics service using the provided configuration and service registry.
+     *
+     * @param config telemetry metrics configuration
+     * @param serviceRegistry service registry which owns this service
+     * @return telemetry metrics service initialized using the configuration and service registry
+     */
+    public static WebClientTelemetryMetrics create(Config config, ServiceRegistry serviceRegistry) {
+        Objects.requireNonNull(config);
+        ServiceRegistry owningRegistry = Objects.requireNonNull(serviceRegistry);
+        return new WebClientTelemetryMetrics(() -> createHistogram(owningRegistry.get(Config.class),
+                                                                   owningRegistry.get(OpenTelemetry.class)));
+    }
+
     @Override
     public WebClientServiceResponse handle(Chain chain, WebClientServiceRequest clientRequest) {
         long startTime = System.nanoTime();
@@ -95,8 +118,10 @@ public class WebClientTelemetryMetrics implements WebClientService {
             throw ex;
         } finally {
             long endTime = System.nanoTime();
+            String requestMethod = clientRequest.method().text();
+            String knownMethod = knownMethod(requestMethod);
             var attributes = Attributes.builder()
-                    .put(HTTP_REQUEST_METHOD, clientRequest.method().text())
+                    .put(HTTP_REQUEST_METHOD, knownMethod == null ? OTHER_METHOD : knownMethod)
                     .put(SERVER_ADDRESS, clientRequest.uri().host())
                     .put(SERVER_PORT, clientRequest.uri().port())
                     .put(ERROR_TYPE, errorType)
@@ -105,16 +130,26 @@ public class WebClientTelemetryMetrics implements WebClientService {
                     .put(URL_TEMPLATE, clientRequest.uri().path().path())
                     .build();
 
-            outboundHttpRequestDuration.get().record(endTime - startTime, attributes);
+            outboundHttpRequestDuration.get().record((endTime - startTime) / 1_000_000_000.0, attributes);
         }
     }
 
+    private static String knownMethod(String method) {
+        return switch (method) {
+        case "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY", "TRACE" -> method;
+        default -> null;
+        };
+    }
+
     private static DoubleHistogram createHistogram() {
-        var config = Services.get(Config.class);
+        return createHistogram(Services.get(Config.class), Services.get(OpenTelemetry.class));
+    }
+
+    private static DoubleHistogram createHistogram(Config config, OpenTelemetry openTelemetry) {
         HelidonOpenTelemetry helidonOpenTelemetry = HelidonOpenTelemetry.builder()
                 .config(config.get(HelidonOpenTelemetry.CONFIG_KEY))
                 .build();
-        return Services.get(OpenTelemetry.class)
+        return openTelemetry
                 .getMeterProvider()
                 .get(helidonOpenTelemetry.prototype().service())
                 .histogramBuilder(REQUEST_DURATION)

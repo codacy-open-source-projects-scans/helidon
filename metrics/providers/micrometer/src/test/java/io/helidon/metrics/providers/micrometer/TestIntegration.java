@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,25 +15,40 @@
  */
 package io.helidon.metrics.providers.micrometer;
 
+import java.util.Map;
+
 import io.helidon.common.testing.junit5.OptionalMatcher;
 import io.helidon.metrics.api.Counter;
 import io.helidon.metrics.api.Meter;
 import io.helidon.metrics.api.MeterRegistry;
-import io.helidon.metrics.api.Metrics;
+import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.service.registry.Services;
+import io.helidon.testing.junit5.Testing;
 
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
+@Testing.Test(perMethod = true)
 class TestIntegration {
+
+    @Test
+    void rejectsNullMeterEnablementArguments() {
+        MeterRegistry meterRegistry = Services.get(MeterRegistry.class);
+
+        assertThrows(NullPointerException.class, () -> meterRegistry.isMeterEnabled(null, Map.of()));
+        assertThrows(NullPointerException.class, () -> meterRegistry.isMeterEnabled("test", null));
+    }
 
     @Test
     void testHelidonRegistrationViaMicrometer() {
 
-        MeterRegistry hMeterRegistry = Metrics.globalRegistry();
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MeterRegistry hMeterRegistry = Services.get(MeterRegistry.class);
 
-        Counter hCounter = hMeterRegistry.getOrCreate(Counter.builder("hCounter1"));
+        Counter hCounter = hMeterRegistry.getOrCreate(metricsFactory.counterBuilder("hCounter1"));
         hCounter.increment(2);
 
         io.micrometer.core.instrument.Counter unwrappedCounter = hCounter.unwrap(io.micrometer.core.instrument.Counter.class);
@@ -43,20 +58,23 @@ class TestIntegration {
 
         assertThat("hCounter via Helidon unwrap after Micrometer increment", hCounter.count(), equalTo(5L));
 
-        io.micrometer.core.instrument.MeterRegistry mMeterRegistry = io.micrometer.core.instrument.Metrics.globalRegistry;
-        io.micrometer.core.instrument.Counter mCounter = mMeterRegistry.counter("hCounter1", "scope", "application");
+        io.micrometer.core.instrument.MeterRegistry mMeterRegistry =
+                hMeterRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class);
+        io.micrometer.core.instrument.Counter mCounter = mMeterRegistry.counter("hCounter1");
         assertThat("hCounter via Micrometer meter registry", mCounter.count(), equalTo(5D));
     }
 
     @Test
     void testMicrometerRegistrationViaHelidon() {
-        MeterRegistry hMeterRegistry = Metrics.globalRegistry();
-        io.micrometer.core.instrument.MeterRegistry mMeterRegistry = io.micrometer.core.instrument.Metrics.globalRegistry;
-        io.micrometer.core.instrument.Counter mCounter = mMeterRegistry.counter("mCounter1", "scope", "application");
+        MetricsFactory metricsFactory = Services.get(MetricsFactory.class);
+        MeterRegistry hMeterRegistry = Services.get(MeterRegistry.class);
+        io.micrometer.core.instrument.MeterRegistry mMeterRegistry =
+                hMeterRegistry.unwrap(io.micrometer.core.instrument.MeterRegistry.class);
+        io.micrometer.core.instrument.Counter mCounter = mMeterRegistry.counter("mCounter1");
         mCounter.increment(2);
 
         // Should find the previously-registered counter.
-        Counter hCounter = hMeterRegistry.getOrCreate(Counter.builder("mCounter1"));
+        Counter hCounter = hMeterRegistry.getOrCreate(metricsFactory.counterBuilder("mCounter1"));
         assertThat("mCounter via Helidon with no explicit tag",
                    hCounter.count(),
                    equalTo(2L));

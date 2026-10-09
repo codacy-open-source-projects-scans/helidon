@@ -15,10 +15,14 @@
  */
 package io.helidon.http.http2;
 
-import java.util.concurrent.Semaphore;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 import static java.lang.System.Logger.Level.DEBUG;
 
@@ -47,7 +51,14 @@ abstract class WindowSizeImpl implements WindowSize {
         // When the value of SETTINGS_INITIAL_WINDOW_SIZE changes,
         // a receiver MUST adjust the size of all stream flow-control windows that
         // it maintains by the difference between the new value and the old value
-        remainingWindowSize.updateAndGet(o -> o + size - windowSize);
+        int previousWindowSize = windowSize;
+        remainingWindowSize.updateAndGet(o -> {
+            long newSize = (long) o + size - previousWindowSize;
+            if (newSize > MAX_WIN_SIZE) {
+                throw new Http2Exception(Http2ErrorCode.FLOW_CONTROL, "Window size too big.");
+            }
+            return (int) newSize;
+        });
         windowSize = size;
         if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
             LOGGER_OUTBOUND.log(DEBUG, String.format("%s OFC STR %d: Recv INITIAL_WINDOW_SIZE %d(%d)",
@@ -121,12 +132,14 @@ abstract class WindowSizeImpl implements WindowSize {
      */
     static final class Outbound extends WindowSizeImpl implements WindowSize.Outbound {
 
-        private static final int BACKOFF_MIN = 50;
-        private static final int BACKOFF_MAX = 5000;
-        private final Semaphore updatedSemaphore = new Semaphore(1);
+        private final ReentrantLock updateLock = new ReentrantLock();
+        private final Condition updated = updateLock.newCondition();
         private final ConnectionFlowControl.Type type;
         private final int streamId;
         private final long timeoutMillis;
+        private boolean connectionClosed;
+        private volatile boolean streamClosed;
+        private Set<ConnectionWindowWaiter> connectionWindowWaiters;
 
         Outbound(ConnectionFlowControl.Type type, int streamId, ConnectionFlowControl connectionFlowControl) {
             super(type, streamId, connectionFlowControl.initialWindowSize());
@@ -137,51 +150,172 @@ abstract class WindowSizeImpl implements WindowSize {
 
         @Override
         public long incrementWindowSize(int increment) {
-            long remaining = super.incrementWindowSize(increment);
-            if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
-                LOGGER_OUTBOUND.log(DEBUG, String.format("%s OFC STR %d: +%d(%d)", type, streamId, increment, remaining));
+            long remaining;
+            updateLock.lock();
+            try {
+                remaining = super.incrementWindowSize(increment);
+                updated.signalAll();
+                signalConnectionWindowWaiters();
+            } finally {
+                updateLock.unlock();
             }
-            triggerUpdate();
+            if (LOGGER_OUTBOUND.isLoggable(DEBUG)) {
+                LOGGER_OUTBOUND.log(DEBUG,
+                                    String.format("%s OFC STR %d: +%d(%d)", type, streamId, increment, remaining));
+            }
             return remaining;
         }
 
         @Override
         public void resetWindowSize(int size) {
-            super.resetWindowSize(size);
-            triggerUpdate();
+            updateLock.lock();
+            try {
+                super.resetWindowSize(size);
+                updated.signalAll();
+                signalConnectionWindowWaiters();
+            } finally {
+                updateLock.unlock();
+            }
         }
 
         @Override
         public int decrementWindowSize(int decrement) {
-            int n = super.decrementWindowSize(decrement);
-            triggerUpdate();
-            return n;
+            return super.decrementWindowSize(decrement);
         }
 
         @Override
         public void triggerUpdate() {
-            updatedSemaphore.release();
+            updateLock.lock();
+            try {
+                updated.signalAll();
+                signalConnectionWindowWaiters();
+            } finally {
+                updateLock.unlock();
+            }
+        }
+
+        void connectionClosed() {
+            updateLock.lock();
+            try {
+                connectionClosed = true;
+                updated.signalAll();
+                signalConnectionWindowWaiters();
+            } finally {
+                updateLock.unlock();
+            }
+        }
+
+        void streamClosed() {
+            updateLock.lock();
+            try {
+                streamClosed = true;
+                updated.signalAll();
+            } finally {
+                updateLock.unlock();
+            }
+        }
+
+        boolean isStreamClosed() {
+            return streamClosed;
+        }
+
+        ConnectionWindowWaiter createConnectionWindowWaiter(BooleanSupplier streamClosed) {
+            return new ConnectionWindowWaiter(updateLock.newCondition(), streamClosed);
+        }
+
+        void triggerUpdate(ConnectionWindowWaiter waiter) {
+            updateLock.lock();
+            try {
+                waiter.updated.signalAll();
+            } finally {
+                updateLock.unlock();
+            }
         }
 
         @Override
         public void blockTillUpdate() {
-            var startTime = System.currentTimeMillis();
-            int backoff = BACKOFF_MIN;
-            while (getRemainingWindowSize() < 1) {
-                try {
-                    updatedSemaphore.drainPermits();
-                    var _ = updatedSemaphore.tryAcquire(backoff, TimeUnit.MILLISECONDS);
-                    // linear deterministic backoff
-                    backoff = Math.min(backoff * 2, BACKOFF_MAX);
-                } catch (InterruptedException e) {
-                    debugLog("%s OFC STR %d: Window depleted, waiting for update interrupted.", e);
-                    throw new Http2Exception(Http2ErrorCode.FLOW_CONTROL, "Flow control update wait interrupted.");
+            blockTillUpdate(null);
+        }
+
+        void blockTillUpdate(ConnectionWindowWaiter connectionWindowWaiter) {
+            var startTime = System.nanoTime();
+            long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+            try {
+                while (true) {
+                    boolean timedOut;
+                    boolean waiting;
+                    updateLock.lock();
+                    try {
+                        if (connectionClosed) {
+                            throw new Http2Exception(Http2ErrorCode.CANCEL,
+                                                     "Connection closed while waiting for a flow control update.");
+                        }
+                        if (streamClosed
+                                || (connectionWindowWaiter != null
+                                && connectionWindowWaiter.streamClosed.getAsBoolean())) {
+                            throw new Http2Exception(Http2ErrorCode.CANCEL,
+                                                     "Stream closed while waiting for a flow control update.");
+                        }
+                        // Updates acquire this lock, so the predicate check and await enrollment are atomic.
+                        int remainingWindowSize = getRemainingWindowSize();
+                        long elapsedNanos = System.nanoTime() - startTime;
+                        if (elapsedNanos >= timeoutNanos) {
+                            timedOut = true;
+                            waiting = false;
+                        } else if (remainingWindowSize > 0) {
+                            return;
+                        } else {
+                            timedOut = false;
+                            long remainingNanos = timeoutNanos - elapsedNanos;
+                            Condition waitCondition = updated;
+                            if (connectionWindowWaiter != null) {
+                                register(connectionWindowWaiter);
+                                waitCondition = connectionWindowWaiter.updated;
+                            }
+                            try {
+                                var _ = waitCondition.await(remainingNanos, TimeUnit.NANOSECONDS);
+                            } finally {
+                                if (connectionWindowWaiter != null) {
+                                    unregister(connectionWindowWaiter);
+                                }
+                            }
+                            waiting = getRemainingWindowSize() < 1;
+                        }
+                    } finally {
+                        updateLock.unlock();
+                    }
+                    if (timedOut) {
+                        debugLog("%s OFC STR %d: Window depleted, waiting for update time-out.", null);
+                        throw new Http2Exception(Http2ErrorCode.FLOW_CONTROL, "Flow control update wait time-out.");
+                    }
+                    if (waiting) {
+                        debugLog("%s OFC STR %d: Window depleted, waiting for update.", null);
+                    }
                 }
-                if (System.currentTimeMillis() - startTime > timeoutMillis) {
-                    debugLog("%s OFC STR %d: Window depleted, waiting for update time-out.", null);
-                    throw new Http2Exception(Http2ErrorCode.FLOW_CONTROL, "Flow control update wait time-out.");
+            } catch (InterruptedException e) {
+                debugLog("%s OFC STR %d: Window depleted, waiting for update interrupted.", e);
+                throw new Http2Exception(Http2ErrorCode.FLOW_CONTROL, "Flow control update wait interrupted.");
+            }
+        }
+
+        private void register(ConnectionWindowWaiter waiter) {
+            if (waiter.activeBlocks++ == 0) {
+                if (connectionWindowWaiters == null) {
+                    connectionWindowWaiters = new HashSet<>();
                 }
-                debugLog("%s OFC STR %d: Window depleted, waiting for update.", null);
+                connectionWindowWaiters.add(waiter);
+            }
+        }
+
+        private void unregister(ConnectionWindowWaiter waiter) {
+            if (--waiter.activeBlocks == 0) {
+                connectionWindowWaiters.remove(waiter);
+            }
+        }
+
+        private void signalConnectionWindowWaiters() {
+            if (connectionWindowWaiters != null) {
+                connectionWindowWaiters.forEach(waiter -> waiter.updated.signalAll());
             }
         }
 
@@ -192,6 +326,17 @@ abstract class WindowSizeImpl implements WindowSize {
                 } else {
                     LOGGER_OUTBOUND.log(DEBUG, String.format(message, type, streamId));
                 }
+            }
+        }
+
+        static final class ConnectionWindowWaiter {
+            private final Condition updated;
+            private final BooleanSupplier streamClosed;
+            private int activeBlocks;
+
+            private ConnectionWindowWaiter(Condition updated, BooleanSupplier streamClosed) {
+                this.updated = updated;
+                this.streamClosed = streamClosed;
             }
         }
     }

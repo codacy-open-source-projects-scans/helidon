@@ -25,10 +25,13 @@ import java.lang.annotation.Target;
 import java.util.List;
 import java.util.Set;
 
+import io.helidon.common.Api;
+
 /**
  * Prototype is generated from a prototype blueprint, and it is expected to be part of the public API of the module.
  * This class holds all types related to generating prototypes form a blueprint.
  */
+@Api.Stable
 public final class Prototype {
     private Prototype() {
     }
@@ -52,6 +55,9 @@ public final class Prototype {
         /**
          * Create an instance of the {@link Prototype}. This method is available on
          * all generated builders for {@link Prototype.Blueprint}.
+         * <p>
+         * Calling this method may update the builder from providers and decorators, so repeated calls may have side
+         * effects such as repeated provider discovery.
          *
          * @return an instance of the setup object created from this builder
          */
@@ -170,6 +176,19 @@ public final class Prototype {
     }
 
     /**
+     * Generate the prototype API as a sealed interface.
+     * <p>
+     * The generated prototype cannot be extended and must be a leaf in a prototype hierarchy. Its generated
+     * implementation is private and final.
+     * <p>
+     * This annotation must be used together with {@link Prototype.Blueprint}.
+     */
+    @Target(ElementType.TYPE)
+    @Retention(RetentionPolicy.CLASS)
+    public @interface Sealed {
+    }
+
+    /**
      * A blueprint annotated with this annotation will create a prototype that can be created from a
      * {@code io.helidon.config.Config} instance. The builder will also have a method {@code config(Config)} that
      * reads all options annotated with {@link io.helidon.builder.api.Option.Configured} from the config.
@@ -193,6 +212,14 @@ public final class Prototype {
          * @return whether this is a root node, ignored if {@link #value()} is an empty string
          */
         boolean root() default true;
+
+        /**
+         * Whether to include this type in generated configuration metadata.
+         * This setting does not affect configuration reading.
+         *
+         * @return whether to include this type in generated configuration metadata
+         */
+        boolean metadata() default true;
     }
 
     /**
@@ -469,8 +496,10 @@ public final class Prototype {
      * metadata file will be generated for the service provider interfaces.
      * <p>
      * Simply add this annotation to your {@link io.helidon.builder.api.Prototype.Blueprint} type to enable service registry.
-     * Note that if this annotation is NOT present, service registry would not be used, and {@link java.util.ServiceLoader}
-     * is used instead.
+     * If this annotation is not present, registry support is inherited from the nearest parent blueprint or prototype.
+     * If no parent enables registry support, {@link java.util.ServiceLoader} is used instead. An explicit value of
+     * {@code false} disables registry discovery for provider options declared by the annotated blueprint, without removing
+     * registry support already owned by its parent builder.
      * <p>
      * When using this annotation, you cannot use {@code serviceRegistry} as a custom option in your blueprint, as it will
      * be added by the annotation processor, to allow customization of the registry instance.
@@ -524,6 +553,7 @@ public final class Prototype {
     @Target(ElementType.TYPE)
     @Retention(RetentionPolicy.CLASS)
     @Repeatable(Extensions.class)
+    @io.helidon.common.Api.Incubating
     public @interface Extension {
         /**
          * Type the extension supports, see documentation of appropriate extension.
@@ -539,6 +569,7 @@ public final class Prototype {
      */
     @Target(ElementType.TYPE)
     @Retention(RetentionPolicy.CLASS)
+    @io.helidon.common.Api.Incubating
     public @interface Extensions {
         /**
          * Extensions to use.

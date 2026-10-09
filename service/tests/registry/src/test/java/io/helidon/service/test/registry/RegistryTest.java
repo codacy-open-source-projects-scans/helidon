@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,13 @@ package io.helidon.service.test.registry;
 import java.util.List;
 import java.util.function.Supplier;
 
+import io.helidon.common.types.TypeName;
+import io.helidon.service.registry.Qualifier;
+import io.helidon.service.registry.ServiceLoader__ServiceDescriptor;
 import io.helidon.service.registry.ServiceRegistry;
+import io.helidon.service.registry.ServiceRegistryConfig;
 import io.helidon.service.registry.ServiceRegistryManager;
+import io.helidon.service.registry.Services;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -29,6 +34,7 @@ import org.junit.jupiter.api.Test;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasSize;
@@ -72,6 +78,299 @@ public class RegistryTest {
     }
 
     @Test
+    public void testRegistryFirstActive() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveService.instances = 0;
+
+        try {
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).isEmpty(), is(true));
+            assertThat(FirstActiveService.instances, is(0));
+
+            FirstActiveContract activated = serviceRegistry.get(FirstActiveContract.class);
+            assertThat(activated, notNullValue());
+            assertThat(FirstActiveService.instances, is(1));
+
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).orElseThrow(), sameInstance(activated));
+            assertThat(FirstActiveService.instances, is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryAllActive() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveService.instances = 0;
+        FirstActiveContract first = new FirstActiveContract() {
+        };
+        FirstActiveContract second = new FirstActiveContract() {
+        };
+
+        Services.registry(serviceRegistry);
+        try {
+            assertThat(serviceRegistry.allActive(FirstActiveContract.class), hasSize(0));
+            assertThat(FirstActiveService.instances, is(0));
+
+            Services.set(FirstActiveContract.class, first, second);
+
+            List<FirstActiveContract> active = serviceRegistry.allActive(FirstActiveContract.class);
+            assertThat(active, hasSize(2));
+            assertThat(active.get(0), sameInstance(first));
+            assertThat(active.get(1), sameInstance(second));
+            assertThat(FirstActiveService.instances, is(0));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotBlockSet() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveService.instances = 0;
+        FirstActiveContract explicit = new FirstActiveContract() {
+        };
+
+        Services.registry(serviceRegistry);
+        try {
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).isEmpty(), is(true));
+            assertThat(FirstActiveService.instances, is(0));
+
+            Services.set(FirstActiveContract.class, explicit);
+
+            assertThat(serviceRegistry.get(FirstActiveContract.class), sameInstance(explicit));
+            assertThat(FirstActiveService.instances, is(0));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotBlockSetByServiceType() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveService.instances = 0;
+
+        Services.registry(serviceRegistry);
+        try {
+            assertThat(serviceRegistry.firstActive(FirstActiveService.class).isEmpty(), is(true));
+            assertThat(FirstActiveService.instances, is(0));
+
+            FirstActiveService explicit = new FirstActiveService();
+            Services.set(FirstActiveService.class, explicit);
+
+            assertThat(serviceRegistry.firstActive(FirstActiveService.class).orElseThrow(), sameInstance(explicit));
+            assertThat(serviceRegistry.get(FirstActiveService.class), sameInstance(explicit));
+            assertThat(FirstActiveService.instances, is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveReturnsSetInstance() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveService.instances = 0;
+        FirstActiveContract explicit = new FirstActiveContract() {
+        };
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.set(FirstActiveContract.class, explicit);
+
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).orElseThrow(), sameInstance(explicit));
+            assertThat(FirstActiveService.instances, is(0));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveReturnsQualifiedSetInstance() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveContract explicit = new FirstActiveContract() {
+        };
+        Qualifier qualifier = Qualifier.createNamed("explicit");
+        Qualifier otherQualifier = Qualifier.createNamed("other");
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.setQualified(FirstActiveContract.class, explicit, qualifier);
+
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class, otherQualifier).isEmpty(), is(true));
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class, qualifier).orElseThrow(),
+                       sameInstance(explicit));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotReturnDestroyedSetInstance() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        FirstActiveContract explicit = new FirstActiveContract() {
+        };
+        boolean shutDown = false;
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.set(FirstActiveContract.class, explicit);
+
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).orElseThrow(), sameInstance(explicit));
+
+            manager.shutdown();
+            shutDown = true;
+
+            assertThat(serviceRegistry.firstActive(FirstActiveContract.class).isEmpty(), is(true));
+        } finally {
+            if (!shutDown) {
+                manager.shutdown();
+            }
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotCreatePerLookupInstance() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        ServiceSupplier.reset();
+
+        try {
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(ServiceSupplier.instances(), is(0));
+
+            Supplier<SuppliedContract> supplier = serviceRegistry.supply(SuppliedContract.class);
+            SuppliedContract first = supplier.get();
+            assertThat(first.message(), is("Supplied:1"));
+
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(ServiceSupplier.instances(), is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotCreateFixedPerLookupInstance() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create();
+        ServiceRegistry serviceRegistry = manager.registry();
+        ServiceSupplier.reset();
+        ServiceSupplier explicit = new ServiceSupplier();
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.set(ServiceSupplier.class, explicit);
+
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(ServiceSupplier.instances(), is(0));
+
+            assertThat(serviceRegistry.firstActive(ServiceSupplier.class).orElseThrow(), sameInstance(explicit));
+            assertThat(ServiceSupplier.instances(), is(0));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotCreateFixedSingletonSupplierProduct() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create(ServiceRegistryConfig.builder()
+                                                                               .discoverServices(false)
+                                                                               .addServiceDescriptor(
+                                                                                       SingletonServiceSupplier__ServiceDescriptor.INSTANCE)
+                                                                               .build());
+        ServiceRegistry serviceRegistry = manager.registry();
+        SingletonServiceSupplier explicit = new SingletonServiceSupplier(serviceRegistry);
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.set(SingletonServiceSupplier.class, explicit);
+
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(explicit.instances(), is(0));
+            assertThat(serviceRegistry.firstActive(SingletonServiceSupplier.class).orElseThrow(), sameInstance(explicit));
+            assertThat(explicit.instances(), is(0));
+
+            explicit.reenterOnGet();
+            SuppliedContract activated = serviceRegistry.get(SuppliedContract.class);
+
+            assertThat(activated.message(), is("Supplied:1"));
+            assertThat(explicit.activeDuringGet().isEmpty(), is(true));
+            assertThat(explicit.instances(), is(1));
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).orElseThrow(), sameInstance(activated));
+            assertThat(explicit.instances(), is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryFirstActiveDoesNotRetainEmptyFixedFactory() {
+        ServiceRegistryManager manager = ServiceRegistryManager.create(ServiceRegistryConfig.builder()
+                                                                               .discoverServices(false)
+                                                                               .addServiceDescriptor(
+                                                                                       SingletonServicesFactory__ServiceDescriptor.INSTANCE)
+                                                                               .build());
+        ServiceRegistry serviceRegistry = manager.registry();
+        SingletonServicesFactory emptyFactory = new SingletonServicesFactory();
+        SuppliedContract product = () -> "replacement";
+        SingletonServicesFactory replacementFactory = new SingletonServicesFactory(product);
+
+        Services.registry(serviceRegistry);
+        try {
+            Services.set(SingletonServicesFactory.class, emptyFactory);
+
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(emptyFactory.servicesCalls(), is(0));
+
+            Services.set(SingletonServicesFactory.class, replacementFactory);
+
+            assertThat(serviceRegistry.firstActive(SingletonServicesFactory.class).orElseThrow(),
+                       sameInstance(replacementFactory));
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(replacementFactory.servicesCalls(), is(0));
+
+            assertThat(serviceRegistry.get(SuppliedContract.class), sameInstance(product));
+            assertThat(replacementFactory.servicesCalls(), is(1));
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).orElseThrow(), sameInstance(product));
+            assertThat(replacementFactory.servicesCalls(), is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
+    public void testRegistryInitialFixedFactoryProductsAreLazy() {
+        SuppliedContract product = () -> "initial";
+        SingletonServicesFactory factory = new SingletonServicesFactory(product);
+        ServiceRegistryManager manager = ServiceRegistryManager.create(ServiceRegistryConfig.builder()
+                                                                               .discoverServices(false)
+                                                                               .addServiceDescriptor(
+                                                                                       SingletonServicesFactory__ServiceDescriptor.INSTANCE)
+                                                                               .putServiceInstance(
+                                                                                       SingletonServicesFactory__ServiceDescriptor.INSTANCE,
+                                                                                       factory)
+                                                                               .build());
+        ServiceRegistry serviceRegistry = manager.registry();
+
+        try {
+            assertThat(factory.servicesCalls(), is(0));
+            assertThat(serviceRegistry.firstActive(SingletonServicesFactory.class).orElseThrow(), sameInstance(factory));
+            assertThat(serviceRegistry.firstActive(SuppliedContract.class).isEmpty(), is(true));
+            assertThat(factory.servicesCalls(), is(0));
+
+            assertThat(serviceRegistry.get(SuppliedContract.class), sameInstance(product));
+            assertThat(factory.servicesCalls(), is(1));
+        } finally {
+            manager.shutdown();
+        }
+    }
+
+    @Test
     public void testRegistryAll() {
         List<MyContract> myContracts = registry.all(MyContract.class);
         assertThat(myContracts, hasSize(2));
@@ -85,6 +384,7 @@ public class RegistryTest {
 
     @Test
     public void testSupplier() {
+        ServiceSupplier.reset();
         Supplier<SuppliedContract> supplier = registry.supply(SuppliedContract.class);
 
         SuppliedContract first = supplier.get();
@@ -108,5 +408,37 @@ public class RegistryTest {
 
         MyContract secondInstance = myContractSupplier.get();
         assertThat(secondInstance, sameInstance(firstInstance));
+    }
+
+    @Test
+    public void testServiceLoaderInstanceIsScopedToRegistry() {
+        var descriptor = ServiceLoader__ServiceDescriptor.create(TypeName.create(ServiceLoaderContract.class),
+                                                                 ServiceLoaderService.class,
+                                                                 ServiceLoaderService::new,
+                                                                 100);
+        ServiceRegistryConfig config = ServiceRegistryConfig.builder()
+                .discoverServices(false)
+                .addServiceDescriptor(descriptor)
+                .build();
+        ServiceRegistryManager firstManager = ServiceRegistryManager.create(config);
+        ServiceRegistryManager secondManager = ServiceRegistryManager.create(config);
+
+        try {
+            ServiceLoaderContract first = firstManager.registry().get(ServiceLoaderContract.class);
+            ServiceLoaderContract second = secondManager.registry().get(ServiceLoaderContract.class);
+
+            assertThat(firstManager.registry().get(ServiceLoaderContract.class), sameInstance(first));
+            assertThat(secondManager.registry().get(ServiceLoaderContract.class), sameInstance(second));
+            assertThat(second, not(sameInstance(first)));
+        } finally {
+            firstManager.shutdown();
+            secondManager.shutdown();
+        }
+    }
+
+    private interface ServiceLoaderContract {
+    }
+
+    private static class ServiceLoaderService implements ServiceLoaderContract {
     }
 }

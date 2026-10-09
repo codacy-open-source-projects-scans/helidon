@@ -42,6 +42,7 @@ import static io.opentelemetry.context.Context.current;
  * Open Telemetry factory methods to create wrappers for Open Telemetry types.
  */
 public final class HelidonOpenTelemetry {
+    static final String DEFAULT_SERVICE_NAME = "helidon-service";
 
     /**
      * OpenTelemetry property for indicating if the Java agent is present.
@@ -63,6 +64,7 @@ public final class HelidonOpenTelemetry {
 
     private HelidonOpenTelemetry() {
     }
+
     /**
      * Wrap an open telemetry tracer.
      *
@@ -73,9 +75,10 @@ public final class HelidonOpenTelemetry {
      */
     public static io.helidon.tracing.Tracer create(OpenTelemetry telemetry, Tracer tracer, Map<String, String> tags) {
         return OpenTelemetryTracerBuilder.create()
-                .serviceName("helidon-service")
+                .serviceName(DEFAULT_SERVICE_NAME)
                 .openTelemetry(telemetry)
                 .delegate(tracer)
+                .registerGlobal(false)
                 .tracerTags(tags)
                 .build();
     }
@@ -95,7 +98,7 @@ public final class HelidonOpenTelemetry {
      *
      * @param span open telemetry span
      * @param baggage open telemetry baggage
-     * @return Helidon (@link io.helidon.tracing.Span}
+     * @return Helidon {@link io.helidon.tracing.Span}
      */
     public static io.helidon.tracing.Span create(Span span, Baggage baggage) {
         return new OpenTelemetrySpan(span, baggage, SPAN_LISTENERS.get());
@@ -147,13 +150,14 @@ public final class HelidonOpenTelemetry {
      * @param otelTracer the native OpenTelemetry {@code Tracer} to expose as a separate callback-enabled OpenTelemetry
      *                   {@code Tracer}
      * @param <T>        specific type of the tracer to return
-     * @return an OpenTelemetry {@code Tracer} and {@link io.helidon.tracing.Wrapper} able to notify span lifecycle listeners
+     * @return an OpenTelemetry {@code Tracer} and {@link io.helidon.common.Wrapper} able to notify span lifecycle listeners
      */
     public static <T extends Tracer & Wrapper> T callbackEnabledFrom(Tracer otelTracer) {
         return callbackEnabledFrom(OpenTelemetryTracerBuilder.create()
                                            .serviceName("callback-enabled-otel-tracer")
-                                           .openTelemetry(GlobalOpenTelemetry.get())
+                                           .openTelemetry(GlobalOpenTelemetry.getOrNoop())
                                            .delegate(otelTracer)
+                                           .registerGlobal(false)
                                            .build());
     }
 
@@ -164,7 +168,7 @@ public final class HelidonOpenTelemetry {
      *
      * @param helidonTracer the Helidon {@code Tracer} to expose as a callback-enabled OpenTelemetry {@code Tracer}
      * @param <T>           specific type of the tracer to return
-     * @return an OpenTelemetry {@code Tracer} and {@link io.helidon.tracing.Wrapper} able to notify span lifecycle listeners
+     * @return an OpenTelemetry {@code Tracer} and {@link io.helidon.common.Wrapper} able to notify span lifecycle listeners
      */
     public static <T extends Tracer & Wrapper> T callbackEnabledFrom(io.helidon.tracing.Tracer helidonTracer) {
         return (T) WrappedTracer.create(helidonTracer);
@@ -182,7 +186,7 @@ public final class HelidonOpenTelemetry {
      *
      * @param otelSpan the native OpenTelemetry {@code Span} to expose as a callback-enabled OpenTelemetry {@code Span}
      * @param <T>      specific type of the Span to return
-     * @return an OpenTelemetry {@code Span} and {@link io.helidon.tracing.Wrapper} which also performs lifecycle callbacks
+     * @return an OpenTelemetry {@code Span} and {@link io.helidon.common.Wrapper} which also performs lifecycle callbacks
      */
     public static <T extends Span & Wrapper> T callbackEnabledFrom(Span otelSpan) {
         return (T) WrappedSpan.create(create(otelSpan));
@@ -195,7 +199,7 @@ public final class HelidonOpenTelemetry {
      *
      * @param <T> specific type of the {@code Span} to return
      * @param helidonSpan the Helidon {@code Span} to expose as a callback-enabled OpenTelemetry {@code Span}
-     * @return an OpenTelemetry {@code Span} and {@link io.helidon.tracing.Wrapper} which also performs lifecycle callbacks
+     * @return an OpenTelemetry {@code Span} and {@link io.helidon.common.Wrapper} which also performs lifecycle callbacks
      **/
     public static <T extends Span & Wrapper> T callbackEnabledFrom(io.helidon.tracing.Span helidonSpan) {
         return (T) WrappedSpan.create(helidonSpan);
@@ -231,7 +235,7 @@ public final class HelidonOpenTelemetry {
                 }
             }
 
-            if (checkContext() || checkSystemProperties()){
+            if (checkContext() || checkSystemProperties()) {
                 if (LOGGER.isLoggable(System.Logger.Level.INFO)) {
                     LOGGER.log(System.Logger.Level.INFO, "OpenTelemetry Agent detected");
                 }
@@ -303,5 +307,12 @@ public final class HelidonOpenTelemetry {
         if (throwableToLog != null) {
             logger.log(System.Logger.Level.WARNING, "Error(s) from listener(s)", throwableToLog);
         }
+    }
+
+    static boolean autoConfigureGlobalOpenTelemetry(String propertyValue, String envValue) {
+        if (propertyValue != null) {
+            return Boolean.parseBoolean(propertyValue);
+        }
+        return Boolean.parseBoolean(envValue);
     }
 }

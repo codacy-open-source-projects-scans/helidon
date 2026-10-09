@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,14 @@
 
 package io.helidon.webclient.spi;
 
+import java.util.Objects;
+
+import io.helidon.common.Api;
 import io.helidon.webclient.api.ClientRequest;
 import io.helidon.webclient.api.ClientUri;
 import io.helidon.webclient.api.FullClientRequest;
 import io.helidon.webclient.api.ReleasableResource;
+import io.helidon.webclient.api.WebClientProtocolResponse;
 
 /**
  * Integration for HTTP versions to provide a single API.
@@ -30,11 +34,15 @@ public interface HttpClientSpi extends ReleasableResource {
      * <p>
      * Examples:
      * <ul>
-     *     <li>HTTP/1.1 always returns true, as it is the fallback protocol of all other protocols</li>
-     *     <li>HTTP/2 returns true when upgrade is enabled, false when prior-knowledge is specified (as we can always
-     *     attempt to upgrade and fallback to 1.1 in the first case, but we would fail with prior-knowledge, unless the endpoint
-     *     is known to be HTTP/2</li>
-     *     <li>HTTP/3 would always return true, as it cannot fallback once a connection is attempted</li>
+     *     <li>HTTP/1.1 always returns
+     *     {@link io.helidon.webclient.spi.HttpClientSpi.SupportLevel#COMPATIBLE}, as it is the fallback protocol of all
+     *     other protocols</li>
+     *     <li>A protocol with a reusable connection returns
+     *     {@link io.helidon.webclient.spi.HttpClientSpi.SupportLevel#SUPPORTED}</li>
+     *     <li>A dynamically discovered protocol can move between
+     *     {@link io.helidon.webclient.spi.HttpClientSpi.SupportLevel#NOT_SUPPORTED} and
+     *     {@link io.helidon.webclient.spi.HttpClientSpi.SupportLevel#SUPPORTED} as endpoint information becomes
+     *     available or expires</li>
      * </ul>
      *
      * So how can we get to HTTP/2 with prior knowledge, or HTTP/3? There are the following options:
@@ -43,16 +51,16 @@ public interface HttpClientSpi extends ReleasableResource {
      *     {@link io.helidon.webclient.api.HttpClientRequest#protocolId(String)}</li>
      *     <li>There is no fallback protocol enabled, in such a case, we use the one with highest priority - see
      *     {@link io.helidon.webclient.api.WebClientConfig.Builder#addProtocolPreference(String)}</li>
-     *     <li>We get an {@code Alt-Svc} header from a response that points us to a protocol version (we only support permanent
-     *     protocol changes, {@code Alt-Svc} with timeout will be ignored</li>
+     *     <li>The client dynamically learns that another protocol is viable for the endpoint</li>
      *     <li>This protocol version already handled a request to such an endpoint and has the connection available</li>
      * </ul>
      *
-     * Note that this response is cached.
+     * Note that this result is cached and revalidated for later requests. Implementations must make this method cheap
+     * and safe to invoke repeatedly, including for concurrent requests.
      *
      * @param clientRequest HTTP request
      * @param clientUri     URI to invoke
-     * @return {@code true} if we are sure we can handle this request with this protocol version
+     * @return support level for this protocol and request
      */
     SupportLevel supports(FullClientRequest<?> clientRequest, ClientUri clientUri);
 
@@ -65,6 +73,20 @@ public interface HttpClientSpi extends ReleasableResource {
      */
     ClientRequest<?> clientRequest(FullClientRequest<?> clientRequest,
                                    ClientUri clientUri);
+
+    /**
+     * Notification invoked after the WebClient receives a transport response, regardless of the protocol that produced
+     * it.
+     * <p>
+     * An implementation may inspect response metadata relevant to its protocol. For example, it may learn about an
+     * alternative service from an {@code Alt-Svc} response header received over another protocol.
+     *
+     * @param response received protocol response
+     */
+    @Api.Internal
+    default void responseReceived(WebClientProtocolResponse response) {
+        Objects.requireNonNull(response, "response");
+    }
 
     /**
      * For TCP based protocols, we can do ALPN negotiation, obtain a connection, and then let the client handle the protocol.
@@ -83,7 +105,7 @@ public interface HttpClientSpi extends ReleasableResource {
      */
     enum SupportLevel {
         /**
-         * This request can never be supported by this client.
+         * This request is not currently supported by this client.
          */
         NOT_SUPPORTED,
         /**

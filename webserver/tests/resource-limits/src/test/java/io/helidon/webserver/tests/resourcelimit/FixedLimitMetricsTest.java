@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,17 @@
 package io.helidon.webserver.tests.resourcelimit;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 import io.helidon.common.concurrency.limits.FixedLimit;
 import io.helidon.metrics.api.MeterRegistry;
 import io.helidon.metrics.api.MetricsFactory;
+import io.helidon.metrics.api.Tag;
 import io.helidon.metrics.api.Timer;
 import io.helidon.webclient.api.HttpClientResponse;
 import io.helidon.webclient.api.WebClient;
+import io.helidon.webserver.ListenerConfig;
 import io.helidon.webserver.WebServerConfig;
 import io.helidon.webserver.http.HttpRules;
 import io.helidon.webserver.observe.ObserveFeature;
@@ -32,6 +35,7 @@ import io.helidon.webserver.observe.metrics.MetricsObserver;
 import io.helidon.webserver.testing.junit5.ServerTest;
 import io.helidon.webserver.testing.junit5.SetUpRoute;
 import io.helidon.webserver.testing.junit5.SetUpServer;
+import io.helidon.webserver.testing.junit5.Socket;
 
 import org.junit.jupiter.api.Test;
 
@@ -54,9 +58,20 @@ class FixedLimitMetricsTest {
     };
 
     private final WebClient webClient;
+    private final WebClient adminClient;
+    private final MetricsFactory metricsFactory;
+    private final MeterRegistry meterRegistry;
+    private final Tag adminSocketTag;
 
-    FixedLimitMetricsTest(WebClient webClient) {
+    FixedLimitMetricsTest(WebClient webClient,
+                          @Socket("admin") WebClient adminClient,
+                          MetricsFactory metricsFactory,
+                          MeterRegistry meterRegistry) {
         this.webClient = webClient;
+        this.adminClient = adminClient;
+        this.metricsFactory = metricsFactory;
+        this.meterRegistry = meterRegistry;
+        this.adminSocketTag = metricsFactory.tagCreate("socketName", "admin");
     }
 
     @SetUpServer
@@ -78,6 +93,17 @@ class FixedLimitMetricsTest {
         });
     }
 
+    @SetUpRoute("admin")
+    static void adminRouteSetup(ListenerConfig.Builder listener, HttpRules rules) {
+        listener.concurrencyLimit(FixedLimit.builder()
+                                          .permits(1)
+                                          .enableMetrics(true)
+                                          .build());
+        rules.get("/greet", (req, res) -> {
+            res.send("hello");
+        });
+    }
+
     @Test
     void testMetrics() {
         try (HttpClientResponse res = webClient.get("/greet").request()) {
@@ -92,9 +118,27 @@ class FixedLimitMetricsTest {
             assertThat(res.status().code(), is(200));
         }
 
-        MeterRegistry meterRegistry = MetricsFactory.getInstance().globalRegistry();
         Optional<Timer> rtt = meterRegistry.timer("fixed_rtt", Collections.emptyList());
         assertThat(rtt.isPresent(), is(true));
         assertThat(rtt.get().count(), is(greaterThan(0L)));
+    }
+
+    @Test
+    void testNamedSocketMetricsTag() {
+        try (HttpClientResponse res = adminClient.get("/greet").request()) {
+            assertThat(res.status().code(), is(200));
+        }
+
+        Optional<Timer> rtt = meterRegistry.timer("fixed_rtt", List.of(adminSocketTag));
+        assertThat(rtt.isPresent(), is(true));
+
+        try (HttpClientResponse res = webClient.get("/observe/metrics").request()) {
+            String s = res.as(String.class);
+            assertThat(s, containsString("fixed_rtt_seconds_count"));
+            assertThat(res.status().code(), is(200));
+        }
+
+        Optional<Timer> defaultTaggedRtt = meterRegistry.timer("fixed_rtt", Collections.emptyList());
+        assertThat(defaultTaggedRtt.isPresent(), is(true));
     }
 }

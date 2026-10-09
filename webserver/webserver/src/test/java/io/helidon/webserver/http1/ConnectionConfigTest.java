@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@
 
 package io.helidon.webserver.http1;
 
+import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.Map;
 
 import io.helidon.config.Config;
 import io.helidon.webserver.WebServer;
+import io.helidon.webserver.http.AltSvcConfig;
 
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +32,13 @@ import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;
 
 public class ConnectionConfigTest {
+
+    @Test
+    void preservesMaxHeadersSizeBuilderDescriptor() throws NoSuchMethodException {
+        Method method = Http1Config.BuilderBase.class.getDeclaredMethod("maxHeadersSize", int.class);
+
+        assertThat(method.getReturnType().getName(), is(Http1Config.BuilderBase.class.getName()));
+    }
 
     @Test
     void testConnectionConfig() {
@@ -49,14 +59,26 @@ public class ConnectionConfigTest {
         assertThat(http1Config.maxHeadersSize(), is(8192));
         assertThat(http1Config.validatePath(), is(true));
         assertThat(http1Config.validateRequestHeaders(), is(true));
-        assertThat(http1Config.validateResponseHeaders(), is(false));
+        assertThat(http1Config.validateResponseHeaders(), is(true));
+        assertThat(http1Config.log().unsafeRawData(), is(false));
+        AltSvcConfig altSvc = http1Config.altSvc().orElseThrow().prototype();
+        assertThat(altSvc.protocol(), is("h3"));
+        assertThat(altSvc.port().orElseThrow(), is(8443));
+        assertThat(altSvc.maxAge().orElseThrow(), is(Duration.ofHours(1)));
+        assertThat(altSvc.persist(), is(true));
 
         http1Config = http1Configs.get("other");
         assertThat(http1Config.maxPrologueLength(), is(81));
         assertThat(http1Config.maxHeadersSize(), is(42));
         assertThat(http1Config.validatePath(), is(false));
         assertThat(http1Config.validateRequestHeaders(), is(false));
-        assertThat(http1Config.validateResponseHeaders(), is(true));
+        assertThat(http1Config.validateResponseHeaders(), is(false));
+        assertThat(http1Config.log().unsafeRawData(), is(false));
+        assertThat(Http1Config.builder()
+                           .log(it -> it.unsafeRawData(true))
+                           .build()
+                           .log()
+                           .unsafeRawData(), is(true));
     }
 
 }

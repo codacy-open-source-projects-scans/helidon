@@ -30,7 +30,7 @@ module io.helidon.webserver {
     requires io.helidon.common.features.api;
     requires io.helidon.common.features;
     requires io.helidon.common.task;
-    requires io.helidon.common.uri;
+    requires transitive io.helidon.common.uri;
     requires io.helidon.common.resumable;
     requires io.helidon.logging.common;
     requires io.helidon.service.registry;
@@ -39,9 +39,11 @@ module io.helidon.webserver {
 
     requires transitive io.helidon.common.buffers;
     requires transitive io.helidon.common.context;
+    requires transitive io.helidon.common.configurable;
     requires transitive io.helidon.common.security;
     requires transitive io.helidon.common.socket;
     requires transitive io.helidon.common.tls;
+    requires transitive io.helidon.http.http1;
     requires transitive io.helidon.config;
     requires transitive io.helidon.http.encoding;
     requires transitive io.helidon.http.media;
@@ -61,6 +63,7 @@ module io.helidon.webserver {
     uses io.helidon.webserver.spi.ServerConnectionSelectorProvider;
     uses io.helidon.webserver.spi.ProtocolConfigProvider;
     uses io.helidon.webserver.spi.ServerFeatureProvider;
+    uses io.helidon.webserver.spi.TransportBindingFactoryProvider;
     uses io.helidon.webserver.http.spi.SinkProvider;
     uses io.helidon.webserver.http1.spi.Http1UpgradeProvider;
     uses io.helidon.common.concurrency.limits.spi.LimitProvider;
@@ -68,5 +71,10 @@ module io.helidon.webserver {
     provides io.helidon.webserver.spi.ProtocolConfigProvider
             with io.helidon.webserver.http1.Http1ProtocolConfigProvider;
     provides io.helidon.webserver.spi.ServerConnectionSelectorProvider with io.helidon.webserver.http1.Http1ConnectionProvider;
+    provides io.helidon.webserver.spi.ServerFeatureProvider
+            with io.helidon.webserver.StuckThreadDetectionFeatureProvider;
+    provides io.helidon.webserver.spi.TransportBindingFactoryProvider
+            with io.helidon.webserver.TcpTransportBindingFactoryProvider,
+                    io.helidon.webserver.UdsTransportBindingFactoryProvider;
 
 }

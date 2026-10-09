@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,9 @@ import io.helidon.webserver.grpc.spi.GrpcServerServiceProvider;
 import io.helidon.webserver.spi.ProtocolConfig;
 import io.helidon.webserver.spi.ProtocolConfigProvider;
 
+/**
+ * gRPC protocol configuration.
+ */
 @Prototype.Blueprint
 @Prototype.Configured(root = false, value = GrpcProtocolProvider.CONFIG_NAME)
 @Prototype.Provides(ProtocolConfigProvider.class)
@@ -68,13 +71,13 @@ interface GrpcConfigBlueprint extends ProtocolConfig {
     boolean enableCompression();
 
     /**
-     * gRPC server services. These services will not be discovered automatically.
+     * gRPC server services. Services are discovered automatically by default.
      *
      * @return services to use
      */
     @Option.Singular
     @Option.Configured
-    @Option.Provider(value = GrpcServerServiceProvider.class, discoverServices = false)
+    @Option.Provider(GrpcServerServiceProvider.class)
     default List<GrpcServerService> grpcServices() {
         return List.of();
     }
@@ -82,9 +85,11 @@ interface GrpcConfigBlueprint extends ProtocolConfig {
     /**
      * Max size of gRPC reading buffer. If receiving an entity larger than this,
      * processing will be aborted. This can help prevent DoS attacks. Default
-     * set to 2 MB.
+     * set to 4 MB.
+     *
+     * @return max read buffer size
      */
     @Option.Configured
-    @Option.DefaultInt(2 * 1024 * 1024)
+    @Option.DefaultInt(4 * 1024 * 1024)
     int maxReadBufferSize();
 }

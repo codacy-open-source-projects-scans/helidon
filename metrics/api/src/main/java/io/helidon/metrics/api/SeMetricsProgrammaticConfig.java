@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,31 +17,28 @@ package io.helidon.metrics.api;
 
 import java.util.Optional;
 
+import io.helidon.common.Api;
+import io.helidon.common.Weight;
+import io.helidon.common.Weighted;
 import io.helidon.metrics.spi.MetricsProgrammaticConfig;
+import io.helidon.service.registry.Service;
 
 /**
  * Provides SE defaults for config values defaulted in a flavor-dependent way.
  */
+@Weight(Weighted.DEFAULT_WEIGHT - 50)
+@Service.Singleton
 public class SeMetricsProgrammaticConfig implements MetricsProgrammaticConfig {
 
     /**
-     * For service loading.
+     * Required public constructor for {@link java.util.ServiceLoader}.
      */
+    @Api.Internal
     public SeMetricsProgrammaticConfig() {
-    }
-
-    @Override
-    public Optional<String> scopeTagName() {
-        return Optional.of("scope");
     }
 
     @Override
     public Optional<String> appTagName() {
         return Optional.of("app");
-    }
-
-    @Override
-    public Optional<String> scopeDefaultValue() {
-        return Optional.of(Meter.Scope.DEFAULT);
     }
 }

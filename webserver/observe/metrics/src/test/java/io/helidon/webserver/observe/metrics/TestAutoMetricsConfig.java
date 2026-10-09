@@ -16,6 +16,8 @@
 
 package io.helidon.webserver.observe.metrics;
 
+import java.util.List;
+
 import io.helidon.common.media.type.MediaTypes;
 import io.helidon.common.uri.UriPath;
 import io.helidon.config.Config;
@@ -37,6 +39,7 @@ class TestAutoMetricsConfig {
                       observers:
                         metrics:
                           auto-http-metrics:
+                            known-methods: ["LIST"]
                             paths:
                               - path: "/greet/{name}"
                                 methods: ["GET","OPTIONS"]
@@ -55,6 +58,9 @@ class TestAutoMetricsConfig {
         var configFromText = Config.just(configText, MediaTypes.APPLICATION_YAML)
                 .get("server.features.observe.observers.metrics.auto-http-metrics");
         var config = AutoHttpMetricsConfig.create(configFromText);
+
+        assertThat("Updated HTTP metrics default", config.useUpdatedHttpMetrics(), is(true));
+        assertThat(config.knownMethods(), is(List.of("LIST")));
 
         assertThat("GET /greet", config.isMeasured(Method.GET, UriPath.create("/greet")), is(true));
         assertThat("PUT /greet", config.isMeasured(Method.PUT, UriPath.create("/greet")), is(true));
@@ -120,6 +126,63 @@ class TestAutoMetricsConfig {
         assertThat("GET /hi", config.isMeasured(Method.GET, UriPath.create("/hi")), is(true));
 
         assertThat("GET /metrics", config.isMeasured(Method.GET, UriPath.create("/metrics")), is(false));
+        assertThat("Updated HTTP metrics default", config.useUpdatedHttpMetrics(), is(true));
+        assertThat(config.knownMethods(),
+                   is(List.of("CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT",
+                              "QUERY", "TRACE")));
 
+    }
+
+    @Test
+    void configuredMethodUsesExactMatching() {
+        var config = AutoHttpMetricsConfig.create(Config.just("""
+                paths:
+                  - path: "/greet"
+                    methods: ["get"]
+                    enabled: false
+                """, MediaTypes.APPLICATION_YAML));
+
+        assertExactLowercasePathMatch(config);
+    }
+
+    @Test
+    void programmaticMethodUsesExactMatching() {
+        var config = AutoHttpMetricsConfig.builder()
+                .addPath(AutoHttpMetricsPathConfig.builder()
+                                 .path("/greet")
+                                 .addMethod("get")
+                                 .enabled(false)
+                                 .build())
+                .build();
+
+        assertExactLowercasePathMatch(config);
+    }
+
+    @Test
+    @SuppressWarnings("removal")
+    void testDeprecatedFalseSettingIsAccepted() {
+        var config = AutoHttpMetricsConfig.create(Config.just("use-updated-http-metrics: false", MediaTypes.APPLICATION_YAML));
+
+        assertThat(config.useUpdatedHttpMetrics(), is(false));
+    }
+
+    private static void assertExactLowercasePathMatch(AutoHttpMetricsConfig config) {
+        assertThat("Different-case method matching", config.isMeasured(Method.GET, UriPath.create("/greet")), is(true));
+        assertThat("Exact method matching",
+                   config.isMeasured(Method.create("get"), UriPath.create("/greet")),
+                   is(false));
+
+        AutoHttpMetricsPathConfig pathConfig = config.paths().stream()
+                .filter(it -> it.path().equals("/greet"))
+                .findFirst()
+                .orElseThrow();
+        assertThat("Different-case path predicate matching", pathConfig.methodPredicate().test(Method.GET), is(false));
+        assertThat("Exact path predicate matching",
+                   pathConfig.methodPredicate().test(Method.create("get")),
+                   is(true));
+        assertThat("Different-case path config matching", pathConfig.matchesMethod(Method.GET), is(false));
+        assertThat("Exact path config matching",
+                   pathConfig.matchesMethod(Method.create("get")),
+                   is(true));
     }
 }

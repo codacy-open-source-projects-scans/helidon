@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2025, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@ package io.helidon.faulttolerance;
 import java.time.Duration;
 
 import io.helidon.metrics.api.Counter;
-import io.helidon.metrics.api.Tag;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MetricsFactory;
 import io.helidon.testing.junit5.Testing;
 
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static io.helidon.faulttolerance.CircuitBreaker.FT_CIRCUITBREAKER_CALLS_TOTAL;
@@ -31,6 +33,18 @@ import static org.hamcrest.Matchers.is;
 
 @Testing.Test
 class CircuitBreakerMetricsTest extends CircuitBreakerBaseTest {
+    private final MetricsFactory metricsFactory;
+    private final MeterRegistry meterRegistry;
+
+    CircuitBreakerMetricsTest(MetricsFactory metricsFactory, MeterRegistry meterRegistry) {
+        this.metricsFactory = metricsFactory;
+        this.meterRegistry = meterRegistry;
+    }
+
+    @BeforeAll
+    static void activateConfig() {
+        MetricsTestSupport.activateConfig();
+    }
 
     @Test
     void testCircuitBreaker() {
@@ -52,9 +66,13 @@ class CircuitBreakerMetricsTest extends CircuitBreakerBaseTest {
         bad(breaker);
         bad(breaker);       // should open - window complete
 
-        Counter callsCounter = MetricsUtils.counter(FT_CIRCUITBREAKER_CALLS_TOTAL, Tag.create("name", breaker.name()));
+        Counter callsCounter = MetricsTestSupport.counter(meterRegistry,
+                                                    FT_CIRCUITBREAKER_CALLS_TOTAL,
+                                                    MetricsUtils.tag(metricsFactory, "name", breaker.name()));
         assertThat(callsCounter.count(), is(10L));
-        Counter openedCounter = MetricsUtils.counter(FT_CIRCUITBREAKER_OPENED_TOTAL, Tag.create("name", breaker.name()));
+        Counter openedCounter = MetricsTestSupport.counter(meterRegistry,
+                                                     FT_CIRCUITBREAKER_OPENED_TOTAL,
+                                                     MetricsUtils.tag(metricsFactory, "name", breaker.name()));
         assertThat(openedCounter.count(), is(1L));
     }
 }

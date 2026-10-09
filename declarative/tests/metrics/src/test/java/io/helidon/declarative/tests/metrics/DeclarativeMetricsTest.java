@@ -87,28 +87,76 @@ class DeclarativeMetricsTest {
     }
 
     @Test
+    @Order(5)
+    void testInheritedCounted() {
+        var response = client.get("/endpoint/inherited-counted").request(String.class);
+
+        assertThat(response.status(), is(Status.OK_200));
+        assertThat(response.entity(), is("inherited counted"));
+    }
+
+    @Test
+    @Order(6)
+    void testSplitMetricAnnotations() {
+        var countedResponse = client.get("/endpoint/split-counted").request(String.class);
+        var timedResponse = client.get("/endpoint/split-timed").request(String.class);
+
+        assertThat(countedResponse.status(), is(Status.OK_200));
+        assertThat(countedResponse.entity(), is("split counted"));
+        assertThat(timedResponse.status(), is(Status.OK_200));
+        assertThat(timedResponse.entity(), is("split timed"));
+    }
+
+    @Test
+    @Order(7)
     void testMetricsObserver() {
         var response = client.get("/observe/metrics")
                 .header(HeaderValues.ACCEPT_JSON)
                 .request(JsonObject.class);
         assertThat(response.status(), is(Status.OK_200));
         JsonObject metrics = response.entity();
-        JsonObject appMetrics = metrics.objectValue("application").orElse(null);
-        assertThat(appMetrics, notNullValue());
         // absolute metric name
-        JsonObject timed = appMetrics.objectValue("my-timed-metric").orElse(null);
+        JsonObject timed = metrics.objectValue("my-timed-metric").orElse(null);
         assertThat(timed, notNullValue());
 
         // relative metric name + tags from type and annotation
-        BigDecimal counted = appMetrics.numberValue("TestEndpoint.counted;application=MyNiceApp;endpoint=TestEndpoint;location=method")
+        BigDecimal counted = metrics.numberValue("TestEndpoint.counted;application=MyNiceApp;endpoint=TestEndpoint;location=method")
                 .orElse(null);
         assertThat(counted, notNullValue());
         assertThat(counted.intValue(), is(1));
 
         // relative metric name + tags from type
-        BigDecimal gauge = appMetrics.numberValue("TestEndpoint.gaugeValue;application=MyNiceApp;endpoint=TestEndpoint")
+        BigDecimal gauge = metrics.numberValue("TestEndpoint.gaugeValue;application=MyNiceApp;endpoint=TestEndpoint")
                 .orElse(null);
         assertThat(gauge, notNullValue());
         assertThat(gauge.intValue(), is(42));
+
+        BigDecimal inheritedCounted = metrics.numberValue("inherited-counted;application=MyNiceApp;contract=counted;"
+                                                                   + "endpoint=TestEndpoint;implementationOne=one;"
+                                                                   + "implementationTwo=two")
+                .orElse(null);
+        assertThat(inheritedCounted, notNullValue());
+        assertThat(inheritedCounted.intValue(), is(1));
+
+        BigDecimal inheritedGauge = metrics.numberValue("inherited-gauge;application=MyNiceApp;contract=gauge;"
+                                                                 + "endpoint=TestEndpoint;implementationOne=one;"
+                                                                 + "implementationTwo=two")
+                .orElse(null);
+        assertThat(inheritedGauge, notNullValue());
+        assertThat(inheritedGauge.intValue(), is(43));
+
+        BigDecimal splitCounted = metrics.numberValue("split-counted;application=MyNiceApp;contract=split-counted;"
+                                                               + "endpoint=TestEndpoint")
+                .orElse(null);
+        assertThat(splitCounted, notNullValue());
+        assertThat(splitCounted.intValue(), is(1));
+
+        JsonObject splitTimed = metrics.objectValue("split-timed").orElse(null);
+        assertThat("Metrics: " + metrics, splitTimed, notNullValue());
+        BigDecimal splitTimedCount = splitTimed.numberValue("count;application=MyNiceApp;contract=split-timed;"
+                                                                    + "declaration=contract;endpoint=TestEndpoint")
+                .orElse(null);
+        assertThat("Split timed metric: " + splitTimed, splitTimedCount, notNullValue());
+        assertThat(splitTimedCount.intValue(), is(1));
     }
 }

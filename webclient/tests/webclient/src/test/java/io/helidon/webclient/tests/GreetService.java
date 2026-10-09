@@ -103,6 +103,7 @@ public class GreetService implements HttpService {
                 .get("/obtainedQuery", this::obtainedQuery)
                 .get("/pattern with space", this::getDefaultMessageHandler)
                 .put("/greeting", this::updateGreetingHandler)
+                .get("/not-found-with-entity", this::notFoundWithEntity)
                 .get("/contextCheck", this::contextCheck);
     }
 
@@ -130,7 +131,9 @@ public class GreetService implements HttpService {
 
     private void valuesPropagated(ServerRequest serverRequest, ServerResponse serverResponse) {
         String queryParam = serverRequest.query().first("param").orElse("Query param not present");
-        String fragment = serverRequest.prologue().fragment().value();
+        String fragment = serverRequest.prologue().fragment().hasValue()
+                ? serverRequest.prologue().fragment().value()
+                : "";
         serverResponse.status(Status.OK_200);
         serverResponse.send(queryParam + " " + fragment);
     }
@@ -238,6 +241,14 @@ public class GreetService implements HttpService {
 
         greeting.set(jo.getString("greeting"));
         response.status(Status.NO_CONTENT_204).send();
+    }
+
+    private void notFoundWithEntity(ServerRequest request, ServerResponse response) {
+        JsonObject jsonErrorObject = JSON.createObjectBuilder()
+                .add("error", "Not Found")
+                .build();
+        response.status(Status.NOT_FOUND_404)
+                .send(jsonErrorObject);
     }
 
     /**

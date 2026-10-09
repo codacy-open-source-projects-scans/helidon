@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,21 +16,220 @@
 
 package io.helidon.common.tls;
 
+import java.io.IOException;
 import java.security.AlgorithmConstraints;
 import java.security.AlgorithmParameters;
 import java.security.CryptoPrimitive;
+import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.X509KeyManager;
+import javax.net.ssl.X509TrustManager;
 
+import io.helidon.config.Config;
+import io.helidon.config.ConfigSources;
+import io.helidon.config.MissingValueException;
+
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.instanceOf;
+import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.CoreMatchers.notNullValue;
+import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.arrayContaining;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class TlsTest {
+    @BeforeEach
+    void resetRequiredConfigProvider() {
+        RequiredConfigTlsManagerProvider.CREATE_COUNT.set(0);
+        RequiredConfigTlsManagerProvider.INIT_COUNT.set(0);
+    }
+
+    @Test
+    void disabledTlsDoesNotCreateConfiguredProviderWithoutRequiredConfig() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+
+        Tls tls = Tls.create(config.get("server.tls"));
+
+        assertThat(tls.enabled(), is(false));
+        assertThat("disabled TLS must not create the configured provider",
+                   RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThat("disabled TLS must not initialize the configured manager",
+                   RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void disabledTlsDoesNotDiscoverConfiguredProviders() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager-discover-services", "true",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+
+        Tls tls = Tls.create(config.get("server.tls"));
+
+        assertThat(tls.enabled(), is(false));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void explicitDisabledTlsOverridesEnabledConfigBeforeCreatingProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "true",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+
+        Tls tls = Tls.builder().config(config.get("server.tls")).enabled(false).build();
+
+        assertThat(tls.enabled(), is(false));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void disabledTlsDoesNotCreateConfiguredProviderWithRequiredConfig() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE,
+                "server.tls.manager.test.required-value", "configured")));
+
+        Tls tls = Tls.create(config.get("server.tls"));
+
+        assertThat(tls.enabled(), is(false));
+        assertThat("disabled TLS must not create the configured provider",
+                   RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThat("disabled TLS must not initialize the configured manager",
+                   RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void enabledTlsValidatesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "true",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+
+        MissingValueException exception = assertThrows(MissingValueException.class,
+                                                       () -> Tls.create(config.get("server.tls")));
+
+        assertThat(exception.getMessage(),
+                   is("Requested value for configuration key 'server.tls.manager.test.required-value'"
+                              + " is not present in the configuration."));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void enablingReusedBuilderValidatesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+        TlsConfig.Builder builder = Tls.builder().config(config.get("server.tls"));
+
+        assertThat(builder.build().enabled(), is(false));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThrows(MissingValueException.class, () -> builder.enabled(true).build());
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+    }
+
+    @Test
+    void enablingReusedBuilderCreatesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE,
+                "server.tls.manager.test.required-value", "configured")));
+        TlsConfig.Builder builder = Tls.builder().config(config.get("server.tls"));
+
+        assertThat(builder.build().enabled(), is(false));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        Tls tls = builder.enabled(true).build();
+
+        assertThat(tls.enabled(), is(true));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(1));
+        assertThat(tls.prototype().manager(), instanceOf(RequiredConfigTlsManagerProvider.RequiredConfigTlsManager.class));
+    }
+
+    @Test
+    void enablingPrototypeCopyValidatesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+        TlsConfig disabled = Tls.builder().config(config.get("server.tls")).buildPrototype();
+
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        assertThrows(MissingValueException.class,
+                     () -> TlsConfig.builder(disabled).enabled(true).build());
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+    }
+
+    @Test
+    void enablingPrototypeCopyCreatesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE,
+                "server.tls.manager.test.required-value", "configured")));
+        TlsConfig disabled = Tls.builder().config(config.get("server.tls")).buildPrototype();
+
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(0));
+        Tls tls = TlsConfig.builder(disabled).enabled(true).build();
+
+        assertThat(tls.enabled(), is(true));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(1));
+        assertThat(tls.prototype().manager(), instanceOf(RequiredConfigTlsManagerProvider.RequiredConfigTlsManager.class));
+    }
+
+    @Test
+    void enablingReusedBuilderPreservesExplicitManager() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "false",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE)));
+        TlsManager explicit = new RequiredConfigTlsManagerProvider().create(
+                Config.just(ConfigSources.create(Map.of("required-value", "explicit"))), "explicit");
+        TlsConfig.Builder builder = Tls.builder().config(config.get("server.tls")).manager(explicit);
+
+        assertThat(builder.build().enabled(), is(false));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(0));
+        Tls tls = builder.enabled(true).build();
+
+        assertThat(tls.prototype().manager(), sameInstance(explicit));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(1));
+    }
+
+    @Test
+    void enabledTlsCreatesAndInitializesConfiguredProvider() {
+        Config config = Config.just(ConfigSources.create(Map.of(
+                "server.tls.enabled", "true",
+                "server.tls.manager.test.type", RequiredConfigTlsManagerProvider.TYPE,
+                "server.tls.manager.test.required-value", "configured")));
+
+        Tls tls = Tls.create(config.get("server.tls"));
+        RequiredConfigTlsManagerProvider.RequiredConfigTlsManager manager =
+                (RequiredConfigTlsManagerProvider.RequiredConfigTlsManager) tls.prototype().manager();
+
+        assertThat(tls.enabled(), is(true));
+        assertThat(RequiredConfigTlsManagerProvider.CREATE_COUNT.get(), is(1));
+        assertThat(RequiredConfigTlsManagerProvider.INIT_COUNT.get(), is(1));
+        assertThat(manager.name(), is("test"));
+        assertThat(manager.requiredValue(), is("configured"));
+        assertThat(tls.sslContext(), sameInstance(manager.sslContext()));
+        assertThat(tls.newEngine(), notNullValue());
+    }
+
     @Test
     public void testTlsEquals() {
         SSLParameters first = new SSLParameters();
@@ -68,4 +267,218 @@ public class TlsTest {
         first.setSNIMatchers(List.of());
         second.setSNIMatchers(List.of());
     }
+
+    @Test
+    public void testSslParametersCannotMutateTls() throws IOException {
+        Tls tls = Tls.create(it -> it.addApplicationProtocol("h2")
+                .endpointIdentificationAlgorithm(Tls.ENDPOINT_IDENTIFICATION_HTTPS));
+
+        SSLParameters parameters = tls.sslParameters();
+        parameters.setApplicationProtocols(new String[] {"http/1.1"});
+        parameters.setEndpointIdentificationAlgorithm("");
+
+        SSLParameters freshParameters = tls.sslParameters();
+        assertThat(freshParameters.getApplicationProtocols(), arrayContaining("h2"));
+        assertThat(freshParameters.getEndpointIdentificationAlgorithm(), is(Tls.ENDPOINT_IDENTIFICATION_HTTPS));
+
+        SSLParameters engineParameters = tls.newEngine().getSSLParameters();
+        assertThat(engineParameters.getApplicationProtocols(), arrayContaining("h2"));
+        assertThat(engineParameters.getEndpointIdentificationAlgorithm(), is(Tls.ENDPOINT_IDENTIFICATION_HTTPS));
+
+        try (SSLServerSocket serverSocket = tls.createServerSocket()) {
+            SSLParameters serverParameters = serverSocket.getSSLParameters();
+            assertThat(serverParameters.getApplicationProtocols(), arrayContaining("h2"));
+            assertThat(serverParameters.getEndpointIdentificationAlgorithm(), is(""));
+        }
+    }
+
+    @Test
+    public void testConfiguredSslParametersCannotMutateTls() {
+        SSLParameters configured = new SSLParameters();
+        configured.setApplicationProtocols(new String[] {"h2"});
+        configured.setEndpointIdentificationAlgorithm(Tls.ENDPOINT_IDENTIFICATION_HTTPS);
+
+        Tls tls = Tls.create(it -> it.sslParameters(configured));
+
+        configured.setApplicationProtocols(new String[] {"http/1.1"});
+        configured.setEndpointIdentificationAlgorithm("");
+
+        SSLParameters freshParameters = tls.sslParameters();
+        assertThat(freshParameters.getApplicationProtocols(), arrayContaining("h2"));
+        assertThat(freshParameters.getEndpointIdentificationAlgorithm(), is(Tls.ENDPOINT_IDENTIFICATION_HTTPS));
+
+        SSLParameters engineParameters = tls.newEngine().getSSLParameters();
+        assertThat(engineParameters.getApplicationProtocols(), arrayContaining("h2"));
+        assertThat(engineParameters.getEndpointIdentificationAlgorithm(), is(Tls.ENDPOINT_IDENTIFICATION_HTTPS));
+    }
+
+    @Test
+    public void explicitSslContextUsesProvidedContext() {
+        SSLContext sslContext = createSslContext();
+
+        Tls tls = Tls.create(it -> it.sslContext(sslContext)
+                .addApplicationProtocol("h3"));
+
+        assertThat(tls.sslContext(), sameInstance(sslContext));
+        assertThat(tls.prototype().manager(), instanceOf(ExplicitContextTlsManager.class));
+        assertThat(tls.newEngine().getSSLParameters().getApplicationProtocols(), arrayContaining("h3"));
+    }
+
+    @Test
+    public void explicitSslContextRejectsIncompatibleOptions() {
+        SSLContext sslContext = createSslContext();
+
+        IllegalArgumentException managerException = assertThrows(IllegalArgumentException.class,
+                                                                  () -> Tls.create(it -> it.sslContext(sslContext)
+                                                                          .manager(new FailingTlsManager())));
+        assertThat(managerException.getMessage(), is("Explicit SSLContext cannot be combined with TLS options: manager"));
+
+        IllegalArgumentException materialException = assertThrows(IllegalArgumentException.class,
+                                                                   () -> Tls.create(it -> it.sslContext(sslContext)
+                                                                           .trustAll(true)
+                                                                           .sessionCacheSize(1)));
+        assertThat(materialException.getMessage(),
+                   is("Explicit SSLContext cannot be combined with TLS options: trust-all, session-cache-size"));
+    }
+
+    @Test
+    public void explicitSslContextSupportsBuilderReuseAndPrototypeCopy() {
+        SSLContext sslContext = createSslContext();
+        TlsConfig.Builder builder = Tls.builder().sslContext(sslContext);
+
+        TlsConfig prototype = builder.buildPrototype();
+        TlsConfig repeatedBuild = builder.buildPrototype();
+        assertThat(repeatedBuild.manager(), sameInstance(prototype.manager()));
+
+        Tls first = Tls.create(prototype);
+        Tls second = Tls.create(repeatedBuild);
+        assertThat(first.sslContext(), sameInstance(sslContext));
+        assertThat(second.sslContext(), sameInstance(sslContext));
+
+        TlsConfig copy = TlsConfig.builder(prototype).buildPrototype();
+        assertThat(copy.sslContext().orElseThrow(), sameInstance(sslContext));
+        assertThat(copy.manager(), sameInstance(prototype.manager()));
+        assertThat(copy, is(prototype));
+
+        TlsConfig defaultPrototype = Tls.builder().buildPrototype();
+        TlsConfig contextCopy = TlsConfig.builder(defaultPrototype)
+                .sslContext(sslContext)
+                .buildPrototype();
+        assertThat(contextCopy.sslContext().orElseThrow(), sameInstance(sslContext));
+        assertThat(contextCopy.manager(), instanceOf(ExplicitContextTlsManager.class));
+
+        Tls withoutContext = builder.clearSslContext().build();
+        assertThat(withoutContext.prototype().sslContext().isEmpty(), is(true));
+        assertThat(withoutContext.prototype().manager(), instanceOf(ConfiguredTlsManager.class));
+    }
+
+    @Test
+    public void defaultManagerIsOwnedByTlsInstance() {
+        TlsConfig.Builder builder = Tls.builder().trustAll(true);
+
+        Tls first = builder.build();
+        Tls second = builder.trustAll(false).build();
+
+        assertThat(second.prototype().manager(), sameInstance(first.prototype().manager()));
+        assertThat(second.sslContext(), not(sameInstance(first.sslContext())));
+
+        TlsConfig prototype = Tls.builder().buildPrototype();
+        Tls fromPrototype = prototype.build();
+        Tls repeatedFromPrototype = prototype.build();
+
+        assertThat(fromPrototype.prototype(), sameInstance(prototype));
+        assertThat(repeatedFromPrototype.prototype(), sameInstance(prototype));
+        assertThat(repeatedFromPrototype.sslContext(), not(sameInstance(fromPrototype.sslContext())));
+    }
+
+    @Test
+    public void explicitSslContextRejectsMaterialReload() {
+        SSLContext sslContext = createSslContext();
+        Tls tls = Tls.create(it -> it.sslContext(sslContext));
+        TlsMaterial material = TlsMaterial.builder()
+                .trustAll(true)
+                .build();
+
+        UnsupportedOperationException exception = assertThrows(UnsupportedOperationException.class,
+                                                               () -> tls.reload(material));
+
+        assertThat(exception.getMessage(),
+                   is("TLS cannot be reloaded when an explicit instance of SSL context was used to create it"));
+    }
+
+    @Test
+    public void successfulEnabledReloadsAdvanceGeneration() {
+        Tls tls = Tls.create(it -> it.trustAll(true));
+
+        assertThat(tls.generation(), is(0L));
+        tls.reload(TlsMaterial.builder().trustAll(true).build());
+        assertThat(tls.generation(), is(1L));
+
+        tls.reload(Tls.create(it -> it.trustAll(true)));
+        assertThat(tls.generation(), is(2L));
+    }
+
+    @Test
+    public void failedReloadDoesNotAdvanceGeneration() {
+        Tls tls = Tls.create(it -> it.sslContext(createSslContext()));
+
+        assertThrows(UnsupportedOperationException.class,
+                     () -> tls.reload(TlsMaterial.builder().trustAll(true).build()));
+        assertThat(tls.generation(), is(0L));
+    }
+
+    @Test
+    public void disabledTlsReloadDoesNotAdvanceGeneration() {
+        Tls tls = Tls.builder()
+                .enabled(false)
+                .build();
+
+        tls.reload(TlsMaterial.builder().trustAll(true).build());
+        tls.reload(Tls.create(it -> it.trustAll(true)));
+
+        assertThat(tls.generation(), is(0L));
+    }
+
+    private static SSLContext createSslContext() {
+        try {
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, null, null);
+            return sslContext;
+        } catch (GeneralSecurityException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static final class FailingTlsManager implements TlsManager {
+        @Override
+        public void init(TlsConfig tls) {
+            throw new AssertionError("Explicit SSLContext should use ExplicitContextTlsManager");
+        }
+
+        @Override
+        public SSLContext sslContext() {
+            throw new AssertionError("Explicit SSLContext should use ExplicitContextTlsManager");
+        }
+
+        @Override
+        public Optional<X509KeyManager> keyManager() {
+            throw new AssertionError("Explicit SSLContext should use ExplicitContextTlsManager");
+        }
+
+        @Override
+        public Optional<X509TrustManager> trustManager() {
+            throw new AssertionError("Explicit SSLContext should use ExplicitContextTlsManager");
+        }
+
+        @Override
+        public String name() {
+            return "failing";
+        }
+
+        @Override
+        public String type() {
+            return "failing";
+        }
+    }
+
 }

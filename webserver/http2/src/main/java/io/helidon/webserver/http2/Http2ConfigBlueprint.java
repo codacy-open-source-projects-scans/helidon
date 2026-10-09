@@ -17,11 +17,14 @@
 package io.helidon.webserver.http2;
 
 import java.time.Duration;
+import java.util.Optional;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
-import io.helidon.common.Size;
+import io.helidon.common.Api;
+import io.helidon.http.HttpConfig;
 import io.helidon.http.RequestedUriDiscoveryContext;
+import io.helidon.webserver.http.AltSvc;
 import io.helidon.webserver.spi.ProtocolConfig;
 import io.helidon.webserver.spi.ProtocolConfigProvider;
 
@@ -31,8 +34,8 @@ import io.helidon.webserver.spi.ProtocolConfigProvider;
 @Prototype.Blueprint(decorator = Http2ConfigBlueprint.Http2ConfigDecorator.class)
 @Prototype.Configured(root = false, value = Http2ConnectionProvider.CONFIG_NAME)
 @Prototype.Provides(ProtocolConfigProvider.class)
-@Prototype.IncludeDefaultMethods("maxBufferedEntitySize")
-interface Http2ConfigBlueprint extends ProtocolConfig {
+@Prototype.IncludeDefaultMethods({"maxBufferedEntitySize", "log", "altSvc"})
+interface Http2ConfigBlueprint extends ProtocolConfig, HttpConfig {
     /**
      * The size of the largest frame payload that the sender is willing to receive in bytes.
      * Default value is {@code 16384} and maximum value is 2<sup>24</sup>-1 = 16777215 bytes.
@@ -45,11 +48,16 @@ interface Http2ConfigBlueprint extends ProtocolConfig {
     int maxFrameSize();
 
     /**
-     * The maximum field section size that the sender is prepared to accept in bytes.
+     * The maximum field section size the server advertises to clients using the HTTP/2
+     * {@code SETTINGS_MAX_HEADER_LIST_SIZE} setting.
+     * <p>
+     * This setting is sent to the peer as an HTTP/2 protocol hint. Helidon's local request header size
+     * enforcement is configured by {@link #maxHeadersSize()}.
+     * <p>
      * See RFC 9113 section 6.5.2 for details.
      * Default is 8192.
      *
-     * @return maximal header list size in bytes
+     * @return maximal header list size in bytes advertised in the HTTP/2 settings
      */
     @Option.Configured
     @Option.DefaultInt(8192)
@@ -67,16 +75,6 @@ interface Http2ConfigBlueprint extends ProtocolConfig {
     @Option.Configured
     @Option.DefaultLong(8192)
     long maxConcurrentStreams();
-
-    /**
-     * Configure the maximum size allowed for an entity that can be explicitly
-     * buffered by the application by calling {@link io.helidon.http.media.ReadableEntity#buffer}.
-     *
-     * @return maximum size for a buffered entity
-     */
-    @Option.Configured
-    @Option.Default("64 KB")
-    Size maxBufferedEntitySize();
 
     /**
      * This setting indicates the sender's maximum window size in bytes for stream-level flow control.
@@ -135,11 +133,13 @@ interface Http2ConfigBlueprint extends ProtocolConfig {
     Duration rapidResetCheckPeriod();
 
     /**
-     * Maximum number of rapid resets(stream RST sent by client before any data have been sent by server).
-     * When reached within {@link #rapidResetCheckPeriod()}, GOAWAY is sent to client and connection is closed.
+     * Maximum number of rapid client resets within the check period and server-side resets over the connection lifetime
+     * before GOAWAY is sent, or {@code -1} to disable both reset-count checks; fixed internal bounds still apply to
+     * frames received after the server has locally reset a stream.
+     * Rapid client resets are stream RST frames sent by the client before any data have been sent by the server.
      * Default value is {@code 50}.
      *
-     * @return maximum number of rapid resets
+     * @return maximum number of resets
      */
     @Option.Configured
     @Option.DefaultInt(50)
@@ -155,13 +155,26 @@ interface Http2ConfigBlueprint extends ProtocolConfig {
     int maxEmptyFrames();
 
     /**
-     * If set to false, any path is accepted (even containing illegal characters).
+     * Whether to validate path characters and the HTTP/2 {@code :path} pseudo-header.
      *
      * @return whether to validate path
      */
     @Option.Configured
     @Option.DefaultBoolean(true)
     boolean validatePath();
+
+    /**
+     * Explicit {@code Alt-Svc} advertisement for responses handled by HTTP routing,
+     * excluding HTTP/2 subprotocol responses such as gRPC.
+     *
+     * @return alternative service advertisement
+     */
+    @Api.Preview
+    @Option.Configured
+    @Option.PrototypedBy("io.helidon.webserver.http.AltSvcConfig")
+    default Optional<AltSvc> altSvc() {
+        return Optional.empty();
+    }
 
     /**
      * Requested URI discovery settings.

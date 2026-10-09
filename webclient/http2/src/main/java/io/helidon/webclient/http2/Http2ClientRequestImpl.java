@@ -17,19 +17,34 @@
 package io.helidon.webclient.http2;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import io.helidon.http.ClientRequestHeaders;
+import io.helidon.http.HeaderName;
+import io.helidon.http.HeaderNames;
 import io.helidon.http.Method;
+import io.helidon.webclient.api.ClientConnection;
 import io.helidon.webclient.api.ClientRequestBase;
 import io.helidon.webclient.api.ClientUri;
 import io.helidon.webclient.api.FullClientRequest;
+import io.helidon.webclient.api.ProxyRoute;
 import io.helidon.webclient.api.WebClientServiceRequest;
 import io.helidon.webclient.api.WebClientServiceResponse;
+import io.helidon.webclient.http1.Http1Client;
 
 class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2ClientResponse>
         implements Http2ClientRequest, Http2StreamConfig, FullClientRequest<Http2ClientRequest> {
+    private static final Set<HeaderName> REPLAYABLE_HEADERS = Set.of(HeaderNames.ACCEPT,
+                                                                     HeaderNames.ACCEPT_CHARSET,
+                                                                     HeaderNames.ACCEPT_ENCODING,
+                                                                     HeaderNames.ACCEPT_LANGUAGE,
+                                                                     HeaderNames.CONTENT_ENCODING,
+                                                                     HeaderNames.CONTENT_LANGUAGE,
+                                                                     HeaderNames.CONTENT_LOCATION,
+                                                                     HeaderNames.CONTENT_TYPE);
 
     private final Http2ClientImpl http2Client;
     private int priority = 16;
@@ -38,41 +53,101 @@ class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2
     private Duration flowControlTimeout = Duration.ofMillis(100);
     private boolean outputStreamRedirect = false;
     private final FullClientRequest<?> delegate;
+    private final List<String> tcpProtocolIds;
 
     Http2ClientRequestImpl(Http2ClientImpl http2Client,
                            FullClientRequest<?> delegate,
                            Method method,
                            ClientUri clientUri,
                            Map<String, String> properties) {
+        this(http2Client, delegate, method, clientUri, properties, null, false, defaultTcpProtocolIds());
+    }
+
+    Http2ClientRequestImpl(Http2ClientImpl http2Client,
+                           FullClientRequest<?> delegate,
+                           Method method,
+                           ClientUri clientUri,
+                           Map<String, String> properties,
+                           List<String> tcpProtocolIds) {
+        this(http2Client, delegate, method, clientUri, properties, null, false, tcpProtocolIds);
+    }
+
+    private Http2ClientRequestImpl(Http2ClientImpl http2Client,
+                                   FullClientRequest<?> delegate,
+                                   Method method,
+                                   ClientUri clientUri,
+                                   Map<String, String> properties,
+                                   ClientUri redirectSourceUri,
+                                   boolean crossOriginRedirect,
+                                   List<String> tcpProtocolIds) {
         super(http2Client.clientConfig(),
-                http2Client.webClient().cookieManager(),
-                Http2Client.PROTOCOL_ID,
-                method,
-                clientUri,
-                properties);
+              http2Client.webClient().cookieManager(),
+              Http2Client.PROTOCOL_ID,
+              method,
+              clientUri,
+              delegate == null ? null : delegate.sendExpectContinue().orElse(null),
+              properties,
+              redirectSourceUri,
+              crossOriginRedirect);
 
         this.http2Client = http2Client;
         Http2ClientProtocolConfig protocolConfig = http2Client.protocolConfig();
         this.priorKnowledge = protocolConfig.priorKnowledge();
         this.delegate = delegate;
+        this.tcpProtocolIds = List.copyOf(tcpProtocolIds);
     }
 
     Http2ClientRequestImpl(Http2ClientRequestImpl request,
                            Method method,
                            ClientUri clientUri,
-                           Map<String, String> properties) {
-        this(request.http2Client, request.delegate, method, clientUri, properties);
+                           Map<String, String> properties,
+                           boolean preserveEntity) {
+        this(request.http2Client,
+             request.delegate,
+             method,
+             clientUri,
+             properties,
+             request.resolvedUri(),
+             request.crossesRedirectOriginBoundary(clientUri),
+             request.tcpProtocolIds);
 
         followRedirects(request.followRedirects());
         maxRedirects(request.maxRedirects());
         tls(request.tls());
+        proxy(request.proxy());
+        request.sni().ifPresent(this::sni);
+        if (sameOrigin(request.resolvedUri(), clientUri)) {
+            request.address().ifPresent(this::address);
+            request.selectedProxyRoute().ifPresent(this::selectedProxyRoute);
+        }
 
         this.priority(request.priority);
         this.priorKnowledge(request.priorKnowledge);
         this.flowControlTimeout(request.flowControlTimeout);
         this.requestPrefetch(request.requestPrefetch);
         this.readTimeout(request.readTimeout());
+        this.readContinueTimeout(request.readContinueTimeout());
+        request.sendExpectContinue().ifPresent(this::sendExpectContinue);
         this.outputStreamRedirect(request.outputStreamRedirect);
+        if (preserveEntity) {
+            REPLAYABLE_HEADERS.forEach(name -> request.headers().find(name).ifPresent(headers()::set));
+        }
+    }
+
+    @Override
+    public void selectedProxyRoute(ProxyRoute proxyRoute) {
+        super.selectedProxyRoute(proxyRoute);
+        if (delegate != null) {
+            delegate.selectedProxyRoute(proxyRoute);
+        }
+    }
+
+    @Override
+    public void clearSelectedProxyRoute() {
+        super.clearSelectedProxyRoute();
+        if (delegate != null) {
+            delegate.clearSelectedProxyRoute();
+        }
     }
 
     @Override
@@ -159,6 +234,35 @@ class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2
         return outputStreamRedirect;
     }
 
+    boolean ownsExplicitConnection() {
+        ClientConnection current = connection().orElse(null);
+        return delegate != null
+                && current != null
+                && delegate.connection().orElse(null) != current;
+    }
+
+    List<String> tcpProtocolIds() {
+        return tcpProtocolIds;
+    }
+
+    void sanitizeRedirectHeaders(ClientUri requestUri, ClientRequestHeaders requestHeaders) {
+        super.sanitizeRedirectSensitiveHeaders(requestUri, requestHeaders);
+    }
+
+    boolean canReplayEntityTo(ClientUri requestUri) {
+        return clientConfig().followCrossOriginEntityRedirects() || !crossesRedirectOriginBoundary(requestUri);
+    }
+
+    private static boolean sameOrigin(ClientUri sourceUri, ClientUri targetUri) {
+        return sourceUri.scheme().equalsIgnoreCase(targetUri.scheme())
+                && sourceUri.host().equalsIgnoreCase(targetUri.host())
+                && sourceUri.port() == targetUri.port();
+    }
+
+    private static List<String> defaultTcpProtocolIds() {
+        return List.of(Http2Client.PROTOCOL_ID, Http1Client.PROTOCOL_ID);
+    }
+
     Http2ClientResponseImpl invokeEntity(Object entity) {
         CompletableFuture<WebClientServiceRequest> whenSent = new CompletableFuture<>();
         CompletableFuture<WebClientServiceResponse> whenComplete = new CompletableFuture<>();
@@ -171,6 +275,10 @@ class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2
         return invokeWithServices(httpCall, whenSent, whenComplete);
     }
 
+    Http2ClientResponseImpl redirectProbe() {
+        return (Http2ClientResponseImpl) requestWithoutRouteCleanup();
+    }
+
     private Http2ClientResponseImpl invokeWithServices(Http2CallChainBase callChain,
                                                        CompletableFuture<WebClientServiceRequest> whenSent,
                                                        CompletableFuture<WebClientServiceResponse> whenComplete) {
@@ -178,7 +286,11 @@ class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2
         // will create a copy, so we could invoke this method multiple times
         ClientUri resolvedUri = resolvedUri();
 
-        WebClientServiceResponse serviceResponse = invokeServices(callChain, whenSent, whenComplete, resolvedUri);
+        WebClientServiceResponse serviceResponse = invokeServices(http2Client.webClient(),
+                                                                  callChain,
+                                                                  whenSent,
+                                                                  whenComplete,
+                                                                  resolvedUri);
 
         CompletableFuture<Void> complete = new CompletableFuture<>();
         complete.thenAccept(ignored -> serviceResponse.whenComplete().complete(serviceResponse))
@@ -192,19 +304,30 @@ class Http2ClientRequestImpl extends ClientRequestBase<Http2ClientRequest, Http2
             this.headers().forEach(delegateHeaders::set);
         }
 
-        // if this was an HTTP/1.1 response, do something different (just re-use response)
-        return new Http2ClientResponseImpl(clientConfig(),
-                                           serviceResponse.status(),
-                                           callChain.requestHeaders(),
-                                           serviceResponse.headers(),
-                                           serviceResponse.trailers(),
-                                           serviceResponse.inputStream().orElse(null),
-                                           mediaContext(),
-                                           resolvedUri,
-                                           serviceResponse.connection(),
-                                           complete,
-                                           callChain::closeResponse,
-                                           http2Client.protocolConfig().maxBufferedEntitySize().toBytes());
+        boolean retainRequestEntity = followRedirects()
+                && RedirectionProcessor.keepsMethodAndEntity(serviceResponse.serviceRequest().method(),
+                                                             serviceResponse.status());
+        boolean hasRequestEntity = retainRequestEntity && callChain.hasRequestEntity();
+        Object requestEntity = retainRequestEntity ? callChain.requestEntity() : null;
+        long maxBufferedEntitySize = http2Client.protocolConfig().maxBufferedEntitySize().toBytes();
+        Http2ClientResponseImpl response = new Http2ClientResponseImpl(clientConfig(),
+                                                                       callChain.protocolId(),
+                                                                       serviceResponse.status(),
+                                                                       callChain.requestHeaders(),
+                                                                       serviceResponse.headers(),
+                                                                       serviceResponse.trailers(),
+                                                                       serviceResponse.inputStream().orElse(null),
+                                                                       mediaContext(),
+                                                                       resolvedUri,
+                                                                       serviceResponse.connection(),
+                                                                       complete,
+                                                                       callChain::closeResponse,
+                                                                       maxBufferedEntitySize,
+                                                                       hasRequestEntity,
+                                                                       requestEntity);
+        callChain.releaseRequestEntity();
+        return response;
 
     }
+
 }

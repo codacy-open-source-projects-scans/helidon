@@ -25,9 +25,10 @@ import io.helidon.common.features.api.HelidonFlavor;
 @Features.Flavor(HelidonFlavor.SE)
 module io.helidon.webserver.observe.metrics {
 
-    requires io.helidon.common.context;
     requires io.helidon.http.media.json;
+    requires io.helidon.http.metrics;
     requires io.helidon.metrics.api;
+    requires io.helidon.service.registry;
     requires io.helidon.webserver;
     requires java.management;
 
@@ -40,11 +41,11 @@ module io.helidon.webserver.observe.metrics {
     exports io.helidon.webserver.observe.metrics;
     exports io.helidon.webserver.observe.metrics.spi;
 
+    uses io.helidon.metrics.spi.MeterRegistryFormatterProvider;
+
     provides io.helidon.webserver.observe.spi.ObserveProvider
             with io.helidon.webserver.observe.metrics.MetricsObserveProvider;
     provides io.helidon.metrics.spi.MeterRegistryFormatterProvider
             with io.helidon.webserver.observe.metrics.JsonMeterRegistryFormatterProvider;
-
-    uses io.helidon.metrics.spi.MeterRegistryFormatterProvider;
 
 }

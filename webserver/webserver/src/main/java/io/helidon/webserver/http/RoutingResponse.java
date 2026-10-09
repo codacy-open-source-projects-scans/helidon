@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,13 @@
 
 package io.helidon.webserver.http;
 
+import java.io.OutputStream;
+import java.util.Objects;
+import java.util.function.UnaryOperator;
+
+import io.helidon.common.Api;
 import io.helidon.http.HttpPrologue;
+import io.helidon.http.encoding.ContentEncoder;
 
 /**
  * Routing response of a server.
@@ -57,6 +63,37 @@ public interface RoutingResponse extends ServerResponse {
     boolean hasEntity();
 
     /**
+     * Configure whether the WebServer response layer may automatically encode the response entity using the listener
+     * content encoding context. This does not remove or rewrite any explicitly configured {@code Content-Encoding} header.
+     * Repeated calls replace the previous setting until response content encoding is selected.
+     *
+     * @param enabled whether automatic response content encoding is enabled
+     * @return this instance
+     * @throws IllegalStateException if response content encoding was already selected, or the response was sent
+     */
+    @Override
+    @Api.Incubating
+    default RoutingResponse automaticContentEncoding(boolean enabled) {
+        return this;
+    }
+
+    /**
+     * Configure an explicit response content encoder. Repeated calls replace the previous encoder until response content
+     * encoding is selected. The selected encoder's headers are applied once during selection.
+     *
+     * @param encoder content encoder
+     * @return this instance
+     * @throws NullPointerException if {@code encoder} is {@code null}
+     * @throws IllegalStateException if response content encoding was already selected, or the response was sent
+     */
+    @Override
+    @Api.Incubating
+    default RoutingResponse contentEncoder(ContentEncoder encoder) {
+        ServerResponse.super.contentEncoder(encoder);
+        return this;
+    }
+
+    /**
      * Return true if the underlying response buffers and headers can be reset and a new response can be sent.
      *
      * @return {@code true} if reset was successful and a new response can be created instead of the existing one,
@@ -83,5 +120,56 @@ public interface RoutingResponse extends ServerResponse {
      */
     default boolean resetStream() {
         return reset();
+    }
+
+    /**
+     * Reset the response entity so an unsent response can be replaced while preserving response metadata unrelated to
+     * the entity, such as CORS, cookies, cache controls, and {@code Vary} headers.
+     * <p>
+     * This method is intended for Helidon infrastructure that replaces a failed response entity.
+     * <p>
+     * Implementations that track entity metadata must override this method to reset entity buffers and remove framing,
+     * representation, validator, range, and trailer headers. Implementations with separate trailer state must reset that
+     * state as well.
+     * This method does not change the response status. An error handler that replaces the entity is responsible for
+     * configuring or deliberately retaining an appropriate status before sending the replacement response.
+     * <p>
+     * For compatibility with existing {@link RoutingResponse} implementations, the default implementation calls
+     * {@link #resetStream()}.
+     *
+     * @return {@code true} if reset was successful and a new entity can be created instead of the existing one,
+     *         {@code false} if reset failed and status and headers (and maybe entity bytes) were already sent
+     */
+    @Api.Internal
+    default boolean resetEntity() {
+        return resetStream();
+    }
+
+    /**
+     * Configure an infrastructure output stream filter associated with the current response entity.
+     * <p>
+     * Implementations which distinguish entity-scoped filters remove the filter if error handling replaces the unsent
+     * entity. Application filters should use {@link #streamFilter(UnaryOperator)} so they also apply to a replacement
+     * error response. The default fallback registers the filter through the public method and therefore retains it.
+     *
+     * @param filterFunction function that wraps the response output stream
+     */
+    @Api.Internal
+    default void entityStreamFilter(UnaryOperator<OutputStream> filterFunction) {
+        streamFilter(Objects.requireNonNull(filterFunction));
+    }
+
+    /**
+     * Register an infrastructure listener associated with the current response entity.
+     * <p>
+     * Implementations which distinguish entity-scoped listeners remove the listener if error handling replaces the
+     * unsent entity. Application listeners should use {@link #beforeSend(Runnable)} so they also apply to a replacement
+     * error response. The default fallback registers the listener through the public method and therefore retains it.
+     *
+     * @param listener listener invoked before the response is sent
+     */
+    @Api.Internal
+    default void entityBeforeSend(Runnable listener) {
+        beforeSend(Objects.requireNonNull(listener));
     }
 }

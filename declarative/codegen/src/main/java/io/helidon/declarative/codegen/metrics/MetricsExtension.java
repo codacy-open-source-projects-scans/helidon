@@ -17,7 +17,6 @@
 package io.helidon.declarative.codegen.metrics;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -31,9 +30,11 @@ import io.helidon.codegen.classmodel.ClassModel;
 import io.helidon.codegen.classmodel.ContentBuilder;
 import io.helidon.common.types.Annotated;
 import io.helidon.common.types.Annotation;
+import io.helidon.common.types.ElementKind;
 import io.helidon.common.types.TypeInfo;
 import io.helidon.common.types.TypeName;
 import io.helidon.common.types.TypedElementInfo;
+import io.helidon.declarative.codegen.common.DeclarativeElementInfo;
 import io.helidon.service.codegen.RegistryCodegenContext;
 import io.helidon.service.codegen.RegistryRoundContext;
 import io.helidon.service.codegen.spi.RegistryCodegenExtension;
@@ -43,7 +44,6 @@ import static io.helidon.declarative.codegen.metrics.MetricsTypes.ANNOTATION_GAU
 import static io.helidon.declarative.codegen.metrics.MetricsTypes.ANNOTATION_TAG;
 import static io.helidon.declarative.codegen.metrics.MetricsTypes.ANNOTATION_TAGS;
 import static io.helidon.declarative.codegen.metrics.MetricsTypes.ANNOTATION_TIMED;
-import static io.helidon.declarative.codegen.metrics.MetricsTypes.TAG;
 import static io.helidon.service.codegen.ServiceCodegenTypes.SERVICE_ANNOTATION_SINGLETON;
 
 class MetricsExtension implements RegistryCodegenExtension {
@@ -53,10 +53,6 @@ class MetricsExtension implements RegistryCodegenExtension {
 
     MetricsExtension(RegistryCodegenContext ctx) {
         this.ctx = ctx;
-    }
-
-    static String scope(Annotation annotation) {
-        return annotation.stringValue("scope").orElse("application");
     }
 
     static List<Tag> tags(RegistryRoundContext roundContext,
@@ -103,8 +99,7 @@ class MetricsExtension implements RegistryCodegenExtension {
         while (it.hasNext()) {
             var tag = it.next();
             contentBuilder
-                    .addContent(TAG)
-                    .addContent(".create(")
+                    .addContent("metricsFactory.tagCreate(")
                     .addContentLiteral(tag.key())
                     .addContent(", ")
                     .addContentLiteral(tag.value())
@@ -138,16 +133,15 @@ class MetricsExtension implements RegistryCodegenExtension {
     }
 
     private static List<Tag> elementTags(Annotated annotated) {
-        if (annotated.hasAnnotation(ANNOTATION_TAG)) {
-            return toTags(List.of(annotated.annotation(ANNOTATION_TAG)));
+        List<Tag> result = new ArrayList<>();
+        for (Annotation annotation : annotated.annotations()) {
+            if (ANNOTATION_TAG.equals(annotation.typeName())) {
+                result.addAll(toTags(List.of(annotation)));
+            } else if (ANNOTATION_TAGS.equals(annotation.typeName())) {
+                result.addAll(toTags(annotation.annotationValues().orElseGet(List::of)));
+            }
         }
-
-        if (annotated.hasAnnotation(ANNOTATION_TAGS)) {
-            return toTags(annotated.annotation(ANNOTATION_TAGS)
-                                  .annotationValues()
-                                  .orElseGet(List::of));
-        }
-        return List.of();
+        return List.copyOf(result);
     }
 
     private static List<Tag> toTags(List<Annotation> tags) {
@@ -158,55 +152,73 @@ class MetricsExtension implements RegistryCodegenExtension {
     }
 
     private void generateCountedInterceptors(RegistryRoundContext roundContext, Map<TypeName, TypeInfo> types) {
-        Collection<TypedElementInfo> elements = roundContext.annotatedElements(ANNOTATION_COUNTED);
         Map<TypeName, AtomicInteger> counters = new HashMap<>();
         types.keySet()
                 .forEach(it -> counters.put(it, new AtomicInteger()));
 
         CountedHandler countedHandler = new CountedHandler(roundContext);
 
-        for (TypedElementInfo element : elements) {
-            TypeName enclosingType = enclosingType(element);
-            int counter = counters.computeIfAbsent(enclosingType, k -> new AtomicInteger())
-                    .getAndIncrement();
-
-            TypeInfo typeInfo = types.get(enclosingType);
-            if (typeInfo == null) {
-                typeInfo = ctx.typeInfo(enclosingType).orElseThrow(() -> new CodegenException("No type info found for type "
-                                                                                                      + enclosingType.fqName()));
+        for (TypeInfo typeInfo : types.values()) {
+            if (typeInfo.kind() == ElementKind.INTERFACE) {
+                continue;
             }
-            checkTypeIsService(roundContext, typeInfo);
-            countedHandler.handle(typeInfo, element, counter);
+            for (TypedElementInfo element : typeInfo.elementInfo()) {
+                if (!DeclarativeElementInfo.belongsToService(typeInfo, element)
+                        || !element.hasAnnotation(ANNOTATION_COUNTED)) {
+                    continue;
+                }
+
+                int counter = counters.computeIfAbsent(typeInfo.typeName(), k -> new AtomicInteger())
+                        .getAndIncrement();
+                checkTypeIsService(roundContext, typeInfo);
+                countedHandler.handle(typeInfo, element, counter);
+            }
         }
     }
 
     private void generateTimedInterceptors(RegistryRoundContext roundContext, Map<TypeName, TypeInfo> types) {
-        Collection<TypedElementInfo> elements = roundContext.annotatedElements(ANNOTATION_TIMED);
         Map<TypeName, AtomicInteger> counters = new HashMap<>();
         types.keySet()
                 .forEach(it -> counters.put(it, new AtomicInteger()));
 
         TimedHandler handler = new TimedHandler(roundContext);
 
-        for (TypedElementInfo element : elements) {
-            TypeName enclosingType = enclosingType(element);
-            int counter = counters.computeIfAbsent(enclosingType, k -> new AtomicInteger())
-                    .getAndIncrement();
-
-            TypeInfo typeInfo = types.get(enclosingType);
-            if (typeInfo == null) {
-                typeInfo = ctx.typeInfo(enclosingType).orElseThrow(() -> new CodegenException("No type info found for type "
-                                                                                                      + enclosingType.fqName()));
+        for (TypeInfo typeInfo : types.values()) {
+            if (typeInfo.kind() == ElementKind.INTERFACE) {
+                continue;
             }
-            checkTypeIsService(roundContext, typeInfo);
-            handler.handle(typeInfo, element, counter);
+            for (TypedElementInfo element : typeInfo.elementInfo()) {
+                if (!DeclarativeElementInfo.belongsToService(typeInfo, element)
+                        || !element.hasAnnotation(ANNOTATION_TIMED)) {
+                    continue;
+                }
+
+                int counter = counters.computeIfAbsent(typeInfo.typeName(), k -> new AtomicInteger())
+                        .getAndIncrement();
+                checkTypeIsService(roundContext, typeInfo);
+                handler.handle(typeInfo, element, counter);
+            }
         }
     }
 
     private void generateGaugeRegistrars(RegistryRoundContext roundContext, Map<TypeName, TypeInfo> types) {
         Map<TypeName, List<Gauge>> gaugeByType = new HashMap<>();
 
-        addGauges(roundContext, gaugeByType);
+        for (TypeInfo typeInfo : types.values()) {
+            if (typeInfo.kind() == ElementKind.INTERFACE) {
+                continue;
+            }
+            for (TypedElementInfo element : typeInfo.elementInfo()) {
+                if (!DeclarativeElementInfo.belongsToService(typeInfo, element)
+                        || !element.hasAnnotation(ANNOTATION_GAUGE)) {
+                    continue;
+                }
+
+                TypeName typeName = typeInfo.typeName();
+                var allGauges = gaugeByType.computeIfAbsent(typeName, k -> new ArrayList<>());
+                processGauge(roundContext, allGauges, typeName, element);
+            }
+        }
 
         GaugeHandler handler = new GaugeHandler(roundContext);
 
@@ -237,25 +249,6 @@ class MetricsExtension implements RegistryCodegenExtension {
         }
     }
 
-    private TypeName enclosingType(TypedElementInfo element) {
-        Optional<TypeName> enclosingType = element.enclosingType();
-        if (enclosingType.isEmpty()) {
-            throw new CodegenException("Element " + element + " does not have an enclosing type",
-                                       element.originatingElementValue());
-        }
-        return enclosingType.get();
-    }
-
-    private void addGauges(RegistryRoundContext roundContext,
-                           Map<TypeName, List<Gauge>> gaugesByType) {
-        Collection<TypedElementInfo> elements = roundContext.annotatedElements(ANNOTATION_GAUGE);
-        for (TypedElementInfo element : elements) {
-            TypeName enclosingType = enclosingType(element);
-            var allGauges = gaugesByType.computeIfAbsent(enclosingType, k -> new ArrayList<>());
-            processGauge(roundContext, allGauges, enclosingType, element);
-        }
-    }
-
     private void processGauge(RegistryRoundContext roundContext,
                               List<Gauge> allGauges,
                               TypeName enclosingType,
@@ -271,7 +264,6 @@ class MetricsExtension implements RegistryCodegenExtension {
 
         // read annotation values
         Annotation annotation = element.annotation(ANNOTATION_GAUGE);
-        String scope = scope(annotation);
         String description = description(annotation, ANNOTATION_GAUGE, enclosingType, element);
         String unit = annotation.stringValue("unit").orElse("none");
 
@@ -286,7 +278,6 @@ class MetricsExtension implements RegistryCodegenExtension {
                                 gaugeName,
                                 description,
                                 unit,
-                                scope,
                                 tags));
     }
 
@@ -296,7 +287,6 @@ class MetricsExtension implements RegistryCodegenExtension {
             String name,
             String description,
             String unit,
-            String scope,
             List<Tag> tags) {
     }
 

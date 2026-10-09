@@ -75,6 +75,7 @@ final class FactoryPrototypeInfo {
         Javadoc blueprintJavadoc = Javadoc.parse(blueprint.description().orElse(""));
         Predicate<String> defaultMethodsPredicate = defaultMethodsPredicate(blueprint);
         Optional<TypeName> superPrototype = superPrototype(blueprint);
+        validateSealedSuperPrototype(ctx, blueprint);
 
         PrototypeInfo.Builder prototype = PrototypeInfo.builder()
                 .blueprint(blueprint)
@@ -86,7 +87,7 @@ final class FactoryPrototypeInfo {
                 .builderAccessModifier(builderAccessModifier(blueprintAnnotation))
                 .createEmptyCreate(createEmptyPublic(blueprintAnnotation))
                 .recordStyle(recordStyleAccessors(blueprintAnnotation))
-                .registrySupport(registrySupport(blueprint))
+                .registrySupport(registrySupport(ctx, blueprint))
                 .superPrototype(superPrototype)
                 .providerProvides(providerProvides(blueprint))
                 .javadoc(prototypeJavadoc(blueprint))
@@ -140,6 +141,66 @@ final class FactoryPrototypeInfo {
         copyDefaultMethods(blueprint, prototype, defaultMethodsNotOptions);
 
         return prototype.build();
+    }
+
+    static TypeName generatedTypeName(TypeInfo typeInfo) {
+        String typeName = typeInfo.typeName().className();
+        if (typeName.endsWith(BLUEPRINT)) {
+            typeName = typeName.substring(0, typeName.length() - BLUEPRINT.length());
+        } else {
+            throw new CodegenException("Blueprint interface name must end with " + BLUEPRINT
+                                               + ", this is invalid type: " + typeInfo.typeName().fqName(),
+                                       typeInfo);
+        }
+
+        return TypeName.builder(typeInfo.typeName())
+                .enclosingNames(List.of())
+                .className(typeName)
+                .build();
+    }
+
+    static List<Annotation> annotations(Annotated it) {
+        List<Annotation> annotations = new ArrayList<>();
+
+        // annotations to be added to generated code
+        it.findAnnotation(Types.PROTOTYPE_ANNOTATED)
+                .flatMap(Annotation::stringValues)
+                .orElseGet(List::of)
+                .stream()
+                .map(String::trim) // to remove spaces after commas when used
+                .filter(Predicate.not(String::isBlank)) // we do not care about blank values
+                .map(io.helidon.codegen.classmodel.Annotation::parse)
+                .map(io.helidon.codegen.classmodel.Annotation::toTypesAnnotation)
+                .forEach(annotations::add);
+
+        for (var annotation : it.allAnnotations()) {
+            if (isApiAnnotation(annotation)) {
+                // this is an API annotation, add them all (stability, maybe Since) to the generated prototype
+                annotations.add(annotation);
+            }
+        }
+
+        return annotations;
+    }
+
+    static boolean isApiAnnotation(Annotation annotation) {
+        var annotationType = annotation.typeName();
+        List<String> enclosingNames = annotationType.enclosingNames();
+        return enclosingNames.size() == 1
+                && Api.class.getSimpleName().equals(enclosingNames.getFirst())
+                && Api.class.getPackageName().equals(annotationType.packageName());
+    }
+
+    static Optional<String> inheritedServiceRegistryAccessor(RoundContext ctx, TypeInfo blueprint) {
+        return superBlueprintDefinition(ctx, blueprint)
+                .flatMap(it -> serviceRegistryOwner(ctx, it))
+                .map(FactoryPrototypeInfo::serviceRegistryAccessor);
+    }
+
+    static Optional<String> inheritedConfigAccessor(RoundContext ctx, TypeInfo blueprint) {
+        return superBlueprintDefinition(ctx, blueprint)
+                .flatMap(it -> configOwner(ctx, it))
+                .map(FactoryPrototypeInfo::configAccessor);
     }
 
     private static List<TypedElementInfo> defaultMethodsNotOptions(TypeInfo blueprint,
@@ -400,39 +461,6 @@ final class FactoryPrototypeInfo {
                 .toList();
     }
 
-    private static List<Annotation> annotations(Annotated it) {
-        List<Annotation> annotations = new ArrayList<>();
-
-        // annotations to be added to generated code
-        it.findAnnotation(Types.PROTOTYPE_ANNOTATED)
-                .flatMap(Annotation::stringValues)
-                .orElseGet(List::of)
-                .stream()
-                .map(String::trim) // to remove spaces after commas when used
-                .filter(Predicate.not(String::isBlank)) // we do not care about blank values
-                .map(io.helidon.codegen.classmodel.Annotation::parse)
-                .map(io.helidon.codegen.classmodel.Annotation::toTypesAnnotation)
-                .forEach(annotations::add);
-
-        for (var annotation : it.allAnnotations()) {
-            var annotationType = annotation.typeName();
-            List<String> enclosingNames = annotationType.enclosingNames();
-            if (enclosingNames.isEmpty()) {
-                continue;
-            }
-            if (enclosingNames.size() != 1) {
-                continue;
-            }
-            if (Api.class.getSimpleName().equals(enclosingNames.getFirst())
-                    && Api.class.getPackageName().equals(annotationType.packageName())) {
-                // this is an API annotation, add them all (stability, maybe Since) to the generated prototype
-                annotations.add(annotation);
-            }
-        }
-
-        return annotations;
-    }
-
     private static Optional<TypeInfo> customMethodsTypeInfo(RoundContext ctx,
                                                             TypeInfo blueprint) {
         // first check the blueprint
@@ -540,12 +568,7 @@ final class FactoryPrototypeInfo {
         prototypeExtends.add(PROTOTYPE_API);
 
         // add custom implements
-        blueprint.findAnnotation(Types.PROTOTYPE_IMPLEMENT)
-                .flatMap(Annotation::stringValues)
-                .stream()
-                .flatMap(List::stream)
-                .map(TypeName::create)
-                .forEach(prototypeExtends::add);
+        implementedTypes(blueprint).forEach(prototypeExtends::add);
 
         // add declared implements
         for (TypeInfo superInterface : blueprint.interfaceTypeInfo()) {
@@ -578,10 +601,146 @@ final class FactoryPrototypeInfo {
                 .orElseGet(Set::of);
     }
 
-    private static boolean registrySupport(TypeInfo blueprint) {
-        return blueprint.findAnnotation(Types.PROTOTYPE_SERVICE_REGISTRY)
+    private static boolean registrySupport(RoundContext ctx, TypeInfo blueprint) {
+        Optional<Annotation> annotation = blueprint.findAnnotation(Types.PROTOTYPE_SERVICE_REGISTRY);
+        if (annotation.isPresent()) {
+            return annotation.get().booleanValue().orElse(true);
+        }
+        return superBlueprintDefinition(ctx, blueprint)
+                .map(it -> registrySupport(ctx, it))
+                .orElse(false);
+    }
+
+    private static Optional<TypeInfo> serviceRegistryOwner(RoundContext ctx, TypeInfo blueprint) {
+        Optional<TypeInfo> inheritedOwner = superBlueprintDefinition(ctx, blueprint)
+                .flatMap(it -> serviceRegistryOwner(ctx, it));
+        if (inheritedOwner.isPresent()) {
+            return inheritedOwner;
+        }
+        return declaresServiceRegistry(blueprint) ? Optional.of(blueprint) : Optional.empty();
+    }
+
+    private static Optional<TypeInfo> configOwner(RoundContext ctx, TypeInfo blueprint) {
+        Optional<TypeInfo> inheritedOwner = superBlueprintDefinition(ctx, blueprint)
+                .flatMap(it -> configOwner(ctx, it));
+        if (inheritedOwner.isPresent()) {
+            return inheritedOwner;
+        }
+        return blueprint.hasAnnotation(PROTOTYPE_CONFIGURED) ? Optional.of(blueprint) : Optional.empty();
+    }
+
+    private static String serviceRegistryAccessor(TypeInfo owner) {
+        return recordStyleAccessors(blueprintAnnotation(owner)) ? "serviceRegistry" : "getServiceRegistry";
+    }
+
+    private static String configAccessor(TypeInfo owner) {
+        return recordStyleAccessors(blueprintAnnotation(owner)) ? "config" : "getConfig";
+    }
+
+    private static Optional<TypeInfo> superBlueprintDefinition(RoundContext ctx, TypeInfo blueprint) {
+        return superBlueprintDefinition(ctx, blueprint, new HashSet<>());
+    }
+
+    private static void validateSealedSuperPrototype(RoundContext ctx, TypeInfo blueprint) {
+        superBlueprintDefinition(ctx, blueprint)
+                .filter(it -> it.hasAnnotation(Types.PROTOTYPE_SEALED))
+                .or(() -> implementedTypes(blueprint)
+                        .stream()
+                        .map(it -> implementedPrototypeBlueprint(ctx, it))
+                        .flatMap(Optional::stream)
+                        .filter(it -> it.hasAnnotation(Types.PROTOTYPE_SEALED))
+                        .findFirst())
+                .ifPresent(superBlueprint -> {
+                    TypeName prototype = generatedTypeName(blueprint);
+                    TypeName superPrototype = generatedTypeName(superBlueprint);
+                    throw new CodegenException("Prototype " + prototype.className()
+                                                       + " cannot extend sealed prototype " + superPrototype.className()
+                                                       + ". Sealed prototypes must be leaf prototypes.",
+                                               blueprint);
+                });
+    }
+
+    private static List<TypeName> implementedTypes(TypeInfo blueprint) {
+        return blueprint.findAnnotation(Types.PROTOTYPE_IMPLEMENT)
+                .flatMap(Annotation::stringValues)
+                .stream()
+                .flatMap(List::stream)
+                .map(TypeName::create)
+                .toList();
+    }
+
+    private static Optional<TypeInfo> implementedPrototypeBlueprint(RoundContext ctx, TypeName prototype) {
+        TypeName genericPrototype = prototype.genericTypeName();
+        return ctx.typeInfo(genericPrototype)
+                .flatMap(it -> generatedPrototypeBlueprint(ctx, it))
+                .or(() -> ctx.typeInfo(TypeName.builder(genericPrototype)
+                                               .className(genericPrototype.className() + BLUEPRINT)
+                                               .build())
+                        .filter(it -> it.hasAnnotation(PROTOTYPE_BLUEPRINT)));
+    }
+
+    private static Optional<TypeInfo> superBlueprintDefinition(RoundContext ctx,
+                                                               TypeInfo inProgress,
+                                                               Set<TypeName> processed) {
+        for (TypeInfo superInterface : inProgress.interfaceTypeInfo()) {
+            if (!processed.add(superInterface.typeName())) {
+                continue;
+            }
+            if (superInterface.hasAnnotation(PROTOTYPE_BLUEPRINT)) {
+                return Optional.of(superInterface);
+            }
+            Optional<TypeInfo> prototypeBlueprint = superInterface.interfaceTypeInfo()
+                    .stream()
+                    .filter(it -> it.hasAnnotation(PROTOTYPE_BLUEPRINT))
+                    .findFirst();
+            if (prototypeBlueprint.isEmpty()) {
+                prototypeBlueprint = generatedPrototypeBlueprint(ctx, superInterface);
+            }
+            if (prototypeBlueprint.isPresent()) {
+                return prototypeBlueprint;
+            }
+            Optional<TypeInfo> inheritedBlueprint = superBlueprintDefinition(ctx, superInterface, processed);
+            if (inheritedBlueprint.isPresent()) {
+                return inheritedBlueprint;
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<TypeInfo> generatedPrototypeBlueprint(RoundContext ctx, TypeInfo prototype) {
+        return prototype.findAnnotation(Types.GENERATED)
+                .filter(it -> it.stringValue()
+                        .filter(BuilderCodegen.class.getName()::equals)
+                        .isPresent())
+                .flatMap(it -> it.stringValue("trigger"))
+                .map(TypeName::create)
+                .flatMap(ctx::typeInfo)
+                .filter(it -> it.hasAnnotation(PROTOTYPE_BLUEPRINT));
+    }
+
+    private static boolean declaresServiceRegistry(TypeInfo blueprint) {
+        boolean registrySupport = blueprint.findAnnotation(Types.PROTOTYPE_SERVICE_REGISTRY)
                 .flatMap(Annotation::booleanValue)
                 .orElse(false);
+        return registrySupport || hasRegistryServiceOption(blueprint, new HashSet<>());
+    }
+
+    private static boolean hasRegistryServiceOption(TypeInfo inProgress, Set<TypeName> processed) {
+        if (!processed.add(inProgress.typeName())) {
+            return false;
+        }
+        if (inProgress.elementInfo()
+                .stream()
+                .anyMatch(it -> it.hasAnnotation(Types.OPTION_REGISTRY_SERVICE))) {
+            return true;
+        }
+        return inProgress.interfaceTypeInfo()
+                .stream()
+                .filter(it -> !it.hasAnnotation(PROTOTYPE_BLUEPRINT))
+                .filter(it -> it.interfaceTypeInfo()
+                        .stream()
+                        .noneMatch(parent -> parent.typeName().equals(PROTOTYPE_API)))
+                .anyMatch(it -> hasRegistryServiceOption(it, processed));
     }
 
     private static boolean createEmptyPublic(Annotation blueprintAnnotation) {
@@ -635,22 +794,6 @@ final class FactoryPrototypeInfo {
         }
 
         return methodNames::contains;
-    }
-
-    private static TypeName generatedTypeName(TypeInfo typeInfo) {
-        String typeName = typeInfo.typeName().className();
-        if (typeName.endsWith(BLUEPRINT)) {
-            typeName = typeName.substring(0, typeName.length() - BLUEPRINT.length());
-        } else {
-            throw new CodegenException("Blueprint interface name must end with " + BLUEPRINT
-                                               + ", this is invalid type: " + typeInfo.typeName().fqName(),
-                                       typeInfo);
-        }
-
-        return TypeName.builder(typeInfo.typeName())
-                .enclosingNames(List.of())
-                .className(typeName)
-                .build();
     }
 
     private static Optional<TypeName> superPrototype(TypeInfo blueprint) {

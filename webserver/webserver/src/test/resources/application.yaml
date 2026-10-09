@@ -24,6 +24,11 @@ server:
       max-prologue-length: 4096
       max-headers-size: 8192
       max-buffered-entity-size: "8 KB"
+      alt-svc:
+        protocol: "h3"
+        port: 8443
+        max-age: PT1H
+        persist: true
   sockets:
     - name: "other"
       write-buffer-size: 1024
@@ -31,7 +36,7 @@ server:
       protocols:
         http_1_1:
           validate-request-headers: false
-          validate-response-headers: true
+          validate-response-headers: false
           validate-path: false
           max-prologue-length: 81
           max-headers-size: 42
@@ -46,7 +51,10 @@ server2:
   port: 8079
   host: 127.0.0.1
   shutdown-grace-period: PT1S
-  enable-proxy-protocol: true
+  proxy-protocol:
+    trusted-proxies:
+      allow:
+        all: true
 
   connection-providers-discover-services: false
   media-context:
@@ -59,7 +67,27 @@ server3:
   sockets:
     - name: "grace"
       shutdown-grace-period: PT2S
-      enable-proxy-protocol: true
+      proxy-protocol:
+        trusted-proxies:
+          allow:
+            all: true
+
+server4:
+  port: 8079
+  host: 127.0.0.1
+  tls:
+    enabled: true
+  sni:
+    missing: REJECT
+    unmatched: REJECT
+    authority-mismatch: ALLOW
+    fallback-authority: ALLOW
+  virtual-hosts:
+    - host: "Api.Example.COM."
+      tls:
+        enabled: true
+        cipher-suite:
+          - "TLS_AES_128_GCM_SHA256"
 
 inject:
   permits-dynamic: true

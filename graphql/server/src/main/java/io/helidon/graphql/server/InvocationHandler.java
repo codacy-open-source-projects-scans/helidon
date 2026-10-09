@@ -16,19 +16,29 @@
 
 package io.helidon.graphql.server;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
+import io.helidon.common.Api;
 import io.helidon.config.Config;
 
 import graphql.GraphQL;
+import graphql.analysis.MaxQueryComplexityInstrumentation;
+import graphql.analysis.MaxQueryDepthInstrumentation;
 import graphql.execution.SubscriptionExecutionStrategy;
+import graphql.execution.instrumentation.ChainedInstrumentation;
+import graphql.execution.instrumentation.Instrumentation;
 import graphql.schema.GraphQLSchema;
 import graphql.schema.idl.SchemaPrinter;
 
 import static io.helidon.graphql.server.GraphQlConstants.DEFAULT_ERROR_MESSAGE;
+import static io.helidon.graphql.server.GraphQlConstants.DEFAULT_MAX_QUERY_COMPLEXITY;
+import static io.helidon.graphql.server.GraphQlConstants.DEFAULT_MAX_QUERY_DEPTH;
 
 /**
  * Invocation handler that allows execution of GraphQL requests without a WebServer.
@@ -59,7 +69,39 @@ public interface InvocationHandler {
      * @return GraphQL result
      */
     default Map<String, Object> execute(String query) {
-        return execute(query, null, Map.of());
+        return execute(query, (String) null, Map.of());
+    }
+
+    /**
+     * Execute a GraphQL query with context values available from {@link ExecutionContext#contextValue(String)}
+     * and from {@link graphql.schema.DataFetchingEnvironment#getGraphQlContext()}.
+     *
+     * @param query query string
+     * @param contextValues context values to use for this execution
+     * @return GraphQL result
+     */
+    @Api.Preview
+    default Map<String, Object> executeWithContext(String query, Map<String, Object> contextValues) {
+        return executeWithContext(query, Map.of(), contextValues);
+    }
+
+    /**
+     * Execute a GraphQL query with context values available from {@link ExecutionContext#contextValue(String)}
+     * and from {@link graphql.schema.DataFetchingEnvironment#getGraphQlContext()}.
+     *
+     * @param query query string
+     * @param variables variables to use
+     * @param contextValues context values to use for this execution
+     * @return GraphQL result
+     */
+    @Api.Preview
+    default Map<String, Object> executeWithContext(String query,
+                                                   Map<String, Object> variables,
+                                                   Map<String, Object> contextValues) {
+        Objects.requireNonNull(query);
+        Objects.requireNonNull(variables);
+        Objects.requireNonNull(contextValues);
+        return execute(query, (String) null, variables);
     }
 
     /**
@@ -71,6 +113,28 @@ public interface InvocationHandler {
      * @return GraphQL result
      */
     Map<String, Object> execute(String query, String operationName, Map<String, Object> variables);
+
+    /**
+     * Execute a GraphQL query with context values available from {@link ExecutionContext#contextValue(String)}
+     * and from {@link graphql.schema.DataFetchingEnvironment#getGraphQlContext()}.
+     *
+     * @param query query string
+     * @param operationName operation name
+     * @param variables variables to use
+     * @param contextValues context values to use for this execution
+     * @return GraphQL result
+     */
+    @Api.Preview
+    default Map<String, Object> executeWithContext(String query,
+                                                   String operationName,
+                                                   Map<String, Object> variables,
+                                                   Map<String, Object> contextValues) {
+        Objects.requireNonNull(query);
+        Objects.requireNonNull(operationName);
+        Objects.requireNonNull(variables);
+        Objects.requireNonNull(contextValues);
+        return execute(query, operationName, variables);
+    }
 
     /**
      * The schema of this GraphQL endpoint.
@@ -101,13 +165,29 @@ public interface InvocationHandler {
     Set<String> whitelistedExceptions();
 
     /**
+     * Handler used to update the {@link ExecutionContext} before GraphQL execution.
+     */
+    @FunctionalInterface
+    interface ContextHandler {
+        /**
+         * Update the execution context.
+         *
+         * @param context execution context
+         */
+        void update(ExecutionContext context);
+    }
+
+    /**
      * Fluent API builder to configure the invocation handler.
      */
     class Builder implements io.helidon.common.Builder<Builder, InvocationHandler> {
         private final Set<String> blacklistedExceptions = new HashSet<>();
         private final Set<String> whitelistedExceptions = new HashSet<>();
+        private final List<ContextHandler> contextHandlers = new ArrayList<>();
 
         private String defaultErrorMessage = DEFAULT_ERROR_MESSAGE;
+        private int maxQueryDepth = DEFAULT_MAX_QUERY_DEPTH;
+        private int maxQueryComplexity = DEFAULT_MAX_QUERY_COMPLEXITY;
         private GraphQLSchema schema;
         private SchemaPrinter schemaPrinter;
 
@@ -120,9 +200,11 @@ public interface InvocationHandler {
                 throw new IllegalStateException("GraphQL schema must be configured");
             }
 
-            GraphQL graphQl = GraphQL.newGraphQL(schema)
+            GraphQL.Builder graphQlBuilder = GraphQL.newGraphQL(schema)
                     .subscriptionExecutionStrategy(new SubscriptionExecutionStrategy())
-                    .build();
+                    .preparsedDocumentProvider(InvocationHandlerImpl.preparsedDocumentProvider(schema));
+            configureInstrumentation(graphQlBuilder);
+            GraphQL graphQl = graphQlBuilder.build();
 
             SchemaPrinter.Options options = SchemaPrinter.Options
                     .defaultOptions()
@@ -152,6 +234,16 @@ public interface InvocationHandler {
          *     <td>Error message used for internal errors that are not whitelisted.</td>
          * </tr>
          * <tr>
+         *     <td>max-query-depth</td>
+         *     <td>{@value io.helidon.graphql.server.GraphQlConstants#DEFAULT_MAX_QUERY_DEPTH}</td>
+         *     <td>Maximum GraphQL query depth. Must not be negative. Set to {@code 0} to disable the limit.</td>
+         * </tr>
+         * <tr>
+         *     <td>max-query-complexity</td>
+         *     <td>{@value io.helidon.graphql.server.GraphQlConstants#DEFAULT_MAX_QUERY_COMPLEXITY}</td>
+         *     <td>Maximum GraphQL query complexity. Must not be negative. Set to {@code 0} to disable the limit.</td>
+         * </tr>
+         * <tr>
          *     <td>exception-white-list</td>
          *     <td>&nbsp;</td>
          *     <td>Array of exceptions classes. If an {@link java.lang.Error} or a {@link java.lang.RuntimeException}
@@ -170,6 +262,8 @@ public interface InvocationHandler {
          */
         public Builder config(Config config) {
             config.get("default-error-message").asString().ifPresent(this::defaultErrorMessage);
+            config.get("max-query-depth").asInt().ifPresent(this::maxQueryDepth);
+            config.get("max-query-complexity").asInt().ifPresent(this::maxQueryComplexity);
             config.get("exception-white-list").asList(String.class)
                     .stream()
                     .flatMap(List::stream)
@@ -201,6 +295,47 @@ public interface InvocationHandler {
          */
         public Builder defaultErrorMessage(String defaultErrorMessage) {
             this.defaultErrorMessage = defaultErrorMessage;
+            return this;
+        }
+
+        /**
+         * Add a context handler to update the {@link ExecutionContext} before GraphQL execution.
+         *
+         * @param contextHandler context handler
+         * @return updated builder instance
+         */
+        public Builder addContextHandler(ContextHandler contextHandler) {
+            contextHandlers.add(Objects.requireNonNull(contextHandler));
+            return this;
+        }
+
+        /**
+         * Maximum allowed GraphQL query depth. Set to {@code 0} to disable the limit.
+         *
+         * @param maxQueryDepth maximum query depth
+         * @return updated builder instance
+         * @throws IllegalArgumentException if the depth is negative
+         */
+        public Builder maxQueryDepth(int maxQueryDepth) {
+            if (maxQueryDepth < 0) {
+                throw new IllegalArgumentException("Maximum query depth cannot be negative");
+            }
+            this.maxQueryDepth = maxQueryDepth;
+            return this;
+        }
+
+        /**
+         * Maximum allowed GraphQL query complexity. Set to {@code 0} to disable the limit.
+         *
+         * @param maxQueryComplexity maximum query complexity
+         * @return updated builder instance
+         * @throws IllegalArgumentException if the complexity is negative
+         */
+        public Builder maxQueryComplexity(int maxQueryComplexity) {
+            if (maxQueryComplexity < 0) {
+                throw new IllegalArgumentException("Maximum query complexity cannot be negative");
+            }
+            this.maxQueryComplexity = maxQueryComplexity;
             return this;
         }
 
@@ -270,8 +405,28 @@ public interface InvocationHandler {
             return whitelistedExceptions;
         }
 
+        List<ContextHandler> contextHandlers() {
+            return Collections.unmodifiableList(contextHandlers);
+        }
+
         SchemaPrinter schemaPrinter() {
             return schemaPrinter;
+        }
+
+        private void configureInstrumentation(GraphQL.Builder graphQlBuilder) {
+            List<Instrumentation> instrumentations = new ArrayList<>(2);
+            if (maxQueryDepth > 0) {
+                instrumentations.add(new MaxQueryDepthInstrumentation(maxQueryDepth));
+            }
+            if (maxQueryComplexity > 0) {
+                instrumentations.add(new MaxQueryComplexityInstrumentation(maxQueryComplexity));
+            }
+
+            if (instrumentations.size() == 1) {
+                graphQlBuilder.instrumentation(instrumentations.get(0));
+            } else if (!instrumentations.isEmpty()) {
+                graphQlBuilder.instrumentation(new ChainedInstrumentation(instrumentations));
+            }
         }
     }
 }

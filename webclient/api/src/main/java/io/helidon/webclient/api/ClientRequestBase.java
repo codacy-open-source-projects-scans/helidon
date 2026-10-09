@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,16 +23,17 @@ import java.net.UnixDomainSocketAddress;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
+import io.helidon.common.Api;
 import io.helidon.common.Version;
 import io.helidon.common.buffers.BufferData;
 import io.helidon.common.context.Context;
@@ -42,6 +43,7 @@ import io.helidon.common.uri.UriEncoding;
 import io.helidon.common.uri.UriFragment;
 import io.helidon.http.ClientRequestHeaders;
 import io.helidon.http.Header;
+import io.helidon.http.HeaderName;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.Headers;
@@ -66,6 +68,8 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
      * Proxy connection header.
      */
     public static final Header PROXY_CONNECTION = HeaderValues.create("Proxy-Connection", "keep-alive");
+    private static final String CROSS_ORIGIN_REDIRECT_PROPERTY =
+            ClientRequestBase.class.getName() + ".redirect.cross-origin." + UUID.randomUUID();
     private static final Map<String, AtomicLong> COUNTERS = new ConcurrentHashMap<>();
     private static final Set<String> SUPPORTED_SCHEMES = Set.of("https", "http");
 
@@ -75,24 +79,40 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
     private final String protocolId;
     private final Method method;
     private final ClientUri clientUri;
+    private final ClientUri redirectSourceUri;
     private final Map<String, String> properties;
+    private final Set<HeaderName> redirectSensitiveHeaders;
     private final ClientRequestHeaders headers;
     private final String requestId;
     private final MediaContext mediaContext;
+    private final boolean filterRedirectHeaders;
 
     private SocketAddress socketAddress;
-    private String uriTemplate;
+    private UriTemplateQuery uriTemplate;
+    private boolean crossOriginRedirect;
     private boolean skipUriEncoding;
     private boolean followRedirects;
     private int maxRedirects;
     private Duration readTimeout;
     private Duration readContinueTimeout;
     private Tls tls;
+    private SniConfig sni;
     private Proxy proxy;
+    private ProxyRoute selectedProxyRoute;
     private boolean keepAlive;
     private ClientConnection connection;
     private Boolean sendExpectContinue;
 
+    /**
+     * Create a new request.
+     *
+     * @param clientConfig client configuration
+     * @param cookieManager cookie manager
+     * @param protocolId protocol identifier
+     * @param method HTTP method
+     * @param clientUri request URI
+     * @param properties request properties
+     */
     protected ClientRequestBase(HttpClientConfig clientConfig,
                                 WebClientCookieManager cookieManager,
                                 String protocolId,
@@ -102,6 +122,17 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         this(clientConfig, cookieManager, protocolId, method, clientUri, null, properties);
     }
 
+    /**
+     * Create a new request.
+     *
+     * @param clientConfig client configuration
+     * @param cookieManager cookie manager
+     * @param protocolId protocol identifier
+     * @param method HTTP method
+     * @param clientUri request URI
+     * @param sendExpectContinue whether to send the {@code Expect: 100-Continue} header
+     * @param properties request properties
+     */
     protected ClientRequestBase(HttpClientConfig clientConfig,
                                 WebClientCookieManager cookieManager,
                                 String protocolId,
@@ -109,6 +140,62 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
                                 ClientUri clientUri,
                                 Boolean sendExpectContinue,
                                 Map<String, String> properties) {
+        this(clientConfig, cookieManager, protocolId, method, clientUri, sendExpectContinue, properties, null);
+    }
+
+    /**
+     * Create a new request.
+     *
+     * @param clientConfig client configuration
+     * @param cookieManager cookie manager
+     * @param protocolId protocol identifier
+     * @param method HTTP method
+     * @param clientUri request URI
+     * @param sendExpectContinue whether to send the {@code Expect: 100-Continue} header
+     * @param properties request properties
+     * @param redirectSourceUri original request URI for redirect handling
+     */
+    protected ClientRequestBase(HttpClientConfig clientConfig,
+                                WebClientCookieManager cookieManager,
+                                String protocolId,
+                                Method method,
+                                ClientUri clientUri,
+                                Boolean sendExpectContinue,
+                                Map<String, String> properties,
+                                ClientUri redirectSourceUri) {
+        this(clientConfig,
+             cookieManager,
+             protocolId,
+             method,
+             clientUri,
+             sendExpectContinue,
+             properties,
+             redirectSourceUri,
+             false);
+    }
+
+    /**
+     * Create a new request.
+     *
+     * @param clientConfig client configuration
+     * @param cookieManager cookie manager
+     * @param protocolId protocol identifier
+     * @param method HTTP method
+     * @param clientUri request URI
+     * @param sendExpectContinue whether to send the {@code Expect: 100-Continue} header
+     * @param properties request properties
+     * @param redirectSourceUri original request URI for redirect handling
+     * @param crossOriginRedirect whether a previous redirect crossed an origin boundary
+     */
+    protected ClientRequestBase(HttpClientConfig clientConfig,
+                                WebClientCookieManager cookieManager,
+                                String protocolId,
+                                Method method,
+                                ClientUri clientUri,
+                                Boolean sendExpectContinue,
+                                Map<String, String> properties,
+                                ClientUri redirectSourceUri,
+                                boolean crossOriginRedirect) {
         this.clientConfig = clientConfig;
         this.cookieManager = cookieManager;
         this.protocolId = protocolId;
@@ -116,6 +203,16 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         this.clientUri = clientUri;
         this.sendExpectContinue = sendExpectContinue;
         this.properties = new HashMap<>(properties);
+        this.redirectSourceUri = redirectSourceUri == null ? null : ClientUri.create(redirectSourceUri);
+        // Once a redirect crosses origins, later same-origin hops must still be treated as crossing a trust boundary.
+        // The private property key preserves that state across internal paths that recreate a request from copied properties.
+        this.crossOriginRedirect = crossOriginRedirect
+                || Boolean.parseBoolean(this.properties.get(CROSS_ORIGIN_REDIRECT_PROPERTY));
+        if (this.crossOriginRedirect) {
+            this.properties.put(CROSS_ORIGIN_REDIRECT_PROPERTY, Boolean.TRUE.toString());
+        }
+        this.filterRedirectHeaders = clientConfig.filterRedirectHeaders();
+        this.redirectSensitiveHeaders = clientConfig.redirectSensitiveHeaders();
 
         this.headers = clientConfig.defaultRequestHeaders();
         this.readTimeout = clientConfig.socketOptions().readTimeout();
@@ -131,12 +228,20 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
 
         // this must be after we set clientUri, as it is used from the method
         clientConfig.baseAddress()
+                .filter(it -> !(it instanceof UnixDomainSocketAddress)
+                        || this.redirectSourceUri == null)
                 .ifPresent(this::address);
     }
 
     @Override
     public T tls(Tls tls) {
         this.tls = tls;
+        return identity();
+    }
+
+    @Override
+    public T sni(SniConfig sni) {
+        this.sni = Objects.requireNonNull(sni);
         return identity();
     }
 
@@ -154,8 +259,6 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
                     .port(inet.getPort());
             this.socketAddress = null;
         } else if (socketAddress instanceof UnixDomainSocketAddress) {
-            this.clientUri.host("localhost")
-                    .port(0);
             this.socketAddress = socketAddress;
         } else {
             throw new IllegalArgumentException("Unsupported socket address type: " + socketAddress.getClass().getName());
@@ -179,7 +282,7 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
     @Override
     public T uri(String uri) {
         if (uri.indexOf('{') > -1) {
-            this.uriTemplate = uri;
+            this.uriTemplate = new UriTemplateQuery(uri);
         } else {
             uri(URI.create(UriEncoding.encodeUri(uri)));
         }
@@ -234,11 +337,24 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
     @Override
     public T queryParam(String name, String... values) {
         clientUri.writeableQuery().set(name, values);
+        UriTemplateQuery templateQuery = uriTemplate;
+        if (templateQuery != null) {
+            templateQuery.trackQueryParam(name);
+        }
         return identity();
     }
 
     @Override
     public T property(String propertyName, String propertyValue) {
+        // Some internal protocol-switch paths copy request properties through this method rather than a copy constructor.
+        // Keep the redirect marker synchronized so later hops continue to strip redirect-sensitive data.
+        if (CROSS_ORIGIN_REDIRECT_PROPERTY.equals(propertyName)) {
+            if (crossOriginRedirect || Boolean.parseBoolean(propertyValue)) {
+                this.crossOriginRedirect = true;
+                this.properties.put(CROSS_ORIGIN_REDIRECT_PROPERTY, "true");
+            }
+            return identity();
+        }
         this.properties.put(propertyName, propertyValue);
         return identity();
     }
@@ -267,6 +383,14 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         return identity();
     }
 
+    /**
+     * Clear an internally supplied connection without changing other request state.
+     */
+    @Api.Internal
+    public final void clearConnection() {
+        this.connection = null;
+    }
+
     @Override
     public T keepAlive(boolean keepAlive) {
         this.keepAlive = keepAlive;
@@ -288,29 +412,58 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
     @Override
     public T proxy(Proxy proxy) {
         this.proxy = Objects.requireNonNull(proxy);
+        clearSelectedProxyRoute();
         return identity();
     }
 
     @Override
     public R request() {
+        try {
+            return requestWithoutRouteCleanup();
+        } finally {
+            clearSelectedProxyRoute();
+        }
+    }
+
+    /**
+     * Submit an internal request that participates in the enclosing top-level request's selected route.
+     *
+     * @return response
+     */
+    @Api.Internal
+    protected final R requestWithoutRouteCleanup() {
         additionalHeaders();
+        validateQueryContentType();
         return validateAndSubmit(BufferData.EMPTY_BYTES);
     }
 
     @Override
     public R submit(Object entity) {
-        if (!(entity instanceof byte[] bytes && bytes.length == 0)) {
-            rejectHeadWithEntity();
+        try {
+            if (!(entity instanceof byte[] bytes && bytes.length == 0)) {
+                rejectHeadWithEntity();
+            }
+            additionalHeaders();
+            if (entity instanceof byte[]) {
+                validateQueryContentType();
+            }
+            return validateAndSubmit(entity);
+        } finally {
+            clearSelectedProxyRoute();
         }
-        additionalHeaders();
-        return validateAndSubmit(entity);
     }
 
     @Override
     public R outputStream(OutputStreamHandler outputStreamConsumer) {
-        rejectHeadWithEntity();
-        additionalHeaders();
-        return doOutputStream(outputStreamConsumer);
+        try {
+            rejectHeadWithEntity();
+            additionalHeaders();
+            validateQueryContentType();
+            validateRequest();
+            return doOutputStream(outputStreamConsumer);
+        } finally {
+            clearSelectedProxyRoute();
+        }
     }
 
     @Override
@@ -362,8 +515,31 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
     }
 
     @Override
+    public Optional<SniConfig> sni() {
+        return Optional.ofNullable(sni);
+    }
+
+    @Override
     public Proxy proxy() {
         return proxy;
+    }
+
+    @Override
+    @Api.Internal
+    public Optional<ProxyRoute> selectedProxyRoute() {
+        return Optional.ofNullable(selectedProxyRoute);
+    }
+
+    @Override
+    @Api.Internal
+    public void selectedProxyRoute(ProxyRoute proxyRoute) {
+        this.selectedProxyRoute = Objects.requireNonNull(proxyRoute);
+    }
+
+    @Override
+    @Api.Internal
+    public void clearSelectedProxyRoute() {
+        this.selectedProxyRoute = null;
     }
 
     @Override
@@ -416,8 +592,20 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         return Optional.ofNullable(socketAddress);
     }
 
+    /**
+     * Submit a request entity.
+     *
+     * @param entity request entity
+     * @return HTTP client response
+     */
     protected abstract R doSubmit(Object entity);
 
+    /**
+     * Submit a request entity provided through an output stream.
+     *
+     * @param outputStreamHandler output stream handler
+     * @return HTTP client response
+     */
     protected abstract R doOutputStream(OutputStreamHandler outputStreamHandler);
 
     /**
@@ -433,26 +621,93 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
                                                       CompletableFuture<WebClientServiceRequest> whenSent,
                                                       CompletableFuture<WebClientServiceResponse> whenComplete,
                                                       ClientUri usedUri) {
+        return invokeServices(null, httpCallChain, whenSent, whenComplete, usedUri, protocolId, null);
+    }
+
+    /**
+     * Invoke configured client services.
+     *
+     * @param whenSent      completable future to be completed when the request is sent over the network
+     * @param whenComplete  completable future to be completed when the request/response interaction finishes
+     * @param httpCallChain invocation of the HTTP request (the actual network call)
+     * @param usedUri       URI configured on the request, combined with the base URI of the client
+     * @return web client service response
+     */
+    @Api.Internal
+    protected WebClientServiceResponse invokeServices(WebClientService.WireProtocolChain httpCallChain,
+                                                      CompletableFuture<WebClientServiceRequest> whenSent,
+                                                      CompletableFuture<WebClientServiceResponse> whenComplete,
+                                                      ClientUri usedUri) {
+        return invokeServices(null,
+                              httpCallChain,
+                              whenSent,
+                              whenComplete,
+                              usedUri,
+                              null,
+                              Objects.requireNonNull(httpCallChain));
+    }
+
+    /**
+     * Invoke configured client services and publish applicable transport response context before they unwind.
+     *
+     * @param webClient client that owns the transport protocols
+     * @param httpCallChain invocation of the HTTP request (the actual network call)
+     * @param whenSent completable future to be completed when the request is sent over the network
+     * @param whenComplete completable future to be completed when the request/response interaction finishes
+     * @param usedUri URI configured on the request, combined with the base URI of the client
+     * @return web client service response
+     */
+    @Api.Internal
+    protected WebClientServiceResponse invokeServices(WebClient webClient,
+                                                      WebClientService.TransportChain httpCallChain,
+                                                      CompletableFuture<WebClientServiceRequest> whenSent,
+                                                      CompletableFuture<WebClientServiceResponse> whenComplete,
+                                                      ClientUri usedUri) {
+        WebClient client = Objects.requireNonNull(webClient, "webClient");
+        WebClientService.TransportChain chain = Objects.requireNonNull(httpCallChain, "httpCallChain");
+        return invokeServices(client, chain, whenSent, whenComplete, usedUri, null, chain);
+    }
+
+    private WebClientServiceResponse invokeServices(WebClient webClient,
+                                                    WebClientService.Chain httpCallChain,
+                                                    CompletableFuture<WebClientServiceRequest> whenSent,
+                                                    CompletableFuture<WebClientServiceResponse> whenComplete,
+                                                    ClientUri usedUri,
+                                                    String protocolId,
+                                                    WebClientService.WireProtocolChain wireProtocolChain) {
 
         // include any stored cookies in request
-        cookieManager.request(usedUri, headers);
+        cookieManager.request(usedUri, headers, !redirectSensitiveHeadersShouldBeStripped(usedUri));
 
         WebClientServiceRequest serviceRequest = new ServiceRequestImpl(usedUri,
                                                                         method,
                                                                         protocolId,
+                                                                        wireProtocolChain,
                                                                         headers,
                                                                         Contexts.context().orElseGet(Context::create),
                                                                         requestId,
                                                                         whenComplete,
                                                                         whenSent,
-                                                                        properties);
+                                                                        serviceProperties());
 
-        WebClientService.Chain last = httpCallChain;
+        WebClientService.Chain last = request -> {
+            ClientRequestHeaderSupport.validate(request.headers());
+            WebClientServiceResponse response = httpCallChain.proceed(request);
+            if (webClient != null && wireProtocolChain instanceof WebClientService.TransportChain transportChain) {
+                Optional<WebClientProtocolResponse> protocolResponse = transportChain.protocolResponse(response);
+                if (protocolResponse.isPresent()) {
+                    webClient.responseReceived(protocolResponse.get());
+                }
+            }
+            return response;
+        };
 
         List<WebClientService> services = clientConfig.services();
-        ListIterator<WebClientService> serviceIterator = services.listIterator(services.size());
-        while (serviceIterator.hasPrevious()) {
-            last = new ServiceChainImpl(last, serviceIterator.previous());
+        for (int i = services.size() - 1; i >= 0; i--) {
+            WebClientService service = services.get(i);
+            if (!(service instanceof HttpTransportObserverSupport.ObserverProvider)) {
+                last = new ServiceChainImpl(last, service);
+            }
         }
 
         WebClientServiceResponse response = last.proceed(serviceRequest);
@@ -468,6 +723,43 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
      */
     protected HttpClientConfig clientConfig() {
         return clientConfig;
+    }
+
+    private Map<String, String> serviceProperties() {
+        if (!properties.containsKey(CROSS_ORIGIN_REDIRECT_PROPERTY)) {
+            return properties;
+        }
+        Map<String, String> serviceProperties = new HashMap<>(properties);
+        serviceProperties.remove(CROSS_ORIGIN_REDIRECT_PROPERTY);
+        return serviceProperties;
+    }
+
+    /**
+     * Remove headers that must not cross redirect trust boundaries.
+     *
+     * @param requestUri URI that will be used for the request
+     * @param requestHeaders headers to sanitize
+     */
+    protected final void sanitizeRedirectSensitiveHeaders(ClientUri requestUri, ClientRequestHeaders requestHeaders) {
+        if (redirectSensitiveHeadersShouldBeStripped(requestUri)) {
+            redirectSensitiveHeaders.forEach(requestHeaders::remove);
+            cookieManager.request(requestUri, requestHeaders, false);
+        }
+    }
+
+    /**
+     * Whether a redirect from this request to the provided URI would cross, or has already crossed, an origin boundary.
+     *
+     * @param requestUri redirect request URI
+     * @return whether redirect-sensitive headers should be stripped
+     */
+    protected final boolean crossesRedirectOriginBoundary(ClientUri requestUri) {
+        return crossOriginRedirect || !sameOrigin(resolvedUri(), requestUri);
+    }
+
+    private boolean redirectSensitiveHeadersShouldBeStripped(ClientUri requestUri) {
+        return filterRedirectHeaders
+                && (crossOriginRedirect || (redirectSourceUri != null && !sameOrigin(redirectSourceUri, requestUri)));
     }
 
     /**
@@ -487,12 +779,21 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
      * @return updated client uri
      */
     protected ClientUri resolveUri(ClientUri toResolve) {
-        if (uriTemplate != null) {
-            String resolved = resolvePathParams(uriTemplate);
+        UriTemplateQuery templateQuery = uriTemplate;
+        if (templateQuery != null) {
+            String resolved = resolvePathParams(templateQuery.template());
+            URI uri;
             if (skipUriEncoding) {
-                toResolve.resolve(URI.create(resolved));
+                uri = URI.create(resolved);
             } else {
-                toResolve.resolve(URI.create(UriEncoding.encodeUri(resolved)));
+                uri = URI.create(UriEncoding.encodeUri(resolved));
+            }
+            boolean replayQuery = skipUriEncoding || uri.isAbsolute();
+            ClientUri querySource = replayQuery && toResolve == clientUri ? ClientUri.create(clientUri) : clientUri;
+            toResolve.resolve(uri);
+
+            if (replayQuery) {
+                templateQuery.replay(querySource.query(), toResolve.writeableQuery(), uri.isAbsolute());
             }
         }
         return toResolve;
@@ -503,9 +804,20 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         return "client-" + protocolId + "-" + Long.toHexString(counter.getAndIncrement());
     }
 
+    private static boolean sameOrigin(ClientUri sourceUri, ClientUri targetUri) {
+        return sourceUri.scheme().equalsIgnoreCase(targetUri.scheme())
+                && sourceUri.host().equalsIgnoreCase(targetUri.host())
+                && sourceUri.port() == targetUri.port();
+    }
+
     private R validateAndSubmit(Object entity) {
+        validateRequest();
+        return doSubmit(entity);
+    }
+
+    private void validateRequest() {
         String scheme = uri().scheme();
-        if (scheme == null || !SUPPORTED_SCHEMES.contains(scheme.toLowerCase())) {
+        if (scheme == null || !SUPPORTED_SCHEMES.contains(scheme)) {
             throw new IllegalArgumentException(
                     String.format("Not supported scheme %s, client supported schemes are: %s",
                                   uri().scheme(),
@@ -513,7 +825,6 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
                     )
             );
         }
-        return doSubmit(entity);
     }
 
     private String resolvePathParams(String path) {
@@ -539,8 +850,15 @@ public abstract class ClientRequestBase<T extends ClientRequest<T>, R extends Ht
         }
     }
 
+    private void validateQueryContentType() {
+        if (Method.QUERY.equals(this.method) && !headers.contains(HeaderNames.CONTENT_TYPE)) {
+            throw new IllegalArgumentException("Content-Type header is required for method '" + Method.QUERY + "'");
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private T identity() {
         return (T) this;
     }
+
 }

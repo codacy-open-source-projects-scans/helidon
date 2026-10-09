@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@
 
 package io.helidon.builder.test.testsubjects;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 import io.helidon.builder.api.Option;
 import io.helidon.builder.api.Prototype;
@@ -27,4 +30,21 @@ interface ConfigMapBlueprint {
     @Option.Configured
     @Option.Singular
     Map<String, String> properties();
+
+    @Option.Configured
+    @Option.Singular("optionalProperty")
+    Optional<Map<String, String>> optionalProperties();
+
+    @Option.Configured
+    Optional<Map<String, Integer>> optionalNumbers();
+
+    @Option.Configured
+    @Option.Singular
+    @Option.Decorator(ConfigMapSupport.OptionalListDecorator.class)
+    Optional<List<String>> optionalList();
+
+    @Option.Configured
+    @Option.Singular(value = "includeOptionalSetItem", withPrefix = false)
+    @Option.Decorator(ConfigMapSupport.OptionalSetDecorator.class)
+    Optional<Set<String>> optionalSet();
 }

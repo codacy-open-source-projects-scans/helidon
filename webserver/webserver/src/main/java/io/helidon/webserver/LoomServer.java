@@ -21,16 +21,21 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.Timer;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import io.helidon.Main;
 import io.helidon.common.SerializationConfig;
@@ -43,9 +48,14 @@ import io.helidon.common.features.api.HelidonFlavor;
 import io.helidon.common.resumable.Resumable;
 import io.helidon.common.resumable.ResumableSupport;
 import io.helidon.common.tls.Tls;
+import io.helidon.common.tls.TlsMaterial;
 import io.helidon.http.encoding.ContentEncodingContext;
 import io.helidon.http.media.MediaContext;
+import io.helidon.metrics.api.MeterRegistry;
+import io.helidon.metrics.api.MetricsFactory;
 import io.helidon.service.registry.Service;
+import io.helidon.service.registry.ServiceRegistry;
+import io.helidon.service.registry.Services;
 import io.helidon.spi.HelidonShutdownHandler;
 import io.helidon.webserver.http.DirectHandlers;
 import io.helidon.webserver.spi.ServerFeature;
@@ -58,6 +68,7 @@ class LoomServer implements WebServer, Resumable {
 
     private final Map<String, ServerListener> listeners;
     private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicBoolean fatalListenerFailureReported = new AtomicBoolean();
     private final Lock lifecycleLock = new ReentrantLock();
     private final ExecutorService executorService;
     private final Context context;
@@ -69,14 +80,28 @@ class LoomServer implements WebServer, Resumable {
     private volatile boolean alreadyStarted = false;
 
     @Service.Inject
-    LoomServer(WebServerService service) {
+    LoomServer(WebServerService service,
+               Supplier<MetricsFactory> metricsFactory,
+               Supplier<MeterRegistry> meterRegistry,
+               ServiceRegistry serviceRegistry) {
         // only for service registry
         this(WebServerConfig.builder()
+                     .serviceRegistry(serviceRegistry)
                      .update(service::updateServerBuilder)
-                     .buildPrototype());
+                     .buildPrototype(),
+             metricsFactory,
+             meterRegistry);
     }
 
     LoomServer(WebServerConfig serverConfig) {
+        this(serverConfig,
+             () -> Services.get(MetricsFactory.class),
+             () -> Services.get(MeterRegistry.class));
+    }
+
+    private LoomServer(WebServerConfig serverConfig,
+                       Supplier<MetricsFactory> metricsFactory,
+                       Supplier<MeterRegistry> meterRegistry) {
         this.registerShutdownHook = serverConfig.shutdownHook();
         this.context = serverConfig.serverContext()
                 .orElseGet(() -> Context.builder()
@@ -110,7 +135,11 @@ class LoomServer implements WebServer, Resumable {
                                                idleConnectionTimer,
                                                serverConfig.mediaContext().orElseGet(MediaContext::create),
                                                serverConfig.contentEncoding().orElseGet(ContentEncodingContext::create),
-                                               serverConfig.directHandlers().orElseGet(DirectHandlers::create)));
+                                               serverConfig.directHandlers().orElseGet(DirectHandlers::create),
+                                               metricsFactory,
+                                               meterRegistry,
+                                               featureContext.httpTransportObservers(name),
+                                               this::fatalListenerFailure));
         });
 
         validateRoutingsHaveNamedListener(serverConfig, listenerMap.keySet());
@@ -132,7 +161,8 @@ class LoomServer implements WebServer, Resumable {
         try {
             lifecycleLock.lockInterruptibly();
         } catch (InterruptedException e) {
-            throw new IllegalStateException("Webserver start was interrupted");
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Webserver start was interrupted", e);
         }
         try {
             if (running.compareAndSet(false, true)) {
@@ -155,6 +185,7 @@ class LoomServer implements WebServer, Resumable {
         try {
             lifecycleLock.lockInterruptibly();
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new IllegalStateException("Webserver stop was interrupted", e);
         }
         try {
@@ -189,19 +220,95 @@ class LoomServer implements WebServer, Resumable {
     }
 
     @Override
+    @Deprecated(forRemoval = true, since = "27.0.0")
+    @SuppressWarnings("removal")
     public void reloadTls(String socketName, Tls tls) {
+        ServerListener listener = listener(socketName);
+        listener.reloadTls(tls);
+    }
+
+    @Override
+    public void reloadTls(TlsMaterial material, String socketName) {
+        Objects.requireNonNull(material, "material");
+        ServerListener listener = listener(socketName);
+        listener.reloadTls(material);
+    }
+
+    @Override
+    public void reloadVirtualHostTls(TlsMaterial material, String socketName, String host) {
+        Objects.requireNonNull(material, "material");
+        Objects.requireNonNull(host, "host");
+        ServerListener listener = listener(socketName);
+        listener.reloadVirtualHostTls(material, host);
+    }
+
+    private ServerListener listener(String socketName) {
+        Objects.requireNonNull(socketName, "socketName");
         ServerListener listener = listeners.get(socketName);
         if (listener == null) {
             throw new IllegalArgumentException("Cannot reload TLS on socket " + socketName
                                                        + " since this socket does not exist");
-        } else {
-            listener.reloadTls(tls);
         }
+        return listener;
     }
 
     @Override
     public Context context() {
         return context;
+    }
+
+    @Override
+    public void suspend() {
+        try {
+            lifecycleLock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted during snapshot checkpoint.", e);
+        }
+        try {
+            if (running.get()) {
+                try {
+                    for (ServerListener listener : listeners.values()) {
+                        listener.suspend();
+                    }
+                } catch (RuntimeException | Error e) {
+                    stopAfterResumableFailure(e);
+                    throw e;
+                }
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    @Override
+    public void resume() {
+        long now = System.currentTimeMillis();
+        try {
+            lifecycleLock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted during snapshot restore.", e);
+        }
+        try {
+            if (running.get()) {
+                try {
+                    for (ServerListener listener : listeners.values()) {
+                        listener.resume();
+                    }
+                } catch (RuntimeException | Error e) {
+                    stopAfterResumableFailure(e);
+                    throw e;
+                }
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        now = System.currentTimeMillis() - now;
+        LOGGER.log(System.Logger.Level.INFO, "Restored all channels in "
+                + now + " milliseconds. "
+                + ResumableSupport.get().uptimeSinceResume() + " milliseconds since JVM snapshot restore. "
+                + "Java " + Runtime.version());
     }
 
     private static void validateRoutingsHaveNamedListener(WebServerConfig serverConfig, Set<String> namedListeners) {
@@ -232,39 +339,93 @@ class LoomServer implements WebServer, Resumable {
         }
     }
 
-    // Intended for testing. May return null!
-    ServerListener listener(String socketName) {
-        return listeners.get(socketName);
+    private void stopIt() {
+        Throwable failure = stopListeners();
+        running.set(false);
+        LOGGER.log(System.Logger.Level.INFO, "Helidon WebServer stopped all channels.");
+        try {
+            deregisterShutdownHook();
+        } catch (RuntimeException | Error e) {
+            failure = LifecycleFailures.add(failure, e);
+        }
+        LifecycleFailures.throwIfFailed(failure, "Failed to stop Helidon WebServer");
     }
 
-    private void stopIt() {
-        // We may be in a shutdown hook and new threads may not be created
-        for (ServerListener listener : listeners.values()) {
-            listener.stop();
+    private Throwable stopAfterLifecycleFailure(Throwable failure) {
+        Throwable result = LifecycleFailures.add(null, failure);
+        try {
+            stopIt();
+        } catch (RuntimeException | Error e) {
+            result = LifecycleFailures.add(result, e);
         }
+        return result;
+    }
 
-        running.set(false);
+    private void fatalListenerFailure(ServerListener listener, Throwable cause) {
+        Objects.requireNonNull(listener, "listener");
+        Objects.requireNonNull(cause, "cause");
+        if (!fatalListenerFailureReported.compareAndSet(false, true)) {
+            return;
+        }
+        LOGGER.log(System.Logger.Level.ERROR,
+                   "Fatal failure in listener " + listener,
+                   cause);
+        try {
+            executorService.execute(() -> stopAfterFatalListenerFailure(cause));
+        } catch (RejectedExecutionException e) {
+            cause.addSuppressed(e);
+            stopAfterFatalListenerFailure(cause);
+        }
+    }
 
-        LOGGER.log(System.Logger.Level.INFO, "Helidon WebServer stopped all channels.");
-        deregisterShutdownHook();
+    private void stopAfterFatalListenerFailure(Throwable cause) {
+        Throwable failure = LifecycleFailures.add(null, cause);
+        try {
+            lifecycleLock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            failure = LifecycleFailures.add(failure,
+                                            new IllegalStateException("Interrupted while stopping after fatal listener failure",
+                                                                      e));
+            LOGGER.log(System.Logger.Level.ERROR, "Failed to stop after fatal listener failure", failure);
+            return;
+        }
+        try {
+            if (running.get()) {
+                try {
+                    stopIt();
+                } catch (RuntimeException | Error e) {
+                    failure = LifecycleFailures.add(failure, e);
+                }
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        if (failure != null) {
+            LOGGER.log(System.Logger.Level.ERROR, "Stopped after fatal listener failure", failure);
+        }
     }
 
     private void startIt() {
         long now = System.currentTimeMillis();
         // make sure we do not allow runtime without JEP-290 enforcement
         SerializationConfig.configureRuntime();
-        boolean result = parallel("start", ServerListener::start);
-        if (!result) {
+        Throwable failure = startListeners();
+        if (failure != null) {
             LOGGER.log(System.Logger.Level.ERROR, "Helidon WebServer failed to start, shutting down");
-            parallel("stop", ServerListener::stop);
-            if (startFutures != null) {
-                startFutures.forEach(future -> future.future().cancel(true));
-            }
+            cancelStartFutures();
+            failure = LifecycleFailures.add(failure, stopListeners());
             running.set(false);
-            return;
+            LifecycleFailures.throwIfFailedAsIllegalState(failure, "Failed to start Helidon WebServer");
         }
-        if (registerShutdownHook) {
-            registerShutdownHook();
+        try {
+            if (registerShutdownHook) {
+                registerShutdownHook();
+            }
+            fireAfterStart();
+        } catch (RuntimeException | Error e) {
+            Throwable startupFailure = stopAfterLifecycleFailure(e);
+            LifecycleFailures.throwIfFailedAsIllegalState(startupFailure, "Failed to start Helidon WebServer");
         }
         now = System.currentTimeMillis() - now;
         // JVM uptime or since restore
@@ -274,8 +435,6 @@ class LoomServer implements WebServer, Resumable {
                 + now + " milliseconds. "
                 + uptime + " milliseconds since JVM startup. "
                 + "Java " + Runtime.version());
-
-        fireAfterStart();
 
         if ("!".equals(System.getProperty(EXIT_ON_STARTED_KEY))) {
             LOGGER.log(System.Logger.Level.INFO, String.format("Exiting, -D%s set.", EXIT_ON_STARTED_KEY));
@@ -307,80 +466,168 @@ class LoomServer implements WebServer, Resumable {
         }
     }
 
-    // return false if anything fails
-    private boolean parallel(String taskName, Consumer<ServerListener> task) {
-        boolean result = true;
+    private Throwable startListeners() {
+        Throwable failure = null;
+        boolean interrupted = false;
+        AtomicBoolean cancelled = new AtomicBoolean();
+        ExecutorCompletionService<ListenerFuture> completedStarts = new ExecutorCompletionService<>(executorService);
 
         List<ListenerFuture> futures = new LinkedList<>();
 
         for (ServerListener listener : listeners.values()) {
-            futures.add(new ListenerFuture(listener, executorService.submit(() -> {
+            ListenerFuture listenerFuture = new ListenerFuture(listener, cancelled);
+            listenerFuture.future = completedStarts.submit(() -> {
                 Contexts.runInContext(context, () -> {
-                    Thread.currentThread().setName(taskName + " " + listener);
-                    task.accept(listener);
+                    Thread currentThread = Thread.currentThread();
+                    listenerFuture.thread.set(currentThread);
+                    currentThread.setName("start " + listener);
+                    listener.start(cancelled::get);
                 });
-            })));
-        }
-        for (ListenerFuture listenerFuture : futures) {
-            try {
-                listenerFuture.future().get();
-            } catch (InterruptedException e) {
-                LOGGER.log(System.Logger.Level.ERROR, "Failed to start listener, interrupted: "
-                        + listenerFuture.listener.configuredAddress(), e);
-                result = false;
-            } catch (ExecutionException e) {
-                LOGGER.log(System.Logger.Level.ERROR, "Failed to start listener: "
-                        + listenerFuture.listener.configuredAddress(), e);
-                result = false;
-            }
+                return listenerFuture;
+            });
+            futures.add(listenerFuture);
         }
         this.startFutures = futures;
-        return result;
+        int remaining = futures.size();
+        Future<ListenerFuture> failedFuture = null;
+        while (remaining > 0) {
+            try {
+                Future<ListenerFuture> future = completedStarts.take();
+                remaining--;
+                try {
+                    future.get();
+                } catch (CancellationException _) {
+                    // Cancelled by another listener startup failure.
+                } catch (ExecutionException e) {
+                    ListenerFuture listenerFuture = listenerFuture(futures, future);
+                    LOGGER.log(System.Logger.Level.ERROR, "Failed to start listener: "
+                            + listenerFuture.listener.configuredAddress(), e);
+                    failure = LifecycleFailures.add(failure, e.getCause() == null ? e : e.getCause());
+                    cancelled.set(true);
+                    cancelStartFutures(futures);
+                    failedFuture = future;
+                    break;
+                }
+            } catch (InterruptedException e) {
+                LOGGER.log(System.Logger.Level.ERROR, "Failed to start listener, interrupted", e);
+                failure = LifecycleFailures.add(failure,
+                                                new IllegalStateException("Interrupted while waiting for listener startup", e));
+                cancelled.set(true);
+                cancelStartFutures(futures);
+                interrupted = true;
+                break;
+            }
+        }
+        if (failure != null) {
+            failure = awaitStartFutures(futures, failedFuture, failure);
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return failure;
     }
 
-    @Override
-    public void suspend() {
-        try {
-            lifecycleLock.lockInterruptibly();
-        } catch (InterruptedException e) {
-            throw new IllegalStateException("Interrupted during snapshot checkpoint.", e);
+    private static ListenerFuture listenerFuture(List<ListenerFuture> futures, Future<ListenerFuture> future) {
+        for (ListenerFuture listenerFuture : futures) {
+            if (listenerFuture.future == future) {
+                return listenerFuture;
+            }
         }
-        try {
-            if (running.get()) {
-                for (ServerListener listener : listeners.values()) {
-                    listener.suspend();
+        throw new IllegalStateException("Unknown listener startup future");
+    }
+
+    private Throwable awaitStartFutures(List<ListenerFuture> futures, Future<ListenerFuture> failedFuture, Throwable failure) {
+        boolean interrupted = false;
+        for (ListenerFuture listenerFuture : futures) {
+            Future<ListenerFuture> future = listenerFuture.future;
+            if (future == failedFuture) {
+                continue;
+            }
+            boolean done = false;
+            while (!done) {
+                try {
+                    future.get();
+                    done = true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    failure = LifecycleFailures.add(failure,
+                                                    new IllegalStateException("Interrupted while waiting for listener "
+                                                                                      + listenerFuture.listener, e));
+                } catch (CancellationException _) {
+                    done = true;
+                } catch (ExecutionException e) {
+                    failure = LifecycleFailures.add(failure, e.getCause() == null ? e : e.getCause());
+                    done = true;
                 }
             }
-        } finally {
-            lifecycleLock.unlock();
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return failure;
+    }
+
+    private void cancelStartFutures() {
+        List<ListenerFuture> localStartFutures = startFutures;
+        if (localStartFutures != null) {
+            cancelStartFutures(localStartFutures);
         }
     }
 
-    @Override
-    public void resume() {
-        long now = System.currentTimeMillis();
-        try {
-            lifecycleLock.lockInterruptibly();
-        } catch (InterruptedException e) {
-            throw new IllegalStateException("Interrupted during snapshot restore.", e);
-        }
-        try {
-            if (running.get()) {
-                for (ServerListener listener : listeners.values()) {
-                    listener.resume();
-                }
+    private static void cancelStartFutures(List<ListenerFuture> futures) {
+        for (ListenerFuture listenerFuture : futures) {
+            listenerFuture.cancelled.set(true);
+            Future<ListenerFuture> future = listenerFuture.future;
+            if (future.isDone()) {
+                continue;
             }
-        } finally {
-            lifecycleLock.unlock();
+            Thread thread = listenerFuture.thread.get();
+            if (thread == null) {
+                if (!future.cancel(false)) {
+                    thread = listenerFuture.thread.get();
+                    if (thread != null) {
+                        thread.interrupt();
+                    }
+                }
+            } else {
+                thread.interrupt();
+            }
         }
-        now = System.currentTimeMillis() - now;
-        LOGGER.log(System.Logger.Level.INFO, "Restored all channels in "
-                + now + " milliseconds. "
-                + ResumableSupport.get().uptimeSinceResume() + " milliseconds since JVM snapshot restore. "
-                + "Java " + Runtime.version());
     }
 
-    private record ListenerFuture(ServerListener listener, Future<?> future) {
+    private Throwable stopListeners() {
+        Throwable failure = null;
+        // We may be in a shutdown hook and new threads may not be created
+        for (ServerListener listener : listeners.values()) {
+            try {
+                listener.stop();
+            } catch (RuntimeException | Error e) {
+                failure = LifecycleFailures.add(failure, e);
+            }
+        }
+        return failure;
+    }
+
+    private void stopAfterResumableFailure(Throwable failure) {
+        try {
+            stopIt();
+        } catch (RuntimeException | Error e) {
+            if (failure != e) {
+                failure.addSuppressed(e);
+            }
+        }
+    }
+
+    private static final class ListenerFuture {
+        private final ServerListener listener;
+        private final AtomicBoolean cancelled;
+        private final AtomicReference<Thread> thread = new AtomicReference<>();
+        private Future<ListenerFuture> future;
+
+        private ListenerFuture(ServerListener listener, AtomicBoolean cancelled) {
+            this.listener = listener;
+            this.cancelled = cancelled;
+        }
     }
 
     private static final class ServerShutdownHandler implements HelidonShutdownHandler {
@@ -401,12 +648,22 @@ class LoomServer implements WebServer, Resumable {
 
         @Override
         public void shutdown() {
-            listeners.values().forEach(ServerListener::stop);
+            Throwable failure = null;
+            for (ServerListener listener : listeners.values()) {
+                try {
+                    listener.stop();
+                } catch (RuntimeException | Error e) {
+                    failure = LifecycleFailures.add(failure, e);
+                }
+            }
             if (startFutures != null) {
-                startFutures.forEach(future -> future.future().cancel(true));
+                cancelStartFutures(startFutures);
             }
 
             running.set(false);
+            if (failure != null) {
+                LOGGER.log(System.Logger.Level.ERROR, "Failed to stop Helidon WebServer from shutdown hook", failure);
+            }
         }
 
         @Override

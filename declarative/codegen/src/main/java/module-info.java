@@ -29,15 +29,24 @@ module io.helidon.declarative.codegen {
     exports io.helidon.declarative.codegen;
 
     exports io.helidon.declarative.codegen.http;
+    // gRPC server endpoints
+    exports io.helidon.declarative.codegen.grpc.server;
     // webserver related code generation (HTTP endpoints)
     exports io.helidon.declarative.codegen.http.webserver;
     exports io.helidon.declarative.codegen.http.webserver.spi;
     // typed web client
     exports io.helidon.declarative.codegen.http.restclient;
+    // typed gRPC client
+    exports io.helidon.declarative.codegen.grpc.client;
+    // GraphQL server endpoints
+    exports io.helidon.declarative.codegen.graphql.server;
+    exports io.helidon.declarative.codegen.graphql.server.spi;
     // fault tolerance (fallback, retry, circuit breaker)
     exports io.helidon.declarative.codegen.faulttolerance;
     // scheduling
     exports io.helidon.declarative.codegen.scheduling;
+    // messaging
+    exports io.helidon.declarative.codegen.messaging;
     // validation
     exports io.helidon.declarative.codegen.validation;
     // tracing
@@ -46,19 +55,29 @@ module io.helidon.declarative.codegen {
     exports io.helidon.declarative.codegen.cors;
 
     uses io.helidon.declarative.codegen.http.webserver.spi.HttpParameterCodegenProvider;
+    uses io.helidon.declarative.codegen.graphql.server.spi.GraphQlParameterCodegenProvider;
 
     provides io.helidon.service.codegen.spi.RegistryCodegenExtensionProvider
             with io.helidon.declarative.codegen.faulttolerance.FtExtensionProvider,
                     io.helidon.declarative.codegen.scheduling.SchedulingExtensionProvider,
+                    io.helidon.declarative.codegen.graphql.server.GraphQlServerExtensionProvider,
+                    io.helidon.declarative.codegen.openapi.OpenApiExtensionProvider,
                     io.helidon.declarative.codegen.http.restclient.RestClientExtensionProvider,
+                    io.helidon.declarative.codegen.grpc.client.GrpcClientExtensionProvider,
                     io.helidon.declarative.codegen.http.webserver.RestServerExtensionProvider,
                     io.helidon.declarative.codegen.validation.ValidationExtensionProvider,
                     io.helidon.declarative.codegen.metrics.MetricsExtensionProvider,
                     io.helidon.declarative.codegen.tracing.TracingExtensionProvider,
+                    io.helidon.declarative.codegen.grpc.server.GrpcServerExtensionProvider,
                     io.helidon.declarative.codegen.websocket.server.WebSocketServerExtensionProvider,
                     io.helidon.declarative.codegen.websocket.client.WebSocketClientExtensionProvider,
-                    io.helidon.declarative.codegen.cors.CorsExtensionProvider;
+                    io.helidon.declarative.codegen.cors.CorsExtensionProvider,
+                    io.helidon.declarative.codegen.messaging.MessagingExtensionProvider;
+
+    provides io.helidon.service.codegen.spi.InjectCodegenObserverProvider
+            with io.helidon.declarative.codegen.messaging.MessagingEmitterObserverProvider;
 
     provides io.helidon.codegen.spi.AnnotationMapperProvider
-            with io.helidon.declarative.codegen.http.restclient.RestClientAnnotationMapperProvider;
+            with io.helidon.declarative.codegen.http.restclient.RestClientAnnotationMapperProvider,
+                    io.helidon.declarative.codegen.grpc.client.GrpcClientAnnotationMapperProvider;
 }

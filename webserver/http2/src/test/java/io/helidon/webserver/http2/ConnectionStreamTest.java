@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Oracle and/or its affiliates.
+ * Copyright (c) 2023, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,30 +16,825 @@
 
 package io.helidon.webserver.http2;
 
+import java.io.UncheckedIOException;
+import java.net.SocketException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import io.helidon.common.buffers.BufferData;
+import io.helidon.common.buffers.DataWriter;
+import io.helidon.common.socket.SocketContext;
+import io.helidon.common.socket.SocketWriterException;
+import io.helidon.http.HeaderNames;
+import io.helidon.http.HeaderValues;
+import io.helidon.http.HttpPrologue;
+import io.helidon.http.Method;
+import io.helidon.http.WritableHeaders;
+import io.helidon.http.http2.ConnectionFlowControl;
+import io.helidon.http.http2.FlowControl;
+import io.helidon.http.http2.Http2ConnectionWriter;
+import io.helidon.http.http2.Http2ErrorCode;
+import io.helidon.http.http2.Http2Exception;
+import io.helidon.http.http2.Http2Flag;
+import io.helidon.http.http2.Http2FrameData;
+import io.helidon.http.http2.Http2FrameHeader;
+import io.helidon.http.http2.Http2FrameTypes;
+import io.helidon.http.http2.Http2Headers;
+import io.helidon.http.http2.Http2RstStream;
+import io.helidon.http.http2.Http2Settings;
+import io.helidon.http.http2.Http2StreamState;
+import io.helidon.http.http2.Http2StreamWriter;
+import io.helidon.http.http2.Http2WindowUpdate;
+import io.helidon.webserver.ConnectionContext;
+import io.helidon.webserver.ListenerConfig;
+import io.helidon.webserver.ListenerContext;
+import io.helidon.webserver.Router;
+import io.helidon.webserver.ServerConnectionException;
+import io.helidon.webserver.http.DirectHandlers;
+import io.helidon.webserver.http.HttpRouting;
+import io.helidon.webserver.http2.spi.Http2SubProtocolSelector;
+import io.helidon.webserver.http2.spi.SubProtocolResult;
+
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class ConnectionStreamTest {
 
     private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 50;
+    private static final int STREAM_ID = 1;
+    private static final Http2ServerStream.LocallyResetStreamTracker NO_OP_RESET_TRACKER = new NoOpResetTracker();
 
     @Test
-    void concurrentModification() {
-        Http2ServerStream s = mock(Http2ServerStream.class);
+    void concurrentModification() throws InterruptedException {
         Http2ConnectionStreams streams = new Http2ConnectionStreams();
-        for (int i = 1; i < 10_000; i += 2) {
-
-            streams.doMaintenance(SETTINGS_MAX_CONCURRENT_STREAMS);
-            assertThat(streams.size(), Matchers.lessThanOrEqualTo(SETTINGS_MAX_CONCURRENT_STREAMS));
-
+        for (int i = 1; i < SETTINGS_MAX_CONCURRENT_STREAMS * 2; i += 2) {
+            Http2ServerStream s = mockStream(i);
             streams.put(new Http2Connection.StreamContext(i, 8192, s));
-            int toRemoveStreamId = i;
-            for (Http2Connection.StreamContext ctx : streams.contexts()) {
-                Thread.ofVirtual().start(() -> streams.remove(toRemoveStreamId));
+            streams.activate(i);
+        }
+
+        CountDownLatch removed = new CountDownLatch(streams.contexts().size());
+        for (Http2Connection.StreamContext ctx : streams.contexts()) {
+            Thread.ofVirtual().start(() -> {
+                streams.remove(ctx.stream().streamId());
+                removed.countDown();
+            });
+        }
+
+        assertThat(removed.await(10, TimeUnit.SECONDS), Matchers.is(true));
+        streams.doMaintenance();
+
+        assertThat(streams.contexts().size(), Matchers.is(0));
+        assertThat(streams.size(), Matchers.is(0));
+    }
+
+    @Test
+    void queuedRemovalStopsCountingStreamAsActive() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        Http2ServerStream s = mockStream(1);
+
+        streams.put(new Http2Connection.StreamContext(1, 8192, s));
+        streams.activate(1);
+        streams.remove(1);
+
+        assertThat(streams.size(), Matchers.is(0));
+        assertThat(streams.isEmpty(), Matchers.is(true));
+    }
+
+    @Test
+    void deactivatedStreamRemainsAvailableUntilRemoved() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        Http2ServerStream s = mockStream(1);
+        Http2Connection.StreamContext ctx = new Http2Connection.StreamContext(1, 8192, s);
+
+        streams.put(ctx);
+        streams.activate(1);
+        streams.deactivate(1);
+
+        assertThat(streams.size(), Matchers.is(0));
+        assertThat(streams.isEmpty(), Matchers.is(true));
+        assertThat(streams.get(1), sameInstance(ctx));
+
+        streams.doMaintenance();
+        assertThat(streams.get(1), sameInstance(ctx));
+
+        streams.remove(1);
+        streams.doMaintenance();
+        assertThat(streams.get(1), nullValue());
+    }
+
+    @Test
+    void duplicateRemovalDoesNotChangeActiveCount() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        Http2ServerStream first = mockStream(1);
+        Http2ServerStream second = mockStream(3);
+
+        streams.put(new Http2Connection.StreamContext(1, 8192, first));
+        streams.activate(1);
+        streams.remove(1);
+        streams.doMaintenance();
+        streams.remove(1);
+        streams.put(new Http2Connection.StreamContext(3, 8192, second));
+        streams.activate(3);
+
+        assertThat(streams.size(), Matchers.is(1));
+        assertThat(streams.isEmpty(), Matchers.is(false));
+    }
+
+    @Test
+    void idleStreamDoesNotCountAsActive() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        Http2ServerStream s = mockStream(1);
+
+        streams.put(new Http2Connection.StreamContext(1, 8192, s));
+
+        assertThat(streams.size(), Matchers.is(0));
+        assertThat(streams.isEmpty(), Matchers.is(true));
+    }
+
+    @Test
+    void terminalHeadersDeactivateAfterConnectionWriterCallback() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter();
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+        stream.closeFromRemote();
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+
+        stream.writeHeaders(responseHeaders(), true);
+
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(true));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+
+        writer.completeTerminalWrite();
+
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    @Test
+    void terminalHeadersWithDataDeactivateAfterCombinedWriteCallback() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter();
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.closeFromRemote();
+
+        stream.writeHeadersWithData(responseHeaders(), 1, BufferData.create(new byte[] {1}), true);
+
+        assertThat(writer.headersWithDataWritten(), Matchers.is(true));
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(true));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+
+        writer.completeTerminalWrite();
+
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    @Test
+    void localCloseSerializesWithRemoteClose() throws InterruptedException {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter();
+        Http2ServerStream stream = stream(streams, writer);
+        CountDownLatch remoteStateSnapshotTaken = new CountDownLatch(1);
+        CountDownLatch releaseRemoteClose = new CountDownLatch(1);
+        CountDownLatch localCloseStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> remoteFailure = new AtomicReference<>();
+        AtomicReference<Throwable> localFailure = new AtomicReference<>();
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.headers(Http2Headers.create(WritableHeaders.create()), false);
+        stream.flowControl().inbound().decrementWindowSize(1);
+        stream.writeHeaders(responseHeaders(), true);
+
+        Thread remoteClose = Thread.ofVirtual().start(() -> {
+            try {
+                stream.enqueueDataAfterPrecheck(Http2FrameHeader.create(1,
+                                                                        Http2FrameTypes.DATA,
+                                                                        Http2Flag.DataFlags.create(
+                                                                                Http2Flag.END_OF_STREAM),
+                                                                        STREAM_ID),
+                                                    BufferData.create(new byte[] {1}),
+                                                    true,
+                                                    () -> { },
+                                                    () -> {
+                                                        remoteStateSnapshotTaken.countDown();
+                                                        try {
+                                                            if (!releaseRemoteClose.await(5, TimeUnit.SECONDS)) {
+                                                                throw new IllegalStateException(
+                                                                        "Timed out waiting to release remote close");
+                                                            }
+                                                        } catch (InterruptedException e) {
+                                                            Thread.currentThread().interrupt();
+                                                            throw new IllegalStateException(e);
+                                                        }
+                                                    });
+            } catch (Throwable t) {
+                remoteFailure.set(t);
             }
+        });
+        assertThat(remoteStateSnapshotTaken.await(1, TimeUnit.SECONDS), Matchers.is(true));
+        Thread localClose = Thread.ofVirtual().start(() -> {
+            localCloseStarted.countDown();
+            try {
+                writer.completeTerminalWrite();
+            } catch (Throwable t) {
+                localFailure.set(t);
+            }
+        });
+
+        try {
+            assertThat(localCloseStarted.await(1, TimeUnit.SECONDS), Matchers.is(true));
+            assertThat("local close must wait for the remote close transition",
+                       localClose.join(Duration.ofMillis(100)),
+                       Matchers.is(false));
+        } finally {
+            releaseRemoteClose.countDown();
+        }
+        localClose.join(TimeUnit.SECONDS.toMillis(2));
+        remoteClose.join(TimeUnit.SECONDS.toMillis(2));
+
+        assertThat("local close must terminate", localClose.isAlive(), Matchers.is(false));
+        assertThat("remote close must terminate", remoteClose.isAlive(), Matchers.is(false));
+        assertThat(localFailure.get(), nullValue());
+        assertThat(remoteFailure.get(), nullValue());
+        assertThat(stream.streamState(), Matchers.is(Http2StreamState.CLOSED));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    @Test
+    void terminalHeadersWithDataFailureDeactivatesStream() {
+        RuntimeException writeFailure = new IllegalStateException("test write failure");
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter(writeFailure);
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.closeFromRemote();
+
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                                               () -> stream.writeHeadersWithData(responseHeaders(),
+                                                                                 1,
+                                                                                 BufferData.create(new byte[] {1}),
+                                                                                 true));
+
+        assertThat(thrown, sameInstance(writeFailure));
+        assertThat(writer.headersWithDataWritten(), Matchers.is(true));
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(false));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    @Test
+    void terminalHeadersWithDataStreamFailureRemainsActiveUntilReset() {
+        Http2Exception writeFailure = new Http2Exception(Http2ErrorCode.CANCEL, "test stream failure");
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter(writeFailure);
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.closeFromRemote();
+
+        Http2Exception thrown = assertThrows(Http2Exception.class,
+                                             () -> stream.writeHeadersWithData(responseHeaders(),
+                                                                               1,
+                                                                               BufferData.create(new byte[] {1}),
+                                                                               true));
+
+        assertThat(thrown, sameInstance(writeFailure));
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(false));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+    }
+
+    @Test
+    void terminalDataStreamFailureRemainsActiveUntilReset() {
+        Http2Exception writeFailure = new Http2Exception(Http2ErrorCode.CANCEL, "test stream failure");
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter(writeFailure);
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.closeFromRemote();
+        stream.writeHeaders(responseHeaders(), false);
+
+        Http2Exception thrown = assertThrows(Http2Exception.class,
+                                             () -> stream.writeData(BufferData.create(new byte[] {1}), true));
+
+        assertThat(thrown, sameInstance(writeFailure));
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(false));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+    }
+
+    @Test
+    void nonTerminalHeadersWithDataUseSeparateWritePath() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter();
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+
+        stream.writeHeadersWithData(responseHeaders(), 1, BufferData.create(new byte[] {1}), false);
+
+        assertThat(writer.headersWithDataWritten(), Matchers.is(false));
+        assertThat(writer.separateHeadersWithDataWritten(), Matchers.is(true));
+        assertThat(writer.dataWritten(), Matchers.is(true));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+    }
+
+    @Test
+    void terminalTrailersDeactivateAfterConnectionWriterCallback() {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        RecordingConnectionWriter writer = new RecordingConnectionWriter();
+        Http2ServerStream stream = stream(streams, writer);
+
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+        stream.closeFromRemote();
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+        stream.writeHeaders(responseHeaders(), false);
+
+        stream.writeTrailers(responseHeaders());
+
+        assertThat(writer.hasPendingTerminalCallback(), Matchers.is(true));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(true));
+
+        writer.completeTerminalWrite();
+
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    @Test
+    void invalidContentLengthResetWritePreservesSocketWriterException() {
+        assertInvalidContentLengthResetWriteFailure(new SocketWriterException());
+    }
+
+    @Test
+    void invalidContentLengthResetWritePreservesUncheckedIOException() {
+        assertInvalidContentLengthResetWriteFailure(new UncheckedIOException(new SocketException("Broken pipe")));
+    }
+
+    @Test
+    void invalidWindowUpdateResetWritePreservesSocketWriterException() {
+        assertInvalidWindowUpdateResetWriteFailure(new SocketWriterException());
+    }
+
+    @Test
+    void invalidWindowUpdateResetWritePreservesUncheckedIOException() {
+        assertInvalidWindowUpdateResetWriteFailure(new UncheckedIOException(new SocketException("Broken pipe")));
+    }
+
+    @Test
+    void resetRestoresOnlyConnectionCreditForQueuedData() {
+        List<WindowUpdate> windowUpdates = new ArrayList<>();
+        ConnectionFlowControl flowControl = ConnectionFlowControl.serverBuilder(
+                        (streamId, update) -> windowUpdates.add(new WindowUpdate(streamId,
+                                                                                 update.windowSizeIncrement())))
+                .initialWindowSize(65536)
+                .maxFrameSize(16384)
+                .build();
+        Http2ServerStream stream = stream(new Http2ConnectionStreams(), new RecordingConnectionWriter(), flowControl);
+        stream.headers(Http2Headers.create(WritableHeaders.create()), false);
+
+        for (int i = 0; i < 2; i++) {
+            Http2FrameHeader header = Http2FrameHeader.create(4096,
+                                                              Http2FrameTypes.DATA,
+                                                              Http2Flag.DataFlags.create(0),
+                                                              STREAM_ID);
+            stream.flowControl().inbound().decrementWindowSize(header.length());
+            stream.data(header, BufferData.create(new byte[header.length()]), false);
+        }
+
+        stream.rstStream(new Http2RstStream(Http2ErrorCode.CANCEL));
+
+        assertThat(windowUpdates, Matchers.empty());
+
+        for (int i = 0; i < 2; i++) {
+            flowControl.decrementInboundConnectionWindowSize(16384);
+            flowControl.incrementInboundConnectionWindowSize(16384);
+        }
+
+        assertThat(windowUpdates, Matchers.is(List.of(new WindowUpdate(0, 40960))));
+    }
+
+    @Test
+    void asynchronousSubProtocolCloseWakesStreamTask() throws InterruptedException {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        AsyncSubProtocolHandler handler = new AsyncSubProtocolHandler();
+        Http2SubProtocolSelector selector = (_,
+                                             _,
+                                             _,
+                                             _,
+                                             _,
+                                             _,
+                                             _,
+                                             _,
+                                             _,
+                                             _) -> new SubProtocolResult(true, handler);
+        Http2ServerStream stream = stream(streams, new RecordingConnectionWriter(), List.of(selector));
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.headers(Http2Headers.create(WritableHeaders.create()), false);
+        Http2FrameHeader header = Http2FrameHeader.create(1,
+                                                          Http2FrameTypes.DATA,
+                                                          Http2Flag.DataFlags.create(Http2Flag.END_OF_STREAM),
+                                                          STREAM_ID);
+        stream.data(header, BufferData.create(new byte[1]), true);
+        Thread task = Thread.startVirtualThread(stream);
+
+        assertThat(handler.dataReceived.await(10, TimeUnit.SECONDS), Matchers.is(true));
+        handler.close();
+        task.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertThat(task.isAlive(), Matchers.is(false));
+        assertThat(stream.streamState(), Matchers.is(Http2StreamState.CLOSED));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+        streams.doMaintenance();
+        assertThat(streams.get(STREAM_ID), nullValue());
+    }
+
+    @Test
+    void subProtocolTerminalWriteCompletesAdmissionPublication() throws InterruptedException {
+        Http2ConnectionStreams streams = new Http2ConnectionStreams();
+        Http2StreamAdmissionGate admissionGate = new Http2StreamAdmissionGate();
+        Http2ConnectionWriter writer = new Http2ConnectionWriter(mock(SocketContext.class),
+                                                                 mock(DataWriter.class),
+                                                                 List.of(admissionGate));
+        Http2SubProtocolSelector selector = (_,
+                                             _,
+                                             _,
+                                             streamWriter,
+                                             streamId,
+                                             _,
+                                             _,
+                                             _,
+                                             currentStreamState,
+                                             _) -> new SubProtocolResult(true,
+                                                                              new TerminalSubProtocolHandler(streamWriter,
+                                                                                                             streamId,
+                                                                                                             currentStreamState));
+        ConnectionFlowControl flowControl = ConnectionFlowControl.serverBuilder((_, _) -> { })
+                .initialWindowSize(8192)
+                .maxFrameSize(16384)
+                .build();
+        Http2ServerStream stream = stream(streams, writer, flowControl, List.of(selector), admissionGate);
+        streams.put(new Http2Connection.StreamContext(STREAM_ID, 8192, stream));
+        streams.activate(STREAM_ID);
+        stream.headers(Http2Headers.create(WritableHeaders.create()), true);
+
+        stream.run();
+
+        AtomicReference<Http2StreamAdmissionGate.AwaitResult> admissionResult = new AtomicReference<>();
+        Thread admission = Thread.ofVirtual().start(() -> admissionResult.set(admissionGate.awaitPublication()));
+        try {
+            assertThat("subprotocol terminal publication must not remain pending",
+                       admission.join(Duration.ofSeconds(1)),
+                       Matchers.is(true));
+        } finally {
+            admissionGate.fail();
+        }
+        assertThat(admissionResult.get(), Matchers.is(Http2StreamAdmissionGate.AwaitResult.NO_PENDING));
+        assertThat(stream.streamState(), Matchers.is(Http2StreamState.CLOSED));
+        assertThat(streams.isActive(STREAM_ID), Matchers.is(false));
+    }
+
+    private static Http2ServerStream mockStream(int streamId) {
+        Http2ServerStream s = mock(Http2ServerStream.class);
+        when(s.streamId()).thenReturn(streamId);
+        return s;
+    }
+
+    private static void assertInvalidContentLengthResetWriteFailure(RuntimeException writeFailure) {
+        Http2ServerStream stream = stream(new Http2ConnectionStreams(), new RecordingConnectionWriter(writeFailure));
+        WritableHeaders<?> headers = WritableHeaders.create();
+        headers.add(HeaderNames.CONTENT_LENGTH, 2);
+        stream.headers(Http2Headers.create(headers), false);
+        BufferData payload = BufferData.create("frank");
+        Http2FrameHeader header = Http2FrameHeader.create(payload.available(),
+                                                          Http2FrameTypes.DATA,
+                                                          Http2Flag.DataFlags.create(Http2Flag.END_OF_STREAM),
+                                                          STREAM_ID);
+
+        ServerConnectionException exception = assertThrows(ServerConnectionException.class,
+                                                           () -> stream.data(header, payload, true));
+
+        assertThat(exception.getCause(), sameInstance(writeFailure));
+    }
+
+    private static void assertInvalidWindowUpdateResetWriteFailure(RuntimeException writeFailure) {
+        Http2ServerStream stream = stream(new Http2ConnectionStreams(), new RecordingConnectionWriter(writeFailure));
+        stream.headers(Http2Headers.create(WritableHeaders.create()), false);
+
+        ServerConnectionException exception = assertThrows(ServerConnectionException.class,
+                                                           () -> stream.windowUpdate(new Http2WindowUpdate(0)));
+
+        assertThat(exception.getCause(), sameInstance(writeFailure));
+    }
+
+    private static Http2ServerStream stream(Http2ConnectionStreams streams, Http2ConnectionWriter writer) {
+        Http2Config config = Http2Config.builder()
+                .initialWindowSize(8192)
+                .maxFrameSize(16384)
+                .build();
+        ConnectionFlowControl flowControl = ConnectionFlowControl.serverBuilder((streamId, windowUpdate) -> { })
+                .initialWindowSize(config.initialWindowSize())
+                .maxFrameSize(config.maxFrameSize())
+                .build();
+        return stream(streams, writer, flowControl, List.of());
+    }
+
+    private static Http2ServerStream stream(Http2ConnectionStreams streams,
+                                            Http2ConnectionWriter writer,
+                                            ConnectionFlowControl flowControl) {
+        return stream(streams, writer, flowControl, List.of());
+    }
+
+    private static Http2ServerStream stream(Http2ConnectionStreams streams,
+                                            Http2ConnectionWriter writer,
+                                            List<Http2SubProtocolSelector> subProtocols) {
+        Http2Config config = Http2Config.builder()
+                .initialWindowSize(8192)
+                .maxFrameSize(16384)
+                .build();
+        ConnectionFlowControl flowControl = ConnectionFlowControl.serverBuilder((streamId, windowUpdate) -> { })
+                .initialWindowSize(config.initialWindowSize())
+                .maxFrameSize(config.maxFrameSize())
+                .build();
+        return stream(streams, writer, flowControl, subProtocols);
+    }
+
+    private static Http2ServerStream stream(Http2ConnectionStreams streams,
+                                            Http2ConnectionWriter writer,
+                                            ConnectionFlowControl flowControl,
+                                            List<Http2SubProtocolSelector> subProtocols) {
+        return stream(streams, writer, flowControl, subProtocols, new Http2StreamAdmissionGate());
+    }
+
+    private static Http2ServerStream stream(Http2ConnectionStreams streams,
+                                            Http2ConnectionWriter writer,
+                                            ConnectionFlowControl flowControl,
+                                            List<Http2SubProtocolSelector> subProtocols,
+                                            Http2StreamAdmissionGate streamAdmissionGate) {
+        Http2Config config = Http2Config.builder()
+                .initialWindowSize(8192)
+                .maxFrameSize(16384)
+                .build();
+        ListenerContext listenerContext = mock(ListenerContext.class);
+        when(listenerContext.config()).thenReturn(ListenerConfig.create());
+        when(listenerContext.directHandlers()).thenReturn(DirectHandlers.create());
+
+        ConnectionContext ctx = mock(ConnectionContext.class);
+        when(ctx.router()).thenReturn(Router.empty());
+        when(ctx.listenerContext()).thenReturn(listenerContext);
+
+        Http2ServerStream stream = new Http2ServerStream(ctx,
+                                                        streams,
+                                                        streamAdmissionGate,
+                                                        NO_OP_RESET_TRACKER,
+                                                        HttpRouting.empty(),
+                                                        config,
+                                                        subProtocols,
+                                                        STREAM_ID,
+                                                        Http2Settings.builder().build(),
+                                                        Http2Settings.builder().build(),
+                                                        writer,
+                                                        flowControl,
+                                                        new Http2ServerStream.InboundDataBudget(
+                                                                1024,
+                                                                2L * config.initialWindowSize()),
+                                                        new Http2ConnectionChecks(config, mock(Http2Connection.class)));
+        stream.prologue(HttpPrologue.create(Http2Connection.FULL_PROTOCOL,
+                                            Http2Connection.PROTOCOL,
+                                            Http2Connection.PROTOCOL_VERSION,
+                                            Method.GET,
+                                            "/",
+                                            false));
+        return stream;
+    }
+
+    private static Http2Headers responseHeaders() {
+        WritableHeaders<?> headers = WritableHeaders.create();
+        headers.add(HeaderValues.createCached(Http2Headers.STATUS_NAME, 200));
+        return Http2Headers.create(headers);
+    }
+
+    private static final class AsyncSubProtocolHandler implements Http2SubProtocolSelector.SubProtocolHandler {
+        private final CountDownLatch dataReceived = new CountDownLatch(1);
+        private volatile Http2StreamState state = Http2StreamState.OPEN;
+        private volatile Runnable closeListener = () -> { };
+
+        @Override
+        public void init() {
+        }
+
+        @Override
+        public Http2StreamState streamState() {
+            return state;
+        }
+
+        @Override
+        public void onStreamClosed(Runnable listener) {
+            closeListener = listener;
+        }
+
+        @Override
+        public void rstStream(Http2RstStream rstStream) {
+        }
+
+        @Override
+        public void windowUpdate(Http2WindowUpdate update) {
+        }
+
+        @Override
+        public void data(Http2FrameHeader header, BufferData data) {
+            state = Http2StreamState.HALF_CLOSED_REMOTE;
+            dataReceived.countDown();
+        }
+
+        private void close() {
+            state = Http2StreamState.CLOSED;
+            closeListener.run();
+        }
+    }
+
+    private static final class TerminalSubProtocolHandler implements Http2SubProtocolSelector.SubProtocolHandler {
+        private final Http2StreamWriter writer;
+        private final int streamId;
+        private volatile Http2StreamState state;
+
+        private TerminalSubProtocolHandler(Http2StreamWriter writer, int streamId, Http2StreamState state) {
+            this.writer = writer;
+            this.streamId = streamId;
+            this.state = state;
+        }
+
+        @Override
+        public void init() {
+            writer.writeHeaders(responseHeaders(),
+                                streamId,
+                                Http2Flag.HeaderFlags.create(Http2Flag.END_OF_HEADERS | Http2Flag.END_OF_STREAM),
+                                FlowControl.Outbound.NOOP);
+            state = Http2StreamState.CLOSED;
+        }
+
+        @Override
+        public Http2StreamState streamState() {
+            return state;
+        }
+
+        @Override
+        public void rstStream(Http2RstStream rstStream) {
+            state = Http2StreamState.CLOSED;
+        }
+
+        @Override
+        public void windowUpdate(Http2WindowUpdate update) {
+        }
+
+        @Override
+        public void data(Http2FrameHeader header, BufferData data) {
+        }
+    }
+
+    private record WindowUpdate(int streamId, int increment) { }
+
+    private static final class NoOpResetTracker implements Http2ServerStream.LocallyResetStreamTracker {
+        @Override
+        public void add(int streamId, Http2ServerStream.LocallyResetStreamState streamState) {
+        }
+
+        @Override
+        public void localComplete(int streamId) {
+        }
+
+        @Override
+        public void remoteComplete(int streamId) {
+        }
+    }
+
+    private static final class RecordingConnectionWriter extends Http2ConnectionWriter {
+        private final RuntimeException writeFailure;
+        private boolean dataWritten;
+        private boolean headersWithDataWritten;
+        private boolean separateHeadersWithDataWritten;
+        private Runnable terminalCallback;
+
+        private RecordingConnectionWriter() {
+            this(null);
+        }
+
+        private RecordingConnectionWriter(RuntimeException writeFailure) {
+            super(mock(SocketContext.class), mock(DataWriter.class), List.of());
+            this.writeFailure = writeFailure;
+        }
+
+        @Override
+        public int writeHeaders(Http2Headers headers,
+                                int streamId,
+                                Http2Flag.HeaderFlags flags,
+                                FlowControl.Outbound flowControl) {
+            separateHeadersWithDataWritten = true;
+            return 0;
+        }
+
+        @Override
+        public int writeHeaders(Http2Headers headers,
+                                int streamId,
+                                Http2Flag.HeaderFlags flags,
+                                FlowControl.Outbound flowControl,
+                                Runnable onEndStreamFrameWritten) {
+            if (flags.endOfStream()) {
+                terminalCallback = onEndStreamFrameWritten;
+            }
+            return 0;
+        }
+
+        @Override
+        public int writeHeaders(Http2Headers headers,
+                                int streamId,
+                                Http2Flag.HeaderFlags flags,
+                                Http2FrameData dataFrame,
+                                FlowControl.Outbound flowControl) {
+            separateHeadersWithDataWritten = true;
+            return 0;
+        }
+
+        @Override
+        public int writeHeaders(Http2Headers headers,
+                                int streamId,
+                                Http2Flag.HeaderFlags flags,
+                                Http2FrameData dataFrame,
+                                FlowControl.Outbound flowControl,
+                                Runnable onEndStreamFrameWritten) {
+            headersWithDataWritten = true;
+            if (writeFailure != null) {
+                throw writeFailure;
+            }
+            terminalCallback = onEndStreamFrameWritten;
+            return 0;
+        }
+
+        @Override
+        public void writeData(Http2FrameData frame, FlowControl.Outbound flowControl) {
+        }
+
+        @Override
+        public int writeData(Http2FrameData frame,
+                             FlowControl.Outbound flowControl,
+                             Runnable onEndStreamFrameWritten) {
+            dataWritten = true;
+            if (writeFailure != null) {
+                throw writeFailure;
+            }
+            terminalCallback = onEndStreamFrameWritten;
+            return 0;
+        }
+
+        @Override
+        public void write(Http2FrameData frame) {
+            if (writeFailure != null) {
+                throw writeFailure;
+            }
+        }
+
+        private void completeTerminalWrite() {
+            assertThat(terminalCallback, Matchers.notNullValue());
+            terminalCallback.run();
+            terminalCallback = null;
+        }
+
+        private boolean hasPendingTerminalCallback() {
+            return terminalCallback != null;
+        }
+
+        private boolean headersWithDataWritten() {
+            return headersWithDataWritten;
+        }
+
+        private boolean separateHeadersWithDataWritten() {
+            return separateHeadersWithDataWritten;
+        }
+
+        private boolean dataWritten() {
+            return dataWritten;
         }
     }
 }

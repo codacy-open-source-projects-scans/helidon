@@ -21,11 +21,15 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Supplier;
+
+import io.helidon.common.Api;
 
 /**
  * Data reader that can pull additional data.
  */
+@Api.Stable
 public class DataReader {
     private final Supplier<byte[]> bytesSupplier;
     private final boolean ignoreLoneEol;
@@ -80,11 +84,7 @@ public class DataReader {
      * Pull next data.
      */
     public void pullData() {
-        byte[] bytes = bytesSupplier.get();
-        if (bytes == null) {
-            throw new InsufficientDataAvailableException();
-        }
-        Node n = new Node(bytes);
+        Node n = new Node(pullBytes());
         tail.next = n;
         tail = n;
     }
@@ -110,9 +110,11 @@ public class DataReader {
     public void ensureAvailable() {
         while (!head.hasAvailable()) {
             if (head.next == null) {
-                pullData();
+                head.reuse(pullBytes());
+                tail = head;
+            } else {
+                head = head.next;
             }
-            head = head.next;
         }
     }
 
@@ -239,6 +241,7 @@ public class DataReader {
      * @param len     number of bytes of the string
      * @return lazy string
      */
+    @Api.Internal
     public LazyString readLazyString(Charset charset, int len) {
         ensureAvailable(); // we have at least 1 byte
         if (len <= head.available()) { // fast case
@@ -263,15 +266,22 @@ public class DataReader {
     }
 
     /**
-     * Read ascii string.
+     * Read a string.
      *
-     * @param len number of bytes of the string
+     * @param len     number of bytes of the string
+     * @param charset character set to use
      * @return string value
+     * @throws NullPointerException if {@code charset} is {@code null}
      */
-    public String readAsciiString(int len) {
+    public String readString(int len, Charset charset) {
+        Objects.requireNonNull(charset, "charset");
         ensureAvailable(); // we have at least 1 byte
         if (len <= head.available()) { // fast case
-            String s = new String(head.bytes, head.position, len, StandardCharsets.US_ASCII);
+            Charset decodeCharset = charset;
+            if (StandardCharsets.ISO_8859_1.equals(charset) && isAscii(head.bytes, head.position, len)) {
+                decodeCharset = StandardCharsets.US_ASCII;
+            }
+            String s = new String(head.bytes, head.position, len, decodeCharset);
             head.position += len;
             return s;
         } else {
@@ -287,8 +297,28 @@ public class DataReader {
                     pullData();
                 }
             }
-            return new String(b, StandardCharsets.US_ASCII);
+            Charset decodeCharset = charset;
+            if (StandardCharsets.ISO_8859_1.equals(charset) && isAscii(b, 0, len)) {
+                decodeCharset = StandardCharsets.US_ASCII;
+            }
+            return new String(b, decodeCharset);
         }
+    }
+
+    /**
+     * Read ascii string.
+     *
+     * @param len number of bytes of the string
+     * @return string value
+     */
+    public String readAsciiString(int len) {
+        ensureAvailable(); // we have at least 1 byte
+        if (len <= head.available()) { // fast case
+            String s = new String(head.bytes, head.position, len, StandardCharsets.US_ASCII);
+            head.position += len;
+            return s;
+        }
+        return readString(len, StandardCharsets.US_ASCII);
     }
 
     /**
@@ -352,7 +382,7 @@ public class DataReader {
             byte[] barr = n.bytes;
             for (int i = n.position; i < barr.length && idx < max; i++, idx++) {
                 if (barr[i] == Bytes.LF_BYTE && !ignoreLoneEol) {
-                    throw new IncorrectNewLineException("Found LF (" + idx + ") without preceding CR. :\n" + this.debugDataHex());
+                    throw new IncorrectNewLineException("Found LF (" + idx + ") without preceding CR.");
                 } else if (barr[i] == Bytes.CR_BYTE) {
                     byte nextByte;
                     if (i + 1 < barr.length) {
@@ -364,8 +394,7 @@ public class DataReader {
                         return -idx - 1;
                     }
                     if (!ignoreLoneEol) {
-                        throw new IncorrectNewLineException("Found CR (" + idx
-                                                                    + ") without following LF. :\n" + this.debugDataHex());
+                        throw new IncorrectNewLineException("Found CR (" + idx + ") without following LF.");
                     }
                 } else if (barr[i] == b) {
                     return idx;
@@ -411,7 +440,7 @@ public class DataReader {
                 if (lfIndexNode != -1) {
                     if (!ignoreLoneEol) {
                         throw new IncorrectNewLineException("Found LF (" + (idx + lfIndexNode - n.position)
-                                                                    + ") without preceding CR. :\n" + this.debugDataHex());
+                                                                    + ") without preceding CR.");
                     }
                 }
             } else {
@@ -424,7 +453,7 @@ public class DataReader {
                     }
                     if (!ignoreLoneEol) {
                         throw new IncorrectNewLineException("Found CR (" + (idx + crIndexNode - n.position)
-                                                                    + ") without following LF. :\n" + this.debugDataHex());
+                                                                    + ") without following LF.");
                     }
                 } else {
                     // found CR within the current array
@@ -433,8 +462,7 @@ public class DataReader {
                         return idx + crIndexNode - fromIndexNode;
                     }
                     if (!ignoreLoneEol) {
-                        throw new IncorrectNewLineException("Found CR (" + idx
-                                                                    + ") without following LF. :\n" + this.debugDataHex());
+                        throw new IncorrectNewLineException("Found CR (" + idx + ") without following LF.");
                     }
                     idx += (crIndexNode - fromIndexNode + 1);
                     fromIndexNode = crIndexNode + 1;
@@ -457,15 +485,55 @@ public class DataReader {
     }
 
     /**
-     * Configure data listener.
+     * Configure a listener for raw input data. Each non-empty chunk obtained from the byte supplier is reported once,
+     * using {@link io.helidon.common.buffers.DataListener#data(Object, byte[], int, int)}. Lookahead and consumption of
+     * already buffered bytes do not produce additional notifications. A chunk may include bytes beyond the current
+     * message boundary.
+     * <p>
+     * The first registration immediately reports any buffered, unread bytes, without fetching more data or replaying
+     * consumed bytes. Replacing the listener or its context affects only chunks fetched after the replacement.
+     * <p>
+     * The callback receives the supplier's byte array directly and must not modify it or consume data from this reader.
      *
      * @param listener listener to write information to
      * @param context  context
      * @param <T>      type of the context
+     * @throws java.lang.NullPointerException if the listener or context is {@code null}
      */
     public <T> void listener(DataListener<T> listener, T context) {
+        Objects.requireNonNull(listener);
+        Objects.requireNonNull(context);
+        boolean firstListener = this.listener == null;
         this.listener = listener;
         this.context = context;
+        if (firstListener) {
+            for (Node node = head; node != null; node = node.next) {
+                if (node.hasAvailable()) {
+                    listener.data(context, node.bytes, node.position, node.available());
+                }
+            }
+        }
+    }
+
+    private static boolean isAscii(byte[] bytes, int offset, int length) {
+        for (int i = offset; i < offset + length; i++) {
+            if (bytes[i] < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    private byte[] pullBytes() {
+        byte[] bytes = bytesSupplier.get();
+        if (bytes == null) {
+            throw new InsufficientDataAvailableException();
+        }
+        if (listener != null && bytes.length != 0) {
+            listener.data(context, bytes, 0, bytes.length);
+        }
+        return bytes;
     }
 
     /**
@@ -494,7 +562,7 @@ public class DataReader {
     }
 
     private class Node {
-        private final byte[] bytes;
+        private byte[] bytes;
         private int position;
         private Node next;
 
@@ -513,6 +581,11 @@ public class DataReader {
 
         boolean hasAvailable() {
             return position < bytes.length;
+        }
+
+        void reuse(byte[] bytes) {
+            this.bytes = bytes;
+            this.position = 0;
         }
 
         /*

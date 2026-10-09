@@ -16,13 +16,16 @@
 
 package io.helidon.webclient.spi;
 
+import java.util.Optional;
+
+import io.helidon.common.Api;
 import io.helidon.config.NamedService;
+import io.helidon.webclient.api.WebClientProtocolResponse;
 import io.helidon.webclient.api.WebClientServiceRequest;
 import io.helidon.webclient.api.WebClientServiceResponse;
 
 /**
  * Extension that can modify web client behavior.
- * This is now only designed for HTTP/1
  */
 @FunctionalInterface
 public interface WebClientService extends NamedService {
@@ -58,5 +61,32 @@ public interface WebClientService extends NamedService {
          * @return response from the next service or HTTP call
          */
         WebClientServiceResponse proceed(WebClientServiceRequest clientRequest);
+    }
+
+    /**
+     * Terminal service chain that exposes the currently selected wire protocol.
+     */
+    @Api.Internal
+    interface WireProtocolChain extends Chain {
+        /**
+         * Protocol currently selected for the request.
+         *
+         * @return protocol identifier
+         */
+        String protocolId();
+    }
+
+    /**
+     * Terminal service chain that can expose transport response context after an invocation.
+     */
+    @Api.Internal
+    interface TransportChain extends WireProtocolChain {
+        /**
+         * Create protocol response context for the completed response when applicable.
+         *
+         * @param response completed service response
+         * @return protocol response context, or empty when no protocol notification is needed
+         */
+        Optional<WebClientProtocolResponse> protocolResponse(WebClientServiceResponse response);
     }
 }

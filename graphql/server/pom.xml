@@ -25,11 +25,15 @@
     <parent>
         <groupId>io.helidon.graphql</groupId>
         <artifactId>helidon-graphql-project</artifactId>
-        <version>27.0.0-SNAPSHOT</version>
+        <version>28.0.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>helidon-graphql-server</artifactId>
     <name>Helidon GraphQL Server</name>
+
+    <properties>
+        <javadoc.fail-on-warnings>true</javadoc.fail-on-warnings>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -39,6 +43,10 @@
         <dependency>
             <groupId>io.helidon.common</groupId>
             <artifactId>helidon-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.helidon.common</groupId>
+            <artifactId>helidon-common-context</artifactId>
         </dependency>
         <dependency>
             <groupId>io.helidon.config</groupId>

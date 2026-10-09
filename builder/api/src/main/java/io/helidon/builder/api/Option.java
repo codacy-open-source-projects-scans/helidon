@@ -23,9 +23,12 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
+import io.helidon.common.Api;
+
 /**
  * Prototype option annotations.
  */
+@Api.Stable
 public final class Option {
     private Option() {
     }
@@ -52,6 +55,14 @@ public final class Option {
          * @return whether to merge the nested object into this object
          */
         boolean merge() default false;
+
+        /**
+         * Whether to include this option in generated configuration metadata.
+         * This setting does not affect configuration reading.
+         *
+         * @return whether to include this option in generated configuration metadata
+         */
+        boolean metadata() default true;
     }
 
     /**
@@ -95,63 +106,288 @@ public final class Option {
     }
 
     /**
-     * Mark option as sourced from a {@link java.util.ServiceLoader}.
+     * Mark option as sourced from services discovered by a {@link java.util.ServiceLoader}, or by Helidon Service
+     * Registry when {@link io.helidon.builder.api.Prototype.RegistrySupport} is enabled.
      * Use if the configuration may be provided by another module not known to us.
      * <p>
-     * To control whether to discover services or not, you can specify a key {@code config-key-discover-services}
-     * on the same level as the section for the provider based property. This is aligned with the generated methods on the
-     * builder, and allows for the shallowest possible configuration tree (this would  override {@link #discoverServices()}
-     * defined on this annotation).
+     * When the option is also {@link io.helidon.builder.api.Option.Configured}, discovered configured providers are
+     * used to create services from configuration.
      * <p>
-     * Also there is no difference regardless whether we return a single value, or a list of values.
-     * If the method returns a list, the provider configuration must be under config key {@code providers} under
-     * the configured option. On the same level as {@code providers}, there can be {@code discover-services} boolean
+     * A configured provider option uses the option's configured key as the provider configuration node. For example,
+     * if the provider option key is {@code my-providers}, provider entries are read from {@code my-providers}. There
+     * is no extra nested {@code providers} key unless the option itself is configured with that key.
      * <p>
-     * Option called {@code myProvider} that returns a single provider, or an {@link java.util.Optional} provider example
-     * in configuration:
+     * To control whether to discover services or not for a configured provider option, you can specify a sibling
+     * boolean key named {@code <option-config-key>-discover-services}, such as
+     * {@code my-providers-discover-services}. This is aligned with the generated methods on the builder and overrides
+     * {@link #discoverServices()} defined on this annotation.
+     * <p>
+     * The configuration key rules are the same regardless whether the method returns a single value, a single
+     * {@link java.util.Optional} value, a list of values, or an optional list of values. A single value or optional
+     * value must have at most one configured provider entry.
+     * <p>
+     * When using an optional list, an absent configuration node does not by itself set the optional value; the value
+     * stays empty unless builder values or service discovery provide entries. An explicitly empty list or object
+     * configuration node produces {@code Optional.of(List.of())}.
+     * <p>
+     * The following examples first use the compatibility defaults, {@link Provider.Identity#TYPE_AND_NAME
+     * TYPE_AND_NAME} with {@link Provider.ConfigForm#AUTO AUTO}. With those defaults, either object or list form is
+     * accepted. Option {@code myProvider} returning one value, or an {@link java.util.Optional} value, can use object
+     * form:
      * <pre>
      * my-type:
      *   my-provider:
-     *     provider-id:
+     *     provider-id: # object key supplies the instance name
+     *       type: provider-type
      *       provider-key1: "providerValue"
      *       provider-key2: "providerValue"
      * </pre>
      * <p>
-     * Option called {@code myProviders} that returns a list of providers in configuration:
+     * Option {@code myProviders} returning a Java {@link java.util.List} can use the same object form; the Java return
+     * type does not require list-form configuration. This example configures two instances of the same provider type:
      * <pre>
      * my-type:
      *   my-providers-discover-services: true # default of this value is controlled by annotation
      *   my-providers:
-     *     provider-id:
+     *     first-provider:
+     *       type: provider-type
      *       provider-key1: "providerValue"
      *       provider-key2: "providerValue"
-     *     provider2-id:
-     *       provider2-key1: "provider2Value"
+     *     second-provider:
+     *       type: provider-type
+     *       provider-key1: "anotherValue"
      * </pre>
+     * The same option can instead use list form with the compatibility defaults:
+     * <pre>
+     * my-type:
+     *   my-providers:
+     *     - type: provider-type
+     *       name: first-provider
+     *       provider-key1: "providerValue"
+     *       provider-key2: "providerValue"
+     *     - type: provider-type
+     *       name: second-provider
+     *       provider-key1: "anotherValue"
+     * </pre>
+     * In object form, each object key supplies an instance name and those names are therefore globally unique within
+     * the object. Object form does not define the order in which values are materialized. List form preserves the
+     * configured order, may reuse a name for a different provider type, and rejects an exact duplicate
+     * {@code (type, name)} pair. Object form is therefore intentionally less expressive than list form for
+     * {@link Provider.Identity#TYPE_AND_NAME TYPE_AND_NAME}.
      */
     @Target(ElementType.METHOD)
     @Inherited
     @Retention(RetentionPolicy.CLASS)
     public @interface Provider {
         /**
-         * The service provider interface that is used to discover
-         * implementations. The type of the property is the service provided by that provider.
+         * Provider contract used to discover implementations for this option.
+         * <p>
+         * For a configured option, implementations of this contract are configured providers that create the option's
+         * values from configuration. For a non-configured option, implementations of this contract are themselves the
+         * option values. The configured-provider identity and configuration-form properties do not apply to a
+         * non-configured option.
          *
-         * @return type of the provider
+         * @return provider contract used for discovery
          */
         Class<?> value();
 
         /**
-         * Whether to discover all services using a service loader by default.
-         * When set to {@code true}, all services discovered by the service loader will be added (even if no configuration
-         * node exists for them). When set to {@code false}, only services that have a configuration node will be added.
-         * This can be overridden by {@code discover-services} configuration option under this option's key.
-         * In case the option is not {@link io.helidon.builder.api.Option.Configured}, this is always considered true,
-         * as otherwise this annotation would not make any sense (i.e. it would never provide a value).
+         * Whether service discovery may add option values that do not have corresponding configuration.
+         * <p>
+         * For a configured provider option, provider implementations are discovered when provider resolution is enabled
+         * by {@link #enabledBy()}, so they can create entries that are present in configuration. A value of {@code false}
+         * only prevents those providers from adding unconfigured default values; it does not disable the discovery
+         * needed to create configured entries. For a non-configured provider option, {@code false} prevents discovered
+         * implementations from being added as option values.
+         * <p>
+         * Discovery uses the service loader, or Helidon Service Registry when
+         * {@link io.helidon.builder.api.Prototype.RegistrySupport} is enabled.
+         * For configured provider options, this can be overridden by a sibling configuration option named
+         * {@code <option-config-key>-discover-services}. For a non-configured provider option, this value initializes
+         * the generated discovery flag, which can still be changed using the generated builder method. The default is
+         * {@code true}.
          *
-         * @return whether to discover services by default for a provider
+         * @return whether service discovery may add values without matching configuration by default
          */
         boolean discoverServices() default true;
+
+        /**
+         * Name of a zero-argument boolean getter on the generated builder that controls all provider processing for
+         * this option.
+         * <p>
+         * The getter is evaluated when building the prototype, using its current builder value, including programmatic
+         * configuration overrides. When it returns {@code false}, provider lookup, configured-provider validation,
+         * and creation of values by providers are all skipped, even when provider entries are explicitly configured.
+         * Explicitly supplied option values are retained, and normal prototype validation still applies.
+         * <p>
+         * When the getter returns {@code true}, normal provider processing applies. The separate
+         * {@link #discoverServices()} setting and generated {@code <option>DiscoverServices(boolean)} method then
+         * control whether providers may contribute values without matching configuration. Disabling that discovery
+         * alone still allows configured provider entries to be processed; this getter returning {@code false}
+         * suppresses both configured entries and unconfigured defaults.
+         * <p>
+         * For example, on a {@code manager} option, {@code enabledBy = "enabled"} calls the builder's {@code enabled()}
+         * getter. Calling {@code enabled(false)} skips manager provider creation even if manager entries are configured
+         * or {@code managerDiscoverServices(true)} is set. With {@code enabled(true)} and
+         * {@code managerDiscoverServices(false)}, configured manager entries are processed, but providers do not add
+         * unconfigured defaults.
+         * <p>
+         * The default empty name leaves provider processing unconditionally enabled, subject to the normal discovery
+         * and configured-entry settings.
+         *
+         * @return boolean builder getter name, or an empty string
+         */
+        String enabledBy() default "";
+
+        /**
+         * Values that constitute the identity of each configured provider instance.
+         * <p>
+         * Identity is independent of {@link #configForm() configuration syntax}. It defines which values distinguish
+         * configured instances, not whether the outer configuration is written as an object or a list. For example,
+         * {@link Identity#TYPE_ONLY TYPE_ONLY} can be combined with {@link ConfigForm#LIST LIST}, and
+         * {@link Identity#TYPE_AND_NAME TYPE_AND_NAME} can be combined with {@link ConfigForm#OBJECT OBJECT}.
+         * <p>
+         * With {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}, an object key supplies the instance name, so object-form
+         * names are globally unique. List form may reuse a name for a different provider type, but an exact duplicate
+         * {@code (type, name)} pair is invalid. The default is {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}. This
+         * property is ignored when the provider option is not also
+         * {@link io.helidon.builder.api.Option.Configured configured}.
+         *
+         * @return configured provider identity model
+         */
+        @Api.Incubating
+        Identity identity() default Identity.TYPE_AND_NAME;
+
+        /**
+         * Outer configuration container accepted for configured provider entries.
+         * <p>
+         * The form is independent of {@link #identity() provider identity}. It controls only whether the configured
+         * provider collection is an object, a list, or either. It is also independent of the option's Java type: a Java
+         * {@link java.util.List} option may use object-form configuration. The selected form does not constrain the
+         * provider-specific value within each entry beyond the metadata required by the selected identity model.
+         * <p>
+         * {@link ConfigForm#AUTO AUTO} preserves compatibility by resolving to {@link ConfigForm#OBJECT OBJECT} for
+         * {@link Identity#TYPE_ONLY TYPE_ONLY}, and to {@link ConfigForm#OBJECT_OR_LIST OBJECT_OR_LIST} for
+         * {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}. Object form has unspecified materialization order; list form
+         * preserves configured order. An explicit form overrides the automatic choice. The default is
+         * {@link ConfigForm#AUTO AUTO}. This property is ignored when the provider option is not also
+         * {@link io.helidon.builder.api.Option.Configured configured}.
+         *
+         * @return accepted outer configuration form
+         */
+        @Api.Incubating
+        ConfigForm configForm() default ConfigForm.AUTO;
+
+        /**
+         * Identity model for configured provider instances.
+         * <p>
+         * Identity and {@link ConfigForm configuration form} are separate axes. Neither enum value selects object or
+         * list syntax by itself when an explicit form is configured.
+         */
+        @Api.Incubating
+        enum Identity {
+            /**
+             * Use provider type as the complete configured-instance identity.
+             * <p>
+             * At most one configured instance may exist for each provider type. In object form, the object key supplies
+             * the provider type; nested {@code type} and {@code name} metadata properties are forbidden. In list form,
+             * each entry must declare {@code type}, must not declare {@code name}, and provider types must be unique.
+             * The two forms represent the same set of unique provider types. Object form has unspecified
+             * materialization order, while list form preserves configured order.
+             * <p>
+             * This value selects identity only; it does not require object syntax. Use
+             * {@link ConfigForm#LIST LIST} or {@link ConfigForm#OBJECT_OR_LIST OBJECT_OR_LIST} when list syntax is
+             * intentionally supported. Provider-specific content within an entry retains the shape accepted by that
+             * provider.
+             */
+            TYPE_ONLY,
+
+            /**
+             * Use provider type and instance name together as the configured-instance identity.
+             * <p>
+             * In object form, the object key supplies the name and nested {@code type} selects the provider, defaulting
+             * to the object key when omitted. Object keys make names globally unique, and object form has unspecified
+             * materialization order. In list form, each entry declares {@code type}; {@code name} defaults to
+             * {@code type} when omitted. A list may reuse a name for a different provider type, while an exact duplicate
+             * {@code (type, name)} pair is invalid and causes configuration to fail. List form preserves configured
+             * order. Object form is intentionally less expressive because it cannot reuse a name across provider
+             * types. Both forms allow multiple differently named instances of the same provider type. The legacy
+             * single-key nested list-entry syntax remains accepted.
+             * <p>
+             * This value selects identity only; it does not enable list syntax. An explicit
+             * {@link ConfigForm#OBJECT OBJECT} requires an object, while {@link ConfigForm#LIST LIST} requires a list.
+             * Provider-specific content within an entry retains the shape accepted by that provider.
+             */
+            TYPE_AND_NAME
+        }
+
+        /**
+         * Accepted outer container for configured provider entries.
+         * <p>
+         * This enum controls syntax only. It does not select the configured provider identity model and does not impose
+         * a generic shape on provider-specific values stored within an entry.
+         */
+        @Api.Incubating
+        enum ConfigForm {
+            /**
+             * Select the outer configuration form from {@link Provider#identity() identity}.
+             * <p>
+             * {@link Identity#TYPE_ONLY TYPE_ONLY}
+             * resolves to {@link #OBJECT OBJECT}, while {@link Identity#TYPE_AND_NAME TYPE_AND_NAME} resolves to
+             * {@link #OBJECT_OR_LIST OBJECT_OR_LIST}.
+             * <p>
+             * Together with the default {@link Identity#TYPE_AND_NAME TYPE_AND_NAME} identity, this preserves the
+             * previous behavior that accepts either configured-provider object or list syntax. The form selected by
+             * this value controls only the outer container and its ordering semantics; it does not constrain
+             * provider-specific content within an entry.
+             */
+            AUTO,
+
+            /**
+             * Require the outer configured-provider container to be an object.
+             * <p>
+             * With {@link Identity#TYPE_ONLY TYPE_ONLY}, each object key is the provider type and nested {@code type}
+             * and {@code name} metadata is forbidden. With {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}, the object key
+             * is the globally unique name and nested {@code type} selects the provider, defaulting to the object key.
+             * Differently named instances of the same type are supported. Object entries have unspecified
+             * materialization order.
+             * <p>
+             * This value selects syntax only. It does not select an identity model or constrain the shape of
+             * provider-specific content within an entry.
+             */
+            OBJECT,
+
+            /**
+             * Require the outer configured-provider container to be a list.
+             * <p>
+             * With {@link Identity#TYPE_ONLY TYPE_ONLY}, every list entry requires {@code type}, forbids {@code name},
+             * and types must be unique. With {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}, {@code name} defaults to
+             * {@code type}, distinct names distinguish entries of one type, and the same name may be reused for another
+             * provider type. An exact duplicate {@code (type, name)} pair is invalid and causes configuration to fail;
+             * the legacy single-key nested entry syntax is also accepted. Entries are materialized in configured list
+             * order.
+             * <p>
+             * This value selects syntax only. It does not select an identity model or constrain provider-specific
+             * content beyond the metadata needed by list syntax.
+             */
+            LIST,
+
+            /**
+             * Accept either an object or a list as the outer configured-provider container.
+             * <p>
+             * Each entry is interpreted using the corresponding {@link #OBJECT OBJECT} or {@link #LIST LIST} rules and
+             * the identity selected by {@link Provider#identity()}. For
+             * {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}, object keys supply globally unique names, while list form
+             * may reuse a name for different provider types and rejects an exact duplicate {@code (type, name)} pair.
+             * Both forms support multiple differently named instances of one type. Object form has unspecified
+             * materialization order; list form preserves configured order.
+             * <p>
+             * This value selects syntax only. It does not add name identity to
+             * {@link Identity#TYPE_ONLY TYPE_ONLY}, remove name identity from
+             * {@link Identity#TYPE_AND_NAME TYPE_AND_NAME}, or constrain provider-specific content within an entry.
+             */
+            OBJECT_OR_LIST
+        }
     }
 
     /**
@@ -182,6 +418,8 @@ public final class Option {
      * Allowed values for this option.
      * The allowed value is always configured as a string, and is compared to {@link java.lang.String#valueOf(Object)} of the
      * value.
+     * For enum options, an allowed value that matches the lower-case {@link java.lang.Enum#name()} is also accepted. The
+     * explicitly declared allowed value is retained in generated configuration metadata.
      */
     @Target(ElementType.METHOD)
     @Inherited
@@ -196,7 +434,9 @@ public final class Option {
     }
 
     /**
-     * Can be used to define a list of possible values of an option.
+     * Defines one possible value for an option.
+     * For enum options, an allowed value that matches the lower-case {@link java.lang.Enum#name()} is also accepted. The
+     * explicitly declared allowed value is retained in generated configuration metadata.
      */
     @Target(ElementType.METHOD)
     @Inherited
@@ -337,8 +577,8 @@ public final class Option {
 
     /**
      * Applying this annotation to a {@link io.helidon.builder.api.Prototype.Blueprint}-annotated interface method will cause
-     * the generated class to also include additional "add*()" methods. This will only apply, however, if the method is for
-     * a {@link java.util.Map}, {@link java.util.List}, or {@link java.util.Set}.
+     * the generated class to also include an additional singular add or put method. This will only apply, however, if the
+     * method is for a {@link java.util.Map}, {@link java.util.List}, {@link java.util.Set}, or an optional map.
      */
     @Target(ElementType.METHOD)
     @Retention(RetentionPolicy.CLASS)
@@ -353,8 +593,8 @@ public final class Option {
          * }</pre>
          * an additional generated method named {@code addPickle(Pickle val)} will be placed on the builder of the generated
          * class.
-         * <p>This annotation only applies to getter methods that return a Map, List, or Set. If left undefined then the add
-         * method
+         * <p>This annotation only applies to getter methods that return a Map, List, Set, or Optional of Map. If left
+         * undefined then the singular method
          * will use the default method name, dropping any "s" that might be present at the end of the method name (e.g.,
          * pickles -> pickle).
          *

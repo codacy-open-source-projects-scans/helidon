@@ -23,6 +23,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
+import java.util.OptionalLong;
 
 import io.helidon.common.GenericType;
 import io.helidon.common.media.type.MediaTypes;
@@ -33,10 +34,16 @@ import io.helidon.http.HttpException;
 import io.helidon.http.HttpMediaType;
 import io.helidon.http.Status;
 import io.helidon.http.WritableHeaders;
+import io.helidon.http.media.EntityWriter;
+import io.helidon.http.media.InstanceWriter;
 import io.helidon.http.media.MediaContext;
 import io.helidon.http.media.MediaSupport;
 
 import jakarta.json.bind.JsonbException;
+import jakarta.json.bind.annotation.JsonbTypeSerializer;
+import jakarta.json.bind.serializer.JsonbSerializer;
+import jakarta.json.bind.serializer.SerializationContext;
+import jakarta.json.stream.JsonGenerator;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.CoreMatchers.containsString;
@@ -44,6 +51,7 @@ import static org.hamcrest.CoreMatchers.hasItems;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.startsWith;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /*
@@ -70,11 +78,13 @@ class JsonbMediaTest {
 
         MediaSupport.WriterResponse<Book> res = support.writer(BOOK_TYPE, headers);
         assertThat(res.support(), is(MediaSupport.SupportLevel.COMPATIBLE));
+        EntityWriter<Book> writer = res.supplier().get();
+        assertThat(writer.supportsInstanceWriter(), is(true));
+        assertInstanceWriter(writer.instanceWriter(BOOK_TYPE, new Book("test-title"), headers), "test-title");
 
         ByteArrayOutputStream os = new ByteArrayOutputStream();
 
-        res.supplier().get()
-                .write(BOOK_TYPE, new Book("test-title"), os, headers);
+        writer.write(BOOK_TYPE, new Book("test-title"), os, headers);
 
         assertThat(headers, HttpHeaderMatcher.hasHeader(HeaderValues.CONTENT_TYPE_JSON));
         String result = os.toString(StandardCharsets.UTF_8);
@@ -88,6 +98,24 @@ class JsonbMediaTest {
                 .read(BOOK_TYPE, new ByteArrayInputStream(os.toByteArray()), headers);
 
         assertThat(sanity.getTitle(), is("test-title"));
+    }
+
+    @Test
+    void testWriteServerInstance() {
+        WritableHeaders<?> requestHeaders = WritableHeaders.create();
+        WritableHeaders<?> responseHeaders = WritableHeaders.create();
+
+        MediaSupport.WriterResponse<Book> res = support.writer(BOOK_TYPE, requestHeaders, responseHeaders);
+        assertThat(res.support(), is(MediaSupport.SupportLevel.COMPATIBLE));
+        EntityWriter<Book> writer = res.supplier().get();
+
+        assertThat(writer.supportsInstanceWriter(), is(true));
+        assertInstanceWriter(writer.instanceWriter(BOOK_TYPE,
+                                                   new Book("server-title"),
+                                                   requestHeaders,
+                                                   responseHeaders),
+                             "server-title");
+        assertThat(responseHeaders, HttpHeaderMatcher.hasHeader(HeaderValues.CONTENT_TYPE_JSON));
     }
 
     @Test
@@ -117,6 +145,36 @@ class JsonbMediaTest {
                 .read(BOOK_LIST_TYPE, new ByteArrayInputStream(os.toByteArray()), headers);
 
         assertThat(sanity, hasItems(new Book("first"), new Book("second"), new Book("third")));
+    }
+
+    @Test
+    void testCustomSerializerForObjectProperty() {
+        var type = GenericType.create(ObjectValue.class);
+        var headers = WritableHeaders.create();
+        var writer = support.writer(type, headers).supplier().get();
+        var entity = new ObjectValue();
+        var output = new ByteArrayOutputStream();
+
+        writer.write(type, entity, output, headers);
+
+        assertThat(output.toString(StandardCharsets.UTF_8), is("{\"value\":\"custom\"}"));
+        assertThat(new String(writer.instanceWriter(type, entity, headers).instanceBytes(), StandardCharsets.UTF_8),
+                   is("{\"value\":\"custom\"}"));
+    }
+
+    @Test
+    void testCustomSerializerForContainerElements() {
+        var type = GenericType.create(ContainerValue.class);
+        var headers = WritableHeaders.create();
+        var writer = support.writer(type, headers).supplier().get();
+        var entity = new ContainerValue();
+        var output = new ByteArrayOutputStream();
+
+        writer.write(type, entity, output, headers);
+
+        assertThat(output.toString(StandardCharsets.UTF_8), is("{\"values\":[\"custom\"]}"));
+        assertThat(new String(writer.instanceWriter(type, entity, headers).instanceBytes(), StandardCharsets.UTF_8),
+                   is("{\"values\":[\"custom\"]}"));
     }
 
     @Test
@@ -248,6 +306,55 @@ class JsonbMediaTest {
                 .read(BOOK_TYPE, is, requestHeaders, responseHeaders));
 
         assertThat(httpException.status(), is(Status.UNSUPPORTED_MEDIA_TYPE_415));
+    }
+
+    private void assertInstanceWriter(InstanceWriter writer, String expectedTitle) {
+        byte[] bytes = writer.instanceBytes();
+        assertThat(writer.alwaysInMemory(), is(true));
+        assertThat(writer.contentLength(), is(OptionalLong.of(bytes.length)));
+
+        ByteArrayOutputStream os = new ByteArrayOutputStream();
+        writer.write(os);
+        assertArrayEquals(bytes, os.toByteArray());
+
+        String result = new String(bytes, StandardCharsets.UTF_8);
+        assertThat(result, containsString("\"title\""));
+        assertThat(result, containsString("\"" + expectedTitle + "\""));
+    }
+
+    @JsonbTypeSerializer(NamedValueSerializer.class)
+    public interface NamedValue {
+        String getValue();
+    }
+
+    public static class ObjectValue {
+        public Object value = new CustomValue();
+    }
+
+    public static class ContainerValue {
+        public List<NamedValue> values = List.of(new InterfaceValue());
+    }
+
+    public static class InterfaceValue implements NamedValue {
+        @Override
+        public String getValue() {
+            return "custom";
+        }
+    }
+
+    @JsonbTypeSerializer(NamedValueSerializer.class)
+    public static class CustomValue implements NamedValue {
+        @Override
+        public String getValue() {
+            return "custom";
+        }
+    }
+
+    public static class NamedValueSerializer implements JsonbSerializer<NamedValue> {
+        @Override
+        public void serialize(NamedValue value, JsonGenerator generator, SerializationContext context) {
+            generator.write(value.getValue());
+        }
     }
 
     public static class Book {

@@ -41,11 +41,10 @@ import io.helidon.metrics.spi.MetersProvider;
 /**
  * Provider for the built-in system meters.
  */
-public class SystemMetersProvider implements MetersProvider {
+public class SystemMetersProvider implements MetersProvider, AutoCloseable {
 
     private static final String BYTES = "bytes";
     private static final String SECONDS = "seconds";
-    private static final String SCOPE = Meter.Scope.BASE;
 
     // Maps camelCase names to snake_case, but only for those names that are actually different in the two cases.
     private static final Map<String, String> CAMEL_TO_SNAKE_CASE_METER_NAMES = initMeterNames();
@@ -187,6 +186,11 @@ public class SystemMetersProvider implements MetersProvider {
         return prepareMeterBuilders();
     }
 
+    @Override
+    public void close() {
+        metricsFactory = null;
+    }
+
     /**
      * Returns a function to invoke a function on a main bean to get a sub-bean, then invoke a function on
      * the sub-bean to retrieve a value.
@@ -263,23 +267,13 @@ public class SystemMetersProvider implements MetersProvider {
                           metadata(GC_COUNT),
                           gcBean,
                           GarbageCollectorMXBean::getCollectionCount,
-                          Tag.create("name", poolName));
+                          metricsFactory.tagCreate("name", poolName));
             // Express the GC time in seconds.
-            // @Deprecated(forRemoval = true) - Starting in Helidon 5 always register a gauge instead of checking which
-            // type of meter to register.
-            if (isGcTimeGauge()) {
-                registerGauge(result,
-                              metadata(GC_TIME),
-                              gcBean,
-                              bean -> (long) (bean.getCollectionTime() / 1000.0D),
-                              Tag.create("name", poolName));
-            } else {
-                registerFunctionalCounter(result,
-                                          metadata(GC_TIME),
-                                          gcBean,
-                                          bean -> (long) (bean.getCollectionTime() / 1000.0D),
-                                          Tag.create("name", poolName));
-            }
+            registerGauge(result,
+                          metadata(GC_TIME),
+                          gcBean,
+                          bean -> (long) (bean.getCollectionTime() / 1000.0D),
+                          metricsFactory.tagCreate("name", poolName));
         }
         return result;
     }
@@ -290,7 +284,6 @@ public class SystemMetersProvider implements MetersProvider {
                                                      Function<T, R> fn,
                                                      Tag... tags) {
             result.add(metricsFactory.gaugeBuilder(metadata.name, object, obj -> fn.apply(obj).doubleValue())
-                               .scope(SCOPE)
                                .description(metadata.description)
                                .baseUnit(metadata.baseUnit)
                                .tags(Arrays.asList(tags)));
@@ -302,16 +295,9 @@ public class SystemMetersProvider implements MetersProvider {
                                                Function<T, Long> fn,
                                                Tag... tags) {
         result.add(metricsFactory.functionalCounterBuilder(metadata.name, object, fn)
-                           .scope(SCOPE)
                            .description(metadata.description)
                            .baseUnit(metadata.baseUnit)
                            .tags(Arrays.asList(tags)));
-    }
-
-    @Deprecated(since = "4.1", forRemoval = true)
-    private boolean isGcTimeGauge() {
-        // Compare using the string so we can avoid exposing the temporary, deprecated enum as public in the config type.
-        return metricsFactory.metricsConfig().gcTimeType().name().equals("GAUGE");
     }
 
     private static class Metadata {

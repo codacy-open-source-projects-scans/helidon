@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022, 2023 Oracle and/or its affiliates.
+# Copyright (c) 2022, 2026 Oracle and/or its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,8 +21,14 @@ server:
   protocols:
     http_2:
       max-frame-size: 8192
+      max-headers-size: 6144
       max-header-list-size: 4096
       max-concurrent-streams: 16384
       initial-window-size: 8192
       flow-control-timeout: PT0.7S
       validate-path: false
+      alt-svc:
+        protocol: "h3"
+        port: 8443
+        max-age: PT1H
+        persist: true
