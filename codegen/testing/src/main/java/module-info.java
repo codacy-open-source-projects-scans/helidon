@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,21 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.helidon.webclient.api;
 
-import org.junit.jupiter.api.Test;
+/**
+ * Utilities for testing code generation and annotation processors.
+ */
+module io.helidon.codegen.testing {
+    requires transitive io.helidon.common;
+    requires transitive java.compiler;
+    requires transitive hamcrest.all;
 
-import static org.hamcrest.CoreMatchers.is;
-import static org.hamcrest.MatcherAssert.assertThat;
+    requires static org.jetbrains.annotations;
 
-class Ipv4LookupFinderTest {
-
-    /**
-     * Default is to prefer IPv4 addresses.
-     */
-    @Test
-    void testIpv4Preference() {
-        DnsAddressLookup dnsAddressLookup = DefaultAddressLookupFinder.defaultDnsAddressLookup();
-        assertThat(dnsAddressLookup, is(DnsAddressLookup.IPV4_PREFERRED));
-    }
+    exports io.helidon.codegen.testing;
 }

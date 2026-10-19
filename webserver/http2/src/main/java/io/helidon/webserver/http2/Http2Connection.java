@@ -138,7 +138,7 @@ public class Http2Connection implements ServerConnection, InterruptableTask<Void
     private final Http2Settings serverSettings;
     private final boolean sendErrorDetails;
     private final ConnectionFlowControl flowControl;
-    private final Http2ServerStream.InboundDataBudget inboundDataBudget;
+    private final InboundDataBudget inboundDataBudget;
     private final WritableHeaders<?> connectionHeaders;
     private final int maxEmptyFrames;
     private final long maxClientConcurrentStreams;
@@ -211,7 +211,7 @@ public class Http2Connection implements ServerConnection, InterruptableTask<Void
                 .maxFrameSize(http2Config.maxFrameSize())
                 .build();
         long maxQueuedDataBytes = Math.max(1L, 2L * http2Config.initialWindowSize());
-        this.inboundDataBudget = new Http2ServerStream.InboundDataBudget(MAX_QUEUED_DATA_FRAMES, maxQueuedDataBytes);
+        this.inboundDataBudget = new InboundDataBudget(MAX_QUEUED_DATA_FRAMES, maxQueuedDataBytes);
         this.lastRequestTimestamp = DateTime.timestamp();
         this.connectionHeaders = WritableHeaders.create();
         this.initConnectionHeaders = true;
@@ -976,6 +976,17 @@ public class Http2Connection implements ServerConnection, InterruptableTask<Void
             } finally {
                 streamContext.clearContinuations();
             }
+        }
+        // Method rejection is deferred until the whole HPACK block has been decoded.
+        try {
+            headers.method();
+        } catch (Http2Exception _) {
+            if (newStream) {
+                activateStream(streamId);
+            }
+            stream.resetProtocolError(0, endOfStream);
+            state = State.READ_FRAME;
+            return;
         }
         receiveFrameListener.headers(ctx, streamId, headers);
 
